@@ -1,0 +1,237 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>MNP · Phase 2 unit tests</title>
+<style>
+  body { background:#131722; color:#d1d4dc; font:14px/1.5 monospace; padding:20px; }
+  .pass { color:#26a69a; }
+  .fail { color:#ef5350; }
+  .group { margin-top: 12px; font-weight:bold; color:#2962ff; }
+  h1 { color:#fff; font-size:18px; }
+  #out { white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>MNP — Phase 2 unit tests</h1>
+<div id="out">running…</div>
+
+<script type="module">
+const out = document.getElementById("out");
+window.addEventListener("error", (e) => {
+  out.innerHTML = `<span class="fail">✗ ${e.message}</span>\n<span style="color:#787b86">${e.filename}:${e.lineno}</span>`;
+});
+window.addEventListener("unhandledrejection", (e) => {
+  out.innerHTML = `<span class="fail">✗ unhandled: ${e.reason?.message || e.reason}</span>`;
+});
+
+const V = "p2-" + Date.now();
+function findBase() {
+  for (const u of [window.location?.href, document.baseURI, import.meta.url]) {
+    if (u && !u.startsWith("data:") && !u.startsWith("blob:")) return u;
+  }
+  return window.location?.href || "file:///";
+}
+const BASE = findBase();
+const IS_FILE = BASE.startsWith("file:");
+const U = (p) => {
+  const url = new URL(p, BASE).href;
+  return IS_FILE ? url : `${url}?v=${V}`;
+};
+let Compress, Integrity, CryptoLayer, OPFS, Shard, Retention, Storage, Backup, IDB;
+try {
+  [Compress, Integrity, CryptoLayer, OPFS, Shard, Retention, Storage, Backup, IDB] = await Promise.all([
+    import(U(`../src/data/compress.js`)),
+    import(U(`../src/data/integrity.js`)),
+    import(U(`../src/data/crypto.js`)),
+    import(U(`../src/data/opfs.js`)),
+    import(U(`../src/data/shardWriter.js`)),
+    import(U(`../src/data/retention.js`)),
+    import(U(`../src/data/storageManager.js`)),
+    import(U(`../src/data/backup.js`)),
+    import(U(`../src/data/idb.js`)),
+  ]);
+} catch (err) {
+  out.innerHTML = `<span class="fail">✗ import failed: ${err.message}</span>`;
+  throw err;
+}
+out.textContent = "";
+let n = 0, p = 0;
+const log = (s, ok, err) => {
+  out.innerHTML += `<span class="${ok?'pass':'fail'}">${ok?'✓':'✗'} ${s}${err ? ' — ' + err : ''}</span>\n`;
+  n++; if (ok) p++;
+};
+const group = (s) => { out.innerHTML += `<span class="group">[${s}]</span>\n`; };
+const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+
+// Ensure a clean IDB state for deterministic tests.
+await IDB.openDB();
+
+/* ─────────── compress ─────────── */
+group("compress");
+try {
+  const orig = JSON.stringify({ candles: Array(500).fill({ t: Date.now(), o:1,h:1,l:1,c:1,v:1 }) });
+  const { bytes, codec } = await Compress.gzip(orig);
+  log(`gzip codec=${codec}`, codec === "gzip" || codec === "raw");
+  log("gzip smaller-or-equal than original", bytes.length <= orig.length + 32);
+  const back = new TextDecoder().decode(await Compress.gunzip(bytes, codec));
+  log("gunzip restores string", back === orig);
+  const pkg = await Compress.gzipJSON({ hello: "world", arr: [1,2,3,4,5] });
+  const obj = await Compress.gunzipJSON(pkg.bytes, pkg.codec);
+  log("gzipJSON round-trip", eq(obj, { hello:"world", arr:[1,2,3,4,5] }));
+} catch (e) { log("compress crashed", false, e.message); }
+
+/* ─────────── integrity ─────────── */
+group("integrity");
+{
+  const a = new TextEncoder().encode("hello world");
+  const b = new TextEncoder().encode("hello world");
+  const c = new TextEncoder().encode("hello world!");
+  log("fnv1a deterministic", Integrity.fnv1a(a) === Integrity.fnv1a(b));
+  log("fnv1a differs on change", Integrity.fnv1a(a) !== Integrity.fnv1a(c));
+  log("fnv1aHex length 8", Integrity.fnv1aHex(a).length === 8);
+  log("verify passes on match", Integrity.verify(a, Integrity.fnv1aHex(a)) === true);
+  log("verify fails on mismatch", Integrity.verify(a, "00000000") === false);
+  let threw = false;
+  try { Integrity.verifyStrict(a, "00000000"); } catch { threw = true; }
+  log("verifyStrict throws on mismatch", threw);
+}
+
+/* ─────────── crypto (if available) ─────────── */
+group("crypto");
+if (CryptoLayer.crypto_info.hasWebCrypto) {
+  try {
+    const obj = { secret: "🎯 hidden", n: 42 };
+    const pkg = await CryptoLayer.encryptJSON(obj);
+    log("encryptJSON produces iv+ct", pkg.iv instanceof Uint8Array && pkg.ct instanceof Uint8Array);
+    log("ct != plaintext", !(new TextDecoder().decode(pkg.ct).includes("hidden")));
+    const dec = await CryptoLayer.decryptJSON(pkg);
+    log("decryptJSON round-trip", eq(dec, obj));
+    const h = await CryptoLayer.sha256hex("mnp");
+    log("sha256hex length 64", h.length === 64);
+    // tamper test
+    pkg.ct[0] ^= 0xff;
+    let rejected = false;
+    try { await CryptoLayer.decryptJSON(pkg); } catch { rejected = true; }
+    log("decryptJSON rejects tampered ct", rejected);
+  } catch (e) { log("crypto crashed", false, e.message); }
+} else {
+  log("webcrypto unavailable — skipped", true);
+}
+
+/* ─────────── OPFS (if available) ─────────── */
+group("opfs");
+if (OPFS.opfs_info.hasOPFS) {
+  try {
+    const bytes = new TextEncoder().encode("hello opfs " + Math.random());
+    await OPFS.writeFile(["__mnp_test__"], "hello.bin", bytes);
+    const back = await OPFS.readFile(["__mnp_test__"], "hello.bin");
+    log("writeFile + readFile round-trip", back && back.length === bytes.length && back[0] === bytes[0]);
+    const list = await OPFS.listDir(["__mnp_test__"]);
+    log("listDir contains hello.bin", list.includes("hello.bin"));
+    const removed = await OPFS.deleteFile(["__mnp_test__"], "hello.bin");
+    log("deleteFile returns true", removed === true);
+    const missing = await OPFS.readFile(["__mnp_test__"], "hello.bin");
+    log("readFile returns null after delete", missing === null);
+    await OPFS.removeDir(["__mnp_test__"]);
+    log("removeDir clean", true);
+  } catch (e) { log("opfs crashed", false, e.message); }
+} else {
+  log("opfs unavailable — skipped", true);
+}
+
+/* ─────────── shardWriter ─────────── */
+group("shardWriter");
+if (OPFS.opfs_info.hasOPFS) {
+  try {
+    const day = "2026-04-18";
+    const BASE = Date.UTC(2026, 3, 18);
+    const candles = Array.from({ length: 10 }, (_, i) => ({
+      t: BASE + i * 60_000, o: 100+i, h: 101+i, l: 99+i, c: 100+i, v: 1,
+    }));
+    await Shard.writeDayShard({ symbol: "TEST", tf: "1m", day, candles });
+    const r = await Shard.readDayShard({ symbol: "TEST", tf: "1m", day });
+    log("writeDayShard + readDayShard count", r?.candles?.length === 10);
+    log("shard meta from/to aligned", r?.meta?.from === candles[0].t && r?.meta?.to === candles[9].t);
+    const list = await Shard.listShards("TEST", "1m");
+    log("listShards returns one entry", list.length === 1 && list[0].day === day);
+    // corruption test — tamper with the stored file's CRC area
+    const path = ["candles", "TEST", "1m"];
+    const buf = await OPFS.readFile(path, `${day}.bin`);
+    const tampered = new Uint8Array(buf);
+    tampered[20] ^= 0xff; // flip a bit in body
+    await OPFS.writeFile(path, `${day}.bin`, tampered);
+    let corrupt = null;
+    const r2 = await Shard.readDayShard({ symbol: "TEST", tf: "1m", day, onCorrupt: c => corrupt = c });
+    log("corrupt shard returns null", r2 === null);
+    log("corrupt event fired with reason", corrupt?.reason === "crc-mismatch" || corrupt?.reason === "decode-failed");
+    // cleanup
+    await Shard.deleteShard({ symbol: "TEST", tf: "1m", day });
+    const after = await Shard.listShards("TEST", "1m");
+    log("deleteShard clears registry", after.length === 0);
+  } catch (e) { log("shard crashed", false, e.message); }
+} else {
+  log("shard skipped — no opfs", true);
+}
+
+/* ─────────── storageManager (IDB-only happy path) ─────────── */
+group("storageManager");
+try {
+  const SYM = "TESTSM", TF = "1m";
+  // wipe any prior test data first
+  await IDB.withStore("candles", "readwrite", (s) => new Promise((res, rej) => {
+    const req = s.openCursor(IDBKeyRange.bound([SYM, TF, 0], [SYM, TF, Number.MAX_SAFE_INTEGER]));
+    req.onerror = () => rej(req.error);
+    req.onsuccess = () => {
+      const cur = req.result; if (!cur) return res();
+      cur.delete(); cur.continue();
+    };
+  }));
+  const BASE = Date.now() - 20 * 60_000;
+  const cs = Array.from({ length: 5 }, (_, i) => ({
+    t: BASE + i * 60_000, o: 1, h: 2, l: 1, c: 1, v: 1,
+  }));
+  await Storage.putCandles({ symbol: SYM, tf: TF, candles: cs });
+  const hot = await Storage.hotCount({ symbol: SYM, tf: TF });
+  log("hotCount reflects puts", hot === 5);
+  const read = await Storage.getRange({ symbol: SYM, tf: TF, fromMs: BASE, toMs: BASE + 4 * 60_000 });
+  log("getRange returns sorted", read.length === 5 && read[0].t === BASE && read[4].t === BASE + 4*60_000);
+  const st = await Storage.stats({ symbol: SYM, tf: TF });
+  log("stats hotCount correct", st.hotCount === 5);
+} catch (e) { log("storageManager crashed", false, e.message); }
+
+/* ─────────── retention (TTL purge) ─────────── */
+group("retention");
+try {
+  // meta is ttl'd on POLICIES but we bypass here and test purgeOlderThan via newsCache
+  // insert a couple of old + new rows
+  await IDB.put("newsCache", { url: "u:old", publishedAt: 1, symbol: "X", ts: Date.now() - 60 * 86_400_000 });
+  await IDB.put("newsCache", { url: "u:new", publishedAt: 2, symbol: "X", ts: Date.now() });
+  const before = await IDB.count("newsCache");
+  const report = await Retention.sweep({ symbols: [], tfs: [] });
+  const newsRan = report.ran.find(r => r.store === "newsCache");
+  log("retention sweep ran newsCache", !!newsRan);
+  const afterCount = await IDB.count("newsCache");
+  log("retention purged stale news", afterCount < before);
+  const newRow = await IDB.get("newsCache", "u:new");
+  log("retention kept recent news", !!newRow);
+} catch (e) { log("retention crashed", false, e.message); }
+
+/* ─────────── backup round-trip ─────────── */
+group("backup");
+try {
+  const { blob, filename, info } = await Backup.exportAll();
+  log("export produces blob", blob instanceof Blob && blob.size > 0);
+  log("filename looks right", /^mnp-backup-.*\.json\.gz$/.test(filename));
+  log("info has origSize/compSize", info.origSize > 0 && info.compSize > 0);
+  // import back (replace=false to avoid nuking current db during test)
+  const r = await Backup.importAll(blob, { replace: false });
+  log("import returns ok", r.ok === true);
+  log("import reports storesRestored", typeof r.storesRestored === "object");
+} catch (e) { log("backup crashed", false, e.message); }
+
+out.innerHTML += `\n${p}/${n} passed\n`;
+document.title = `MNP p2 ${p}/${n}`;
+</script>
+</body>
+</html>

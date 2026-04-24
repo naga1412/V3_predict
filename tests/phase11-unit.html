@@ -1,0 +1,568 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>MNP · Phase 11 — Ghost candles + persistence + resolution (unit tests)</title>
+<style>
+  body { background:#131722; color:#d1d4dc; font:13px/1.5 monospace; padding:20px; }
+  .pass { color:#26a69a; }
+  .fail { color:#ef5350; }
+  .group { margin-top: 12px; font-weight:bold; color:#2962ff; }
+  h1 { color:#fff; font-size:18px; }
+  #out { white-space: pre-wrap; }
+  .note { color:#787b86; }
+  .summary { margin-top: 16px; padding: 8px; border:1px solid #2a2e39; }
+</style>
+</head>
+<body>
+<h1>MNP — Phase 11 · Ghost candles (forecast + store + resolve + verdict)</h1>
+
+<!-- file:// gate: Chromium blocks fetch() and ES-module loads from file://
+     origins.  All tests in this repo require a local HTTP server.  If the
+     user double-clicked the HTML, surface the fix LOUDLY before touching
+     any imports (which would silently hang). -->
+<script>
+  if (location.protocol === "file:") {
+    document.addEventListener("DOMContentLoaded", () => {
+      document.body.innerHTML = `
+        <h1 style="color:#fff">MNP — Phase 11 test harness</h1>
+        <div style="background:#3a1d1d;border:1px solid #ef5350;padding:16px;margin-top:16px;border-radius:4px">
+          <div style="color:#ef5350;font-weight:bold;font-size:14px">✗ This page was loaded via file:// — ES modules require http://</div>
+          <div style="color:#d1d4dc;margin-top:10px">
+            Chromium / Edge block <code>fetch()</code> and <code>&lt;script type="module"&gt;</code> on
+            <code>file://</code> origins. Run a local static server from the <code>v3/</code>
+            directory and open the test via <code>http://localhost:…</code>:
+          </div>
+          <pre style="background:#1a1e2a;padding:10px;margin-top:10px;color:#26a69a;border-radius:4px">cd v3
+python -m http.server 3000
+# then open:
+# http://localhost:3000/tests/phase11-unit.html</pre>
+          <div style="color:#787b86;margin-top:10px;font-size:12px">
+            Any static server works: <code>npx serve</code>, <code>php -S 0.0.0.0:3000</code>, etc.
+            This is a Chromium security policy, not a bug in the test.
+          </div>
+        </div>`;
+    });
+    // Prevent the module scripts below from running.
+    throw new Error("file:// origin — see in-page instructions");
+  }
+</script>
+
+<div id="out">running…</div>
+
+<!-- Static-import shim: modules linked at module-graph time; result stashed
+     on window.__p11 for the runner block below. -->
+<script type="module">
+  import * as Schema      from "../src/data/schema.js";
+  import * as IDB         from "../src/data/idb.js";
+  import * as Conformal   from "../src/ml/conformal.js";
+  import * as Ghost       from "../src/ml/ghostCandles.js";
+  import * as GhostStore  from "../src/ml/ghostStore.js";
+  window.__p11 = { Schema, IDB, Conformal, Ghost, GhostStore, ok: true };
+  window.dispatchEvent(new CustomEvent("p11-ready"));
+</script>
+
+<script type="module">
+const out = document.getElementById("out");
+window.addEventListener("error", (e) => {
+  out.innerHTML += `<span class="fail">✗ ${e.message}</span>\n<span class="note">${e.filename}:${e.lineno}:${e.colno}</span>\n`;
+});
+window.addEventListener("unhandledrejection", (e) => {
+  out.innerHTML += `<span class="fail">✗ unhandled: ${e.reason?.message || e.reason}</span>\n<span class="note">${e.reason?.stack || ''}</span>\n`;
+});
+
+// Wait for the sibling <script type="module"> above to finish loading
+// the module graph. Both blocks run in parallel so we may need to wait.
+async function waitForModules(timeoutMs = 5000) {
+  if (window.__p11) return window.__p11;
+  return new Promise((resolve) => {
+    const onReady = () => resolve(window.__p11);
+    window.addEventListener("p11-ready", onReady, { once: true });
+    setTimeout(() => resolve(window.__p11 || { ok: false, err: new Error("module-load timeout") }), timeoutMs);
+  });
+}
+
+async function probeFetch(path) {
+  try {
+    const r = await fetch(path);
+    return { ok: r.ok, status: r.status, bytes: r.ok ? (await r.text()).length : 0 };
+  } catch (err) {
+    return { ok: false, err: err.message };
+  }
+}
+
+const bundle = await waitForModules();
+if (!bundle.ok) {
+  out.innerHTML = `<span class="fail">✗ module load failed: ${bundle.err?.message || bundle.err}</span>\n<span class="note">${bundle.err?.stack || ''}</span>\n\n<span class="group">[fetch probe]</span>\n`;
+  for (const p of [
+    "../src/data/schema.js",
+    "../src/data/idb.js",
+    "../src/ml/conformal.js",
+    "../src/ml/ghostCandles.js",
+    "../src/ml/ghostStore.js",
+  ]) {
+    const r = await probeFetch(p);
+    out.innerHTML += `<span class="${r.ok?'pass':'fail'}">${r.ok?'✓':'✗'} fetch(${p}) → ${r.ok?`${r.status} · ${r.bytes}B`:r.err}</span>\n`;
+  }
+  throw bundle.err || new Error("module load failed");
+}
+const { Schema, IDB, Conformal, Ghost, GhostStore } = bundle;
+out.textContent = "";
+
+let n = 0, p = 0;
+const log = (s, ok, err) => {
+  out.innerHTML += `<span class="${ok?'pass':'fail'}">${ok?'✓':'✗'} ${s}${err ? ' — ' + err : ''}</span>\n`;
+  n++; if (ok) p++;
+};
+const group = (s) => { out.innerHTML += `\n<span class="group">[${s}]</span>\n`; };
+const close = (a, b, eps=1e-9) => Math.abs(a - b) <= eps;
+
+/* ─── Deterministic PRNG (mulberry32) ─── */
+function mulberry32(seed) {
+  let t = seed >>> 0;
+  return function() {
+    t = (t + 0x6D2B79F5) >>> 0;
+    let r = Math.imul(t ^ (t >>> 15), 1 | t);
+    r = (r + Math.imul(r ^ (r >>> 7), 61 | r)) ^ r;
+    return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/* ─── Synthetic TA + orch fixtures so ghostCandles can compute in the browser ─── */
+function makeTA({ close, atr }) {
+  return {
+    empty: false,
+    close,
+    atr14: Array.isArray(atr) ? atr : Array(close.length).fill(atr),
+  };
+}
+function makeOrch({ rawScore, confidence = 0.7 }) {
+  return { rawScore, probability: (rawScore + 1) / 2, confidence };
+}
+function makeCandles({ n, tfSec = 60, start = 100, step = 0, anchorT = null }) {
+  const out = [];
+  const t0 = anchorT != null ? anchorT : Math.floor(Date.now() / 1000);
+  for (let i = 0; i < n; i++) {
+    const c = start + step * i;
+    out.push({
+      t: (t0 + i * tfSec) * 1000,
+      time: t0 + i * tfSec,
+      o: c - 0.5, h: c + 1, l: c - 1, c, v: 1,
+    });
+  }
+  return out;
+}
+
+/* ════════════════════════════════════ Fixture 1 — drift decay + direction ════════════════════════════════════ */
+group("Fixture 1 · drift decay (exp(-λ·i)) + direction");
+{
+  // rawScore=+0.5 → |bias|=0.5, direction=+1. With ATR=1 and λ=0.18, per-step
+  // drift should be: step_i = 0.5 * exp(-0.18*i).
+  const ta    = makeTA({ close: [99, 100], atr: 1 });
+  const orch  = makeOrch({ rawScore: 0.5 });
+  const cands = makeCandles({ n: 2, start: 99, step: 1, tfSec: 60 });
+  const f = Ghost.predictGhostCandles(ta, orch, { nBars: 5, candles: cands, lambda: 0.18 });
+
+  log("forecast produced", f && Array.isArray(f.bars) && f.bars.length === 5);
+  log("direction === +1", f.direction === 1);
+  log("bias === 0.5",    close(f.bias, 0.5, 1e-12));
+
+  // Each step's drift (c_i - prev close) must equal 0.5 * atr * exp(-0.18*i).
+  const lastClose = cands[cands.length - 1].c; // 100
+  let prev = lastClose;
+  for (let i = 0; i < f.bars.length; i++) {
+    const expected = 0.5 * 1 * Math.exp(-0.18 * i);
+    const actual = f.bars[i].c - prev;
+    log(`bar ${i} drift ≈ 0.5·exp(-0.18·${i}) (expected=${expected.toFixed(6)}, actual=${actual.toFixed(6)})`,
+        close(actual, expected, 1e-9));
+    prev = f.bars[i].c;
+  }
+  // Ghost closes strictly increase when direction is up
+  let mono = true;
+  for (let i = 1; i < f.bars.length; i++) {
+    if (f.bars[i].c <= f.bars[i - 1].c) { mono = false; break; }
+  }
+  log("closes strictly increasing for +1 bias", mono === true);
+
+  // Reverse direction
+  const f2 = Ghost.predictGhostCandles(
+    makeTA({ close: [101, 100], atr: 1 }),
+    makeOrch({ rawScore: -0.5 }),
+    { nBars: 5, candles: cands, lambda: 0.18 },
+  );
+  log("bias=-0.5 → direction=-1", f2 && f2.direction === -1);
+  let monoDn = true;
+  for (let i = 1; i < f2.bars.length; i++) {
+    if (f2.bars[i].c >= f2.bars[i - 1].c) { monoDn = false; break; }
+  }
+  log("closes strictly decreasing for -1 bias", monoDn === true);
+
+  // Zero bias → direction 0 → flat path
+  const f3 = Ghost.predictGhostCandles(
+    makeTA({ close: [100, 100], atr: 1 }),
+    makeOrch({ rawScore: 0 }),
+    { nBars: 4, candles: cands, lambda: 0.18 },
+  );
+  log("bias=0 → direction=0",  f3 && f3.direction === 0);
+  log("bias=0 → all bars c === anchorClose",
+      f3.bars.every(b => close(b.c, f3.anchorClose, 1e-12)));
+}
+
+/* ════════════════════════════════════ Fixture 2 — √-horizon band widening ════════════════════════════════════ */
+group("Fixture 2 · √-horizon band widening (fallback)");
+{
+  const ta    = makeTA({ close: [99, 100], atr: 1 });
+  const orch  = makeOrch({ rawScore: 0.0, confidence: 0.5 });
+  const cands = makeCandles({ n: 2, start: 99, step: 1 });
+  const f = Ghost.predictGhostCandles(ta, orch, { nBars: 6, candles: cands, bandK: 1.25 });
+
+  log("fallback band produced (no conformal)", f && f.usedConformal === false);
+  // Fallback formula: half_i = bandK · atr · √(i+1)
+  // So width_i = 2·half_i should equal 2·1.25·1·√(i+1) = 2.5·√(i+1)
+  let ok = true;
+  for (let i = 0; i < f.bars.length; i++) {
+    const exp = 2 * 1.25 * 1 * Math.sqrt(i + 1);
+    if (!close(f.bars[i].width, exp, 1e-9)) { ok = false; break; }
+  }
+  log("width_i == 2·bandK·atr·√(i+1) for all i", ok);
+
+  // Strictly widening:
+  let widening = true;
+  for (let i = 1; i < f.bars.length; i++) {
+    if (f.bars[i].width <= f.bars[i - 1].width) { widening = false; break; }
+  }
+  log("widths strictly increasing", widening);
+
+  // bandK override applies
+  const f2 = Ghost.predictGhostCandles(ta, orch, { nBars: 3, candles: cands, bandK: 2.5 });
+  log("doubling bandK doubles widths",
+      close(f2.bars[0].width / f.bars[0].width, 2.0, 1e-9));
+}
+
+/* ════════════════════════════════════ Fixture 3 — CP path toggled by calibrated conformal ════════════════════════════════════ */
+group("Fixture 3 · CP vs fallback switch (calibrated SplitConformalRegressor)");
+{
+  const ta    = makeTA({ close: [99, 100], atr: 1 });
+  const orch  = makeOrch({ rawScore: 0.2 });
+  const cands = makeCandles({ n: 2, start: 99, step: 1 });
+
+  // Calibrate a SplitConformalRegressor on synthetic residuals with known q.
+  const rng = mulberry32(17);
+  const cp = new Conformal.SplitConformalRegressor({ alpha: 0.1 });
+  // Non-conformity scores equal |y - yhat|; seeding with yhat=0 and y=rng()*0.5
+  // produces 200 scores uniform on [0, 0.5).
+  const calib = [];
+  for (let i = 0; i < 200; i++) calib.push({ yhat: 0, y: rng() * 0.5 });
+  cp.fit(calib);
+  log("CP q finite + > 0", Number.isFinite(cp.q) && cp.q > 0);
+
+  const withCP = Ghost.predictGhostCandles(ta, orch, { nBars: 5, candles: cands, conformal: cp });
+  log("usedConformal true when cp has finite q", withCP.usedConformal === true);
+
+  // Per-bar CP half-width = cp.q * √(i+1).
+  const withoutCP = Ghost.predictGhostCandles(ta, orch, { nBars: 5, candles: cands });
+  // CP widths are data-driven (from q); the structural √-growth property
+  // should still hold.  Verify width_1 / width_0 ≈ √2.
+  log("CP width_1 / width_0 ≈ √2",
+      close(withCP.bars[1].width / withCP.bars[0].width, Math.sqrt(2) /* widths scale √(i+1) */, 1e-9));
+
+  // usedConformal=false when cp.q is Infinity
+  const cpEmpty = new Conformal.SplitConformalRegressor({ alpha: 0.1 });
+  const withEmpty = Ghost.predictGhostCandles(ta, orch, { nBars: 3, candles: cands, conformal: cpEmpty });
+  log("uncalibrated CP falls back", withEmpty.usedConformal === false);
+
+  // CP path differs from fallback (unless q happens to match bandK·atr exactly)
+  const diff = Math.abs(withCP.bars[0].width - withoutCP.bars[0].width);
+  log("CP path ≠ fallback path (widths differ)", diff > 1e-9);
+}
+
+/* ════════════════════════════════════ Fixture 4 — time projection (anchor + tfSec) ════════════════════════════════════ */
+group("Fixture 4 · time projection (anchor + tfSec)");
+{
+  // Hand-pick anchor at t=1_000_000 sec, tfSec=60.
+  const anchorSec = 1_000_000;
+  const cands = makeCandles({ n: 5, tfSec: 60, start: 100, step: 0.1, anchorT: anchorSec });
+  const ta    = makeTA({ close: cands.map(c => c.c), atr: 1 });
+  const orch  = makeOrch({ rawScore: 0.3 });
+
+  // inferTfSeconds should pick up 60
+  log("inferTfSeconds === 60", Ghost.inferTfSeconds(cands) === 60);
+  // lastCandleTime should match the last bar's `time`
+  log("lastCandleTime === last bar time",
+      Ghost.lastCandleTime(cands) === cands[cands.length - 1].time);
+
+  const f = Ghost.predictGhostCandles(ta, orch, { nBars: 4, candles: cands });
+  log("anchorTime === last bar time", f.anchorTime === cands[cands.length - 1].time);
+  log("anchorClose === last bar close", close(f.anchorClose, cands[cands.length - 1].c, 1e-12));
+
+  // Ghost bar i+1 sits at anchorTime + tfSec*(i+1)
+  let okTimes = true;
+  for (let i = 0; i < f.bars.length; i++) {
+    if (f.bars[i].time !== f.anchorTime + 60 * (i + 1)) { okTimes = false; break; }
+  }
+  log("ghost bar times evenly spaced by tfSec", okTimes);
+
+  // Candle-less mode: falls back to now + 60s spacing and doesn't crash.
+  const ta2    = makeTA({ close: [100, 100.1, 100.2], atr: 1 });
+  const fStale = Ghost.predictGhostCandles(ta2, orch, { nBars: 2 });
+  log("candle-less path yields finite times",
+      fStale && fStale.bars.every(b => Number.isFinite(b.time)));
+
+  // 5-min TF inference
+  const cand5 = makeCandles({ n: 6, tfSec: 300, start: 100, step: 0, anchorT: anchorSec });
+  log("inferTfSeconds === 300 for 5m feed", Ghost.inferTfSeconds(cand5) === 300);
+
+  // Serializers
+  const ser = Ghost.toChartSeriesData(f);
+  log("toChartSeriesData returns 4 arrays",
+      ser && Array.isArray(ser.candleData) && Array.isArray(ser.upperBand)
+      && Array.isArray(ser.lowerBand) && Array.isArray(ser.pointLine));
+  log("toChartSeriesData lengths match",
+      ser.candleData.length === f.bars.length && ser.upperBand.length === f.bars.length);
+
+  const sum = Ghost.summarizeForecast(f);
+  log("summary.horizon === nBars", sum.horizon === f.bars.length);
+  log("summary.direction === f.direction", sum.direction === f.direction);
+  log("summary.expectedMove === finalClose - anchorClose",
+      close(sum.expectedMove, f.bars[f.bars.length - 1].c - f.anchorClose, 1e-12));
+}
+
+/* ════════════════════════════════════ Fixture 5 — Store persistence + grading + resolution ════════════════════════════════════ */
+group("Fixture 5 · GhostStore persistence + gradeGhost + resolveGhosts + verdict");
+{
+  // Schema sanity
+  log("STORES.ghosts exists", typeof Schema.STORES.ghosts === "object");
+  log("ghosts keyPath 'id'", Schema.STORES.ghosts.keyPath === "id");
+  const gNames = (Schema.STORES.ghosts.indexes || []).map(i => i.name);
+  log("ghosts has by_anchor index", gNames.includes("by_anchor"));
+  log("ghosts has by_symbol_tf index", gNames.includes("by_symbol_tf"));
+  log("ghosts has by_resolved index", gNames.includes("by_resolved"));
+  log("DB_VERSION >= 4", Schema.DB_VERSION >= 4);
+
+  // Round-trip + dedup by anchor
+  try {
+    await GhostStore.clearAll();
+
+    const anchorSec = 2_000_000;
+    const cands = makeCandles({ n: 5, tfSec: 60, start: 100, step: 0, anchorT: anchorSec });
+    const ta   = makeTA({ close: cands.map(c => c.c), atr: 1 });
+    const orch = makeOrch({ rawScore: 0.4 });
+    const forecast = Ghost.predictGhostCandles(ta, orch, { nBars: 4, candles: cands, bandK: 1.25 });
+    log("fixture forecast constructed", forecast && forecast.bars.length === 4);
+
+    const id1 = await GhostStore.saveForecast(forecast, { symbol: "BTCUSDT", tf: "1m" });
+    log("saveForecast returns numeric id", typeof id1 === "number" && id1 > 0);
+
+    const row = await GhostStore.loadGhost(id1);
+    log("loadGhost returns matching row",
+        row && row.symbol === "BTCUSDT" && row.tf === "1m" && row.anchorTime === forecast.anchorTime);
+    log("row.bars length matches forecast horizon", row.bars.length === forecast.bars.length);
+    log("row.resolved === 0", row.resolved === 0);
+
+    // Dedup: saving again for the same anchor reuses the id
+    const id2 = await GhostStore.saveForecast(forecast, { symbol: "BTCUSDT", tf: "1m" });
+    log("saveForecast dedups same anchor (id reused)", id2 === id1);
+    log("countGhosts === 1 after dedup save",
+        (await GhostStore.countGhosts()) === 1);
+
+    // findByAnchor
+    const byA = await GhostStore.findByAnchor("BTCUSDT", "1m", forecast.anchorTime);
+    log("findByAnchor returns row", byA && byA.id === id1);
+    const byMiss = await GhostStore.findByAnchor("BTCUSDT", "1m", 999);
+    log("findByAnchor returns null on miss", byMiss == null);
+
+    /* ─── gradeGhost: synthesize realized candles that exactly cover ghost closes ─── */
+    {
+      const realized = row.bars.map((b) => ({
+        t: b.time * 1000,
+        time: b.time,
+        o: b.c - 0.1, c: b.c, h: b.c + 0.1, l: b.c - 0.1, v: 1, // realized EXACTLY matches ghost close
+      }));
+      const lookup = (t) => realized.find(r => r.time === t) || null;
+      const g = GhostStore.gradeGhost(row, lookup);
+      log("grade all bars (realizedN === horizon)", g.resolvedN === row.bars.length);
+      log("grade fullyResolved === true", g.fullyResolved === true);
+      log("perfect match → coverage === 1",
+          Number.isFinite(g.verdict.coverage) && close(g.verdict.coverage, 1, 1e-12));
+      log("absErrorMean === 0 on perfect match", close(g.verdict.absErrorMean, 0, 1e-12));
+    }
+
+    /* ─── gradeGhost: realized breaks ABOVE the upper band → coverage < 1 ─── */
+    {
+      const realized = row.bars.map((b, i) => {
+        // Push realized close to b.hi + 5·atr so it's outside the band
+        const outside = b.hi + 5;
+        return {
+          t: b.time * 1000,
+          time: b.time,
+          o: outside - 0.1, c: outside, h: outside + 0.1, l: outside - 0.1, v: 1,
+        };
+      });
+      const lookup = (t) => realized.find(r => r.time === t) || null;
+      const g = GhostStore.gradeGhost(row, lookup);
+      log("out-of-band realized → coverage < 1",
+          Number.isFinite(g.verdict.coverage) && g.verdict.coverage < 1);
+      log("out-of-band realized → absErrorMean > 0", g.verdict.absErrorMean > 0);
+      log("directionHit === +1 when bias=+ and realized moved up",
+          g.verdict.directionHit === 1);
+    }
+
+    /* ─── resolveGhosts: partial + full via a progressing candle feed ─── */
+    {
+      await GhostStore.clearAll();
+      const anchorSec2 = 3_000_000;
+      const cands2 = makeCandles({ n: 5, tfSec: 60, start: 100, step: 0, anchorT: anchorSec2 });
+      const ta2    = makeTA({ close: cands2.map(c => c.c), atr: 1 });
+      const orch2  = makeOrch({ rawScore: 0.2 });
+      const fc2 = Ghost.predictGhostCandles(ta2, orch2, { nBars: 3, candles: cands2, bandK: 1.25 });
+      await GhostStore.saveForecast(fc2, { symbol: "ETHUSDT", tf: "1m" });
+
+      // Build a partial lookup: only first ghost bar has a realized candle.
+      const realizedAll = fc2.bars.map((b) => ({
+        t: b.time * 1000, time: b.time,
+        o: b.c, c: b.c, h: b.c, l: b.c, v: 1,
+      }));
+      const emitted = [];
+      const bus = { emit(t, d) { emitted.push([t, d]); } };
+
+      const partialLookup = (tSec) => {
+        // Only the first bar is "realized" in this tick
+        if (tSec === fc2.bars[0].time) return realizedAll[0];
+        return null;
+      };
+      const r1 = await GhostStore.resolveGhosts({ candleLookup: partialLookup, bus,
+                                                  nowSec: fc2.bars[0].time + 1 });
+      log("resolveGhosts graded 1 row (partial)", r1.graded === 1);
+      log("resolveGhosts fullyResolved === 0 (partial)", r1.fullyResolved === 0);
+      log("emits ghost:resolved on partial", emitted.some(([t]) => t === "ghost:resolved"));
+      log("does NOT emit ghost:verdict on partial",
+          !emitted.some(([t]) => t === "ghost:verdict"));
+
+      const rowMid = await GhostStore.findByAnchor("ETHUSDT", "1m", fc2.anchorTime);
+      log("row.resolved still 0 mid-horizon", rowMid.resolved === 0);
+      log("row.resolvedN === 1 after partial", rowMid.resolvedN === 1);
+
+      // Now realize ALL bars → should fully resolve + emit verdict
+      emitted.length = 0;
+      const fullLookup = (tSec) => realizedAll.find(r => r.time === tSec) || null;
+      const r2 = await GhostStore.resolveGhosts({ candleLookup: fullLookup, bus,
+                                                  nowSec: fc2.bars[fc2.bars.length - 1].time + 1 });
+      log("resolveGhosts re-grades + finalizes (fullyResolved=1)", r2.fullyResolved === 1);
+      log("emits ghost:verdict on full resolution",
+          emitted.some(([t]) => t === "ghost:verdict"));
+      const verdictEmit = emitted.find(([t]) => t === "ghost:verdict");
+      log("ghost:verdict payload has coverage",
+          verdictEmit && Number.isFinite(verdictEmit[1].verdict.coverage));
+
+      const rowFinal = await GhostStore.findByAnchor("ETHUSDT", "1m", fc2.anchorTime);
+      log("row.resolved === 1 after full", rowFinal.resolved === 1);
+      log("row.resolvedAt set", Number.isFinite(rowFinal.resolvedAt));
+      log("verdict.n === horizon",
+          rowFinal.verdict && rowFinal.verdict.n === fc2.bars.length);
+
+      // Idempotency: a third resolve sweep with the same candles should
+      // skip the already-resolved row (no double-grading).
+      const r3 = await GhostStore.resolveGhosts({ candleLookup: fullLookup, bus,
+                                                  nowSec: fc2.bars[fc2.bars.length - 1].time + 1 });
+      log("re-resolve is idempotent (graded 0)", r3.graded === 0);
+    }
+
+    /* ─── listGhosts + pendingGhosts filters ─── */
+    {
+      await GhostStore.clearAll();
+      const fcA = Ghost.predictGhostCandles(
+        makeTA({ close: [100, 100], atr: 1 }),
+        makeOrch({ rawScore: 0.1 }),
+        { nBars: 2, candles: makeCandles({ n: 2, tfSec: 60, start: 100, anchorT: 10_000 }) },
+      );
+      const fcB = Ghost.predictGhostCandles(
+        makeTA({ close: [200, 200], atr: 2 }),
+        makeOrch({ rawScore: -0.1 }),
+        { nBars: 2, candles: makeCandles({ n: 2, tfSec: 60, start: 200, anchorT: 20_000 }) },
+      );
+      await GhostStore.saveForecast(fcA, { symbol: "AAA", tf: "1m" });
+      await GhostStore.saveForecast(fcB, { symbol: "BBB", tf: "1m" });
+
+      log("listGhosts {symbol:'AAA'} returns 1",
+          (await GhostStore.listGhosts({ symbol: "AAA" })).length === 1);
+      log("listGhosts {resolved:0} returns 2",
+          (await GhostStore.listGhosts({ resolved: 0 })).length === 2);
+
+      // fcA: candles end at time=10_060, ghost bar 0 is at anchor+tfSec = 10_120
+      // fcB: candles end at time=20_060, ghost bar 0 is at 20_120
+      // nowSec=10_050 → NEITHER ghost is due (10_050 < 10_120 < 20_120)
+      const due0 = await GhostStore.pendingGhosts({ nowSec: 10_050 });
+      log("pendingGhosts excludes not-yet-due rows", due0.length === 0);
+      // nowSec=10_150 → A is due (10_120 <= 10_150), B is not (20_120 > 10_150)
+      const due1 = await GhostStore.pendingGhosts({ nowSec: 10_150 });
+      log("pendingGhosts includes only due row",
+          due1.length === 1 && due1[0].symbol === "AAA");
+
+      // latestGhost picks the most recently created
+      const last = await GhostStore.latestGhost({ tf: "1m" });
+      log("latestGhost returns most recent", last && (last.symbol === "AAA" || last.symbol === "BBB"));
+    }
+
+    /* ─── Input validation ─── */
+    {
+      let err;
+      try { await GhostStore.saveForecast(null, { symbol: "X", tf: "1m" }); }
+      catch (e) { err = e; }
+      log("saveForecast rejects null forecast", err && /forecast/.test(err.message));
+      err = null;
+      try { await GhostStore.saveForecast({ bars: [{ time: 1 }], anchorTime: 1 }, { symbol: "", tf: "1m" }); }
+      catch (e) { err = e; }
+      log("saveForecast rejects empty symbol", err && /symbol/.test(err.message));
+      err = null;
+      try { GhostStore.gradeGhost({ bars: [] }, () => null); }
+      catch (e) { err = e; }
+      log("gradeGhost rejects empty bars", err && /bars/.test(err.message));
+      err = null;
+      try { await GhostStore.resolveGhosts({}); }
+      catch (e) { err = e; }
+      log("resolveGhosts rejects missing candleLookup", err && /candleLookup/.test(err.message));
+    }
+
+    /* ─── summarizeResolved after a couple of full resolutions ─── */
+    {
+      await GhostStore.clearAll();
+      // Save + fully resolve 3 forecasts, then summarize.
+      for (let s = 0; s < 3; s++) {
+        const anchor = 50_000 + s * 10_000;
+        const cs = makeCandles({ n: 2, tfSec: 60, start: 100, anchorT: anchor });
+        const f = Ghost.predictGhostCandles(
+          makeTA({ close: cs.map(c => c.c), atr: 1 }),
+          makeOrch({ rawScore: 0.3 }),
+          { nBars: 2, candles: cs, bandK: 1.25 },
+        );
+        await GhostStore.saveForecast(f, { symbol: "SUM", tf: "1m" });
+        const realized = f.bars.map(b => ({
+          t: b.time * 1000, time: b.time,
+          o: b.c, c: b.c, h: b.c, l: b.c, v: 1,
+        }));
+        await GhostStore.resolveGhosts({
+          candleLookup: (t) => realized.find(r => r.time === t) || null,
+          nowSec: f.bars[f.bars.length - 1].time + 1,
+        });
+      }
+      const s = await GhostStore.summarizeResolved({ symbol: "SUM", tf: "1m" });
+      log("summarizeResolved returns rows===3", s && s.rows === 3);
+      log("summarizeResolved coveragePerBar === 1 (exact matches)",
+          s && close(s.coveragePerBar, 1, 1e-12));
+      log("summarizeResolved directionAccuracy === 1",
+          s && close(s.directionAccuracy, 1, 1e-12));
+    }
+
+    await GhostStore.clearAll();
+    log("clearAll wipes store", (await GhostStore.countGhosts()) === 0);
+  } catch (err) {
+    log("ghostStore suite threw", false, err.message + "\n" + (err.stack || ""));
+  }
+}
+
+/* ════════════════════════════════════ summary ════════════════════════════════════ */
+out.innerHTML += `\n<div class="summary ${p===n?'pass':'fail'}">Ran ${n} tests — ${p} passed, ${n-p} failed.</div>`;
+document.title = `MNP p11 ${p}/${n}`;
+</script>
+</body>
+</html>

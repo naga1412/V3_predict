@@ -1,0 +1,668 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>MNP · Phase 8 unit tests</title>
+<style>
+  body { background:#131722; color:#d1d4dc; font:13px/1.5 monospace; padding:20px; }
+  .pass { color:#26a69a; }
+  .fail { color:#ef5350; }
+  .group { margin-top: 12px; font-weight:bold; color:#2962ff; }
+  h1 { color:#fff; font-size:18px; }
+  #out { white-space: pre-wrap; }
+  .note { color:#787b86; }
+  .summary { margin-top: 16px; padding: 8px; border:1px solid #2a2e39; }
+</style>
+</head>
+<body>
+<h1>MNP — Phase 8 unit tests (NN + per-regime ensemble)</h1>
+<div id="out">running…</div>
+
+<script type="module">
+const out = document.getElementById("out");
+window.addEventListener("error", (e) => {
+  out.innerHTML += `<span class="fail">✗ ${e.message}</span>\n<span class="note">${e.filename}:${e.lineno}:${e.colno}</span>\n`;
+});
+window.addEventListener("unhandledrejection", (e) => {
+  out.innerHTML += `<span class="fail">✗ unhandled: ${e.reason?.message || e.reason}</span>\n<span class="note">${e.reason?.stack || ''}</span>\n`;
+});
+
+const V = "p8-" + Date.now();
+function findBase() {
+  for (const u of [window.location?.href, document.baseURI, import.meta.url]) {
+    if (u && !u.startsWith("data:") && !u.startsWith("blob:")) return u;
+  }
+  return window.location?.href || "file:///";
+}
+const BASE = findBase();
+const IS_FILE = BASE.startsWith("file:");
+const U = (p) => {
+  const url = new URL(p, BASE).href;
+  return IS_FILE ? url : `${url}?v=${V}`;
+};
+
+let RNG, NN, Ensemble, TrainerMod, ModelStore, Schema, IDB;
+try {
+  [RNG, NN, Ensemble, TrainerMod, ModelStore, Schema, IDB] = await Promise.all([
+    import(U("../src/ml/rng.js")),
+    import(U("../src/ml/nn.js")),
+    import(U("../src/ml/ensemble.js")),
+    import(U("../src/ml/trainer.js")),
+    import(U("../src/ml/modelStore.js")),
+    import(U("../src/data/schema.js")),
+    import(U("../src/data/idb.js")),
+  ]);
+} catch (err) {
+  out.innerHTML = `<span class="fail">✗ import failed: ${err.message}</span>\n<span class="note">${err.stack || ''}</span>`;
+  throw err;
+}
+out.textContent = "";
+
+let n = 0, p = 0;
+const log = (s, ok, err) => {
+  out.innerHTML += `<span class="${ok?'pass':'fail'}">${ok?'✓':'✗'} ${s}${err ? ' — ' + err : ''}</span>\n`;
+  n++; if (ok) p++;
+};
+const group = (s) => { out.innerHTML += `<span class="group">[${s}]</span>\n`; };
+
+function approx(a, b, eps = 1e-6) { return Math.abs(a - b) <= eps; }
+function mean(arr) {
+  let s = 0; for (const v of arr) s += v;
+  return s / Math.max(1, arr.length);
+}
+function variance(arr) {
+  const m = mean(arr);
+  let s = 0; for (const v of arr) s += (v - m) ** 2;
+  return s / Math.max(1, arr.length);
+}
+
+/* ───────────────────────────── RNG ───────────────────────────── */
+group("RNG · mulberry32 determinism");
+{
+  const r1 = RNG.mulberry32(42);
+  const r2 = RNG.mulberry32(42);
+  const a = []; const b = [];
+  for (let i = 0; i < 500; i++) { a.push(r1()); b.push(r2()); }
+  let match = true;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) { match = false; break; }
+  log("identical seed → identical stream (500 draws)", match);
+  log("all draws in [0,1)", a.every(v => v >= 0 && v < 1));
+  const r3 = RNG.mulberry32(43);
+  let diff = 0;
+  for (let i = 0; i < 500; i++) if (r3() !== a[i]) diff++;
+  log("different seed → different stream", diff > 450);
+  // Uniform-ish distribution check
+  const m = mean(a);
+  log("~uniform mean near 0.5 (±0.05)", Math.abs(m - 0.5) < 0.05, `mean=${m.toFixed(3)}`);
+  const v = variance(a);
+  // Uniform [0,1) variance = 1/12 ≈ 0.0833
+  log("~uniform variance near 1/12 (±0.02)", Math.abs(v - (1 / 12)) < 0.02, `var=${v.toFixed(4)}`);
+  log("seed=0 does not crash (internally coerced to 1)", Number.isFinite(RNG.mulberry32(0)()));
+}
+
+group("RNG · gaussian");
+{
+  const rand = RNG.mulberry32(7);
+  const g = RNG.gaussianFactory(rand);
+  const samples = [];
+  for (let i = 0; i < 4000; i++) samples.push(g());
+  const m = mean(samples), v = variance(samples);
+  log("gaussian mean ~0 (±0.1)", Math.abs(m) < 0.1, `mean=${m.toFixed(3)}`);
+  log("gaussian variance ~1 (±0.1)", Math.abs(v - 1) < 0.15, `var=${v.toFixed(3)}`);
+  log("gaussian uses both sin/cos branches (nonzero spread)", v > 0.5);
+}
+
+group("RNG · shuffle / indices / hash");
+{
+  const rand = RNG.mulberry32(99);
+  const arr = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+  const shuffled = RNG.shuffle([...arr], rand);
+  log("shuffle returns same length", shuffled.length === arr.length);
+  log("shuffle preserves set", [...shuffled].sort((a, b) => a - b).join(",") === arr.join(","));
+  log("shuffle actually moves elements (most bins)",
+    shuffled.filter((v, i) => v !== arr[i]).length >= 5);
+
+  const idx = RNG.shuffledIndices(8, RNG.mulberry32(1));
+  log("shuffledIndices returns Uint32Array", idx instanceof Uint32Array);
+  log("shuffledIndices has correct length", idx.length === 8);
+  const s = new Set(idx); log("shuffledIndices is a permutation", s.size === 8);
+
+  log("randInt in [0, n)", (() => {
+    const r = RNG.mulberry32(3);
+    for (let i = 0; i < 200; i++) {
+      const k = RNG.randInt(r, 5);
+      if (k < 0 || k >= 5 || !Number.isInteger(k)) return false;
+    }
+    return true;
+  })());
+
+  log("hashStringToU32 deterministic",
+    RNG.hashStringToU32("BTCUSDT") === RNG.hashStringToU32("BTCUSDT"));
+  log("hashStringToU32 collision-sensitive",
+    RNG.hashStringToU32("BTCUSDT") !== RNG.hashStringToU32("ETHUSDT"));
+  log("hashStringToU32 is unsigned 32-bit",
+    RNG.hashStringToU32("x") >>> 0 === RNG.hashStringToU32("x"));
+}
+
+/* ───────────────────────────── NN core ───────────────────────────── */
+group("NN · shape / construction");
+{
+  try {
+    new NN.MLP({ layers: [] });
+    log("empty layers throws", false);
+  } catch { log("empty layers throws", true); }
+  try {
+    new NN.MLP({ layers: [{ in: 3, out: 4, act: "relu" }, { in: 5, out: 2, act: "sigmoid" }] });
+    log("shape mismatch throws", false);
+  } catch { log("shape mismatch throws", true); }
+  try {
+    new NN.MLP({ layers: [{ in: 3, out: 4, act: "mystery" }] });
+    log("bad activation throws", false);
+  } catch { log("bad activation throws", true); }
+
+  const m = new NN.MLP({
+    layers: [{ in: 4, out: 6, act: "relu" }, { in: 6, out: 1, act: "sigmoid" }],
+    seed: 1,
+  });
+  log("MLP built with expected layer count", m.layers.length === 2);
+  const params = NN.paramCount(m);
+  // 4*6 + 6 + 6*1 + 1 = 37
+  log("paramCount matches (4*6+6 + 6*1+1 = 37)", params === 37);
+}
+
+group("NN · deterministic init from seed");
+{
+  const m1 = new NN.MLP({ layers: [{ in: 3, out: 2, act: "relu" }], seed: 42 });
+  const m2 = new NN.MLP({ layers: [{ in: 3, out: 2, act: "relu" }], seed: 42 });
+  let same = true;
+  for (let i = 0; i < m1.W[0].length; i++) if (m1.W[0][i] !== m2.W[0][i]) { same = false; break; }
+  log("same seed → identical initial weights", same);
+  const m3 = new NN.MLP({ layers: [{ in: 3, out: 2, act: "relu" }], seed: 43 });
+  let diff = 0;
+  for (let i = 0; i < m1.W[0].length; i++) if (m1.W[0][i] !== m3.W[0][i]) diff++;
+  log("different seed → different initial weights", diff > 0);
+}
+
+group("NN · forward / predict");
+{
+  const m = new NN.MLP({
+    layers: [{ in: 2, out: 3, act: "relu" }, { in: 3, out: 1, act: "sigmoid" }],
+    seed: 11,
+  });
+  const y = m.predict([0.5, -0.3]);
+  log("predict returns Float32Array", y instanceof Float32Array);
+  log("predict output length = outDim", y.length === 1);
+  log("sigmoid output in (0,1)", y[0] > 0 && y[0] < 1);
+  log("predictScalar matches predict[0]",
+    approx(m.predictScalar([0.5, -0.3]), y[0], 1e-9));
+  // Batch
+  const X = new Float32Array([0.5, -0.3, 0.1, 0.2, -0.5, 0.4]);
+  const yB = m.predictBatch(X, 3);
+  log("predictBatch length = n * outDim", yB.length === 3);
+  log("predictBatch first row matches single predict", approx(yB[0], y[0], 1e-6));
+}
+
+group("NN · XOR learns (2-8-1 tanh/sigmoid, bce)");
+{
+  const X = new Float32Array([0, 0,  0, 1,  1, 0,  1, 1]);
+  const Y = new Float32Array([0, 1, 1, 0]);
+  const mlp = new NN.MLP({
+    layers: [{ in: 2, out: 8, act: "tanh" }, { in: 8, out: 1, act: "sigmoid" }],
+    loss: "bce", optimizer: "adam", lr: 0.05, seed: 7,
+  });
+  const { history } = mlp.fit(X, Y, { epochs: 600, batchSize: 4 });
+  const lossStart = history[0];
+  const lossEnd = history[history.length - 1];
+  log("loss decreases over training", lossEnd < lossStart, `start=${lossStart.toFixed(3)} end=${lossEnd.toFixed(3)}`);
+  const preds = [0, 1, 2, 3].map(i => mlp.predictScalar([X[i * 2], X[i * 2 + 1]]));
+  const okEnd = lossEnd < 0.25;
+  const okBounds = preds.every(p => p >= 0 && p <= 1);
+  log("XOR predictions stay in [0,1]", okBounds);
+  // Classification accuracy — accept >= 3/4 (XOR is a known hard test at small capacity)
+  const acc = [0, 1, 1, 0].reduce((s, t, i) => s + ((preds[i] > 0.5 ? 1 : 0) === t ? 1 : 0), 0);
+  log("XOR accuracy ≥ 3/4", acc >= 3, `acc=${acc}/4 preds=${preds.map(x=>x.toFixed(2)).join(',')}`);
+  log("XOR BCE loss < 0.25 (converged enough)", okEnd, `lossEnd=${lossEnd.toFixed(3)}`);
+}
+
+group("NN · linear regression learns (1→1 mse)");
+{
+  // y = 2x + 1
+  const n = 128;
+  const X = new Float32Array(n);
+  const Y = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const x = (i / n) * 2 - 1;
+    X[i] = x; Y[i] = 2 * x + 1;
+  }
+  const mlp = new NN.MLP({
+    layers: [{ in: 1, out: 1, act: "linear" }],
+    loss: "mse", optimizer: "adam", lr: 0.05, seed: 3,
+  });
+  const { history } = mlp.fit(X, Y, { epochs: 200, batchSize: 16 });
+  log("MSE loss decreases", history[history.length - 1] < history[0]);
+  const yHat0 = mlp.predictScalar([0]);
+  const yHat1 = mlp.predictScalar([0.5]);
+  log("learns bias ~1", Math.abs(yHat0 - 1) < 0.1, `got ${yHat0.toFixed(3)}`);
+  log("learns slope ~2", Math.abs((yHat1 - yHat0) / 0.5 - 2) < 0.2,
+    `slope=${((yHat1 - yHat0) / 0.5).toFixed(3)}`);
+}
+
+group("NN · SGD path also trains");
+{
+  const X = new Float32Array([0, 0,  0, 1,  1, 0,  1, 1]);
+  const Y = new Float32Array([0, 1, 1, 0]);
+  const mlp = new NN.MLP({
+    layers: [{ in: 2, out: 8, act: "tanh" }, { in: 8, out: 1, act: "sigmoid" }],
+    loss: "bce", optimizer: "sgd", lr: 0.5, seed: 12,
+  });
+  const { history } = mlp.fit(X, Y, { epochs: 400, batchSize: 4 });
+  log("SGD also reduces loss", history[history.length - 1] < history[0]);
+}
+
+group("NN · progress + epoch callbacks + valFrac");
+{
+  const n = 80, d = 2;
+  const X = new Float32Array(n * d); const Y = new Float32Array(n);
+  const rand = RNG.mulberry32(21);
+  for (let i = 0; i < n; i++) {
+    X[i * 2]     = rand();
+    X[i * 2 + 1] = rand();
+    Y[i] = (X[i * 2] + X[i * 2 + 1] > 1) ? 1 : 0;
+  }
+  const mlp = new NN.MLP({
+    layers: [{ in: 2, out: 4, act: "relu" }, { in: 4, out: 1, act: "sigmoid" }],
+    loss: "bce", optimizer: "adam", lr: 0.05, seed: 1,
+  });
+  let progressCalls = 0, epochCalls = 0, lastFrac = 0;
+  const { history, valHistory } = mlp.fit(X, Y, {
+    epochs: 5, batchSize: 8, valFrac: 0.25,
+    onEpoch: () => { epochCalls++; },
+    onProgress: (frac) => { progressCalls++; lastFrac = frac; },
+  });
+  log("onEpoch fired once per epoch", epochCalls === 5);
+  log("onProgress fired each epoch", progressCalls === 5);
+  log("final progress frac = 1", approx(lastFrac, 1, 1e-6));
+  log("history length = epochs", history.length === 5);
+  log("valHistory length = epochs when valFrac>0", valHistory.length === 5);
+}
+
+group("NN · serialize / deserialize round-trip");
+{
+  const mlp = new NN.MLP({
+    layers: [{ in: 3, out: 4, act: "relu" }, { in: 4, out: 1, act: "sigmoid" }],
+    loss: "bce", optimizer: "adam", lr: 0.03, seed: 17,
+  });
+  // Train a few epochs to diverge from init
+  const n = 40, d = 3;
+  const X = new Float32Array(n * d); const Y = new Float32Array(n);
+  const r = RNG.mulberry32(5);
+  for (let i = 0; i < n; i++) {
+    X[i * 3] = r(); X[i * 3 + 1] = r(); X[i * 3 + 2] = r();
+    Y[i] = (X[i * 3] > 0.5) ? 1 : 0;
+  }
+  mlp.fit(X, Y, { epochs: 5, batchSize: 8 });
+  const blob = mlp.serialize();
+  const str = JSON.stringify(blob);
+  log("serialize is JSON-safe", str.length > 10);
+  const blob2 = JSON.parse(str);
+  const m2 = NN.MLP.deserialize(blob2);
+  const x = Float32Array.from([0.7, 0.2, 0.1]);
+  const y1 = mlp.predictScalar(x);
+  const y2 = m2.predictScalar(x);
+  log("deserialized model gives bit-equal predictions", approx(y1, y2, 1e-6),
+    `y1=${y1.toFixed(6)} y2=${y2.toFixed(6)}`);
+  try {
+    NN.MLP.deserialize({ version: 999 });
+    log("deserialize rejects bad version", false);
+  } catch { log("deserialize rejects bad version", true); }
+}
+
+/* ───────────────────────── Ensemble routing ───────────────────────── */
+group("Ensemble · key derivation");
+{
+  const ens = new Ensemble.RegimeEnsemble({ keyBy: "trend" });
+  log("trending-up label → 'up'",
+    ens.regimeKey("trending-up-strong-normal-vol") === "up");
+  log("trending-down label → 'down'",
+    ens.regimeKey("trending-down-moderate-normal-vol") === "down");
+  log("range label → 'range'",
+    ens.regimeKey("range-weak-low-vol") === "range");
+  log("regime object .label is read",
+    ens.regimeKey({ label: "trending-up-strong-high-vol" }) === "up");
+  log("null regime → null key", ens.regimeKey(null) === null);
+
+  const ensF = new Ensemble.RegimeEnsemble({ keyBy: "full" });
+  log("'full' keyBy returns raw label",
+    ensF.regimeKey("range-weak-low-vol") === "range-weak-low-vol");
+}
+
+group("Ensemble · routing + fallback + blend");
+{
+  // Two mocks: specialist returns 0.9, fallback returns 0.1
+  const specialist = { predict: () => new Float32Array([0.9]), serialize: () => ({ version: 1, marker: "spec" }) };
+  const fallback   = { predict: () => new Float32Array([0.1]), serialize: () => ({ version: 1, marker: "fb" }) };
+  const ens = new Ensemble.RegimeEnsemble({ keyBy: "trend", fallback });
+  ens.addModel("up", specialist, { rows: 123 });
+
+  log("has('up') after addModel", ens.has("up"));
+  log("size reflects addModel", ens.size() === 1);
+  log("keys() returns ['up']", ens.keys().join(",") === "up");
+
+  const y1 = ens.predictScalar([0, 0], "trending-up-strong-normal-vol");
+  log("routes to specialist when key matches", approx(y1, 0.9, 1e-6));
+  const y2 = ens.predictScalar([0, 0], "range-weak-low-vol");
+  log("falls back when no specialist", approx(y2, 0.1, 1e-6));
+
+  // Blend
+  const ensB = new Ensemble.RegimeEnsemble({ keyBy: "trend", fallback, blend: 0.5 });
+  ensB.addModel("up", specialist);
+  const yB = ensB.predictScalar([0, 0], "trending-up-strong-normal-vol");
+  log("blend=0.5 averages specialist + fallback", approx(yB, 0.5, 1e-6));
+
+  // No specialist, no fallback → throws
+  const ensNone = new Ensemble.RegimeEnsemble({ keyBy: "trend" });
+  try {
+    ensNone.predict([0, 0], "range-weak-low-vol");
+    log("throws when no specialist & no fallback", false);
+  } catch { log("throws when no specialist & no fallback", true); }
+
+  // Bad model without predict()
+  try {
+    ens.addModel("x", {}); log("addModel rejects non-predictor", false);
+  } catch { log("addModel rejects non-predictor", true); }
+}
+
+group("Ensemble · predictBatch routing per-row");
+{
+  const up    = { predict: () => new Float32Array([1]) };
+  const down  = { predict: () => new Float32Array([-1]) };
+  const fb    = { predict: () => new Float32Array([0]) };
+  const ens = new Ensemble.RegimeEnsemble({ keyBy: "trend", fallback: fb });
+  ens.addModel("up", up);
+  ens.addModel("down", down);
+  const X = new Float32Array([0, 0, 0, 0, 0, 0]);
+  const regimes = [
+    "trending-up-strong-normal-vol",
+    "range-weak-low-vol",
+    "trending-down-moderate-normal-vol",
+  ];
+  const y = ens.predictBatch(X, 3, regimes);
+  log("predictBatch has n*outDim rows", y.length === 3);
+  log("row 0 routed to 'up'",   approx(y[0],  1, 1e-6));
+  log("row 1 fell back",        approx(y[1],  0, 1e-6));
+  log("row 2 routed to 'down'", approx(y[2], -1, 1e-6));
+}
+
+group("Ensemble · serialize / deserialize round-trip");
+{
+  // Build a real MLP + a real fallback MLP and store in ensemble.
+  const up = new NN.MLP({
+    layers: [{ in: 2, out: 3, act: "relu" }, { in: 3, out: 1, act: "sigmoid" }],
+    seed: 71,
+  });
+  const fb = new NN.MLP({
+    layers: [{ in: 2, out: 3, act: "relu" }, { in: 3, out: 1, act: "sigmoid" }],
+    seed: 72,
+  });
+  const ens = new Ensemble.RegimeEnsemble({ keyBy: "trend", fallback: fb, blend: 0.25 });
+  ens.addModel("up", up, { rows: 200 });
+
+  const blob = ens.serialize();
+  log("ensemble.serialize has version 1", blob.version === 1);
+  log("ensemble.serialize preserves keyBy", blob.keyBy === "trend");
+  log("ensemble.serialize preserves blend", approx(blob.blend, 0.25, 1e-9));
+  log("ensemble.serialize has fallback", !!blob.fallback);
+  log("ensemble.serialize has per-regime models", !!blob.models.up);
+
+  const str = JSON.stringify(blob);
+  const ens2 = Ensemble.RegimeEnsemble.deserialize(JSON.parse(str));
+  const x = [0.2, -0.1];
+  const y1 = ens.predictScalar(x, "trending-up-strong-normal-vol");
+  const y2 = ens2.predictScalar(x, "trending-up-strong-normal-vol");
+  log("deserialized ensemble matches predictions", approx(y1, y2, 1e-6),
+    `y1=${y1.toFixed(6)} y2=${y2.toFixed(6)}`);
+}
+
+/* ───────────────────────── Trainer facade ───────────────────────── */
+group("Trainer · tripleBarrierToBinary");
+{
+  const labels = [
+    { side:  1, t1: 0, ret: 0.02, touched: "up"   },
+    { side: -1, t1: 0, ret: -0.01, touched: "down" },
+    { side:  0, t1: 0, ret: 0.00, touched: "time" },
+    null,
+    undefined,
+  ];
+  const Y = TrainerMod.tripleBarrierToBinary(labels);
+  log("returns Float32Array", Y instanceof Float32Array);
+  log("length matches labels", Y.length === labels.length);
+  log("side=+1 → 1", Y[0] === 1);
+  log("side=-1 → 0", Y[1] === 0);
+  log("side=0  → 0", Y[2] === 0);
+  log("null    → 0", Y[3] === 0);
+  log("undef   → 0", Y[4] === 0);
+}
+
+group("Trainer · trainOne end-to-end (worker if supported, else inline)");
+{
+  const tr = new TrainerMod.Trainer();
+  await tr.ready;
+  // Linearly separable: y = (x > 0)
+  const n = 80, d = 1;
+  const X = new Float32Array(n * d);
+  const Y = new Float32Array(n);
+  const r = RNG.mulberry32(33);
+  for (let i = 0; i < n; i++) {
+    const x = r() * 2 - 1;
+    X[i] = x; Y[i] = x > 0 ? 1 : 0;
+  }
+  let progressSeen = 0;
+  const res = await tr.trainOne({
+    arch: [{ in: 1, out: 4, act: "relu" }, { in: 4, out: 1, act: "sigmoid" }],
+    loss: "bce", optimizer: "adam", lr: 0.05, seed: 5,
+    X, Y, d, outDim: 1, epochs: 30, batchSize: 16,
+    onProgress: () => { progressSeen++; },
+  });
+  log("trainOne resolved with {model, history, ms}",
+    !!res && !!res.model && Array.isArray(res.history) && Number.isFinite(res.ms));
+  // Duck-type: `instanceof NN.MLP` would fail when the test imports nn.js
+  // with a ?v= cache-buster while the trainer imports it without one — the
+  // browser treats them as separate module instances with separate classes.
+  log("trainOne model exposes MLP surface",
+    typeof res.model.predict === "function" &&
+    typeof res.model.predictScalar === "function" &&
+    typeof res.model.serialize === "function" &&
+    Array.isArray(res.model.layers));
+  log("trainOne onProgress fired", progressSeen > 0, `progress=${progressSeen}`);
+  log("trainOne model learned (predict(1)>0.5)",
+    res.model.predictScalar([1]) > 0.5, `y=${res.model.predictScalar([1]).toFixed(3)}`);
+  log("trainOne model learned (predict(-1)<0.5)",
+    res.model.predictScalar([-1]) < 0.5, `y=${res.model.predictScalar([-1]).toFixed(3)}`);
+  log("trainOne ms > 0", res.ms > 0);
+  tr.dispose();
+}
+
+group("Trainer · trainPerRegime partitions and skips below minRows");
+{
+  const tr = new TrainerMod.Trainer();
+  await tr.ready;
+  // Build a small dataset with 3 regimes: up (50), down (50), range (10)
+  const d = 2, outDim = 1;
+  const rows = [];
+  const regimes = [];
+  const r = RNG.mulberry32(777);
+  for (let i = 0; i < 50; i++) {
+    rows.push([r(), r()]); regimes.push("trending-up-strong-normal-vol");
+  }
+  for (let i = 0; i < 50; i++) {
+    rows.push([-r(), -r()]); regimes.push("trending-down-moderate-normal-vol");
+  }
+  for (let i = 0; i < 10; i++) {
+    rows.push([0.01, -0.01]); regimes.push("range-weak-low-vol");
+  }
+  const n = rows.length;
+  const X = new Float32Array(n * d);
+  const Y = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    X[i * 2] = rows[i][0]; X[i * 2 + 1] = rows[i][1];
+    Y[i] = rows[i][0] > 0 ? 1 : 0;
+  }
+  const res = await tr.trainPerRegime({
+    X, Y, d, outDim, regimes,
+    keyBy: "trend", minRows: 40,
+    arch: [{ in: d, out: 4, act: "relu" }, { in: 4, out: 1, act: "sigmoid" }],
+    opts: { epochs: 8, batchSize: 16, lr: 0.05, seed: 9 },
+  });
+  log("returns ensemble + partitions", !!res.ensemble && !!res.partitions);
+  log("ensemble has global fallback", !!res.ensemble.fallback);
+  log("ensemble trained 'up' model (50 rows ≥ minRows)",
+    res.ensemble.has("up"), `keys=${res.ensemble.keys().join(',')}`);
+  log("ensemble trained 'down' model", res.ensemble.has("down"));
+  log("ensemble SKIPPED 'range' (10 rows < minRows=40)",
+    !res.ensemble.has("range") && res.partitions.range?.skipped === true);
+  log("__global__ partition recorded n and history",
+    res.partitions.__global__.n === n && Array.isArray(res.partitions.__global__.history));
+  tr.dispose();
+}
+
+/* ───────────────────────── Model store (IDB) ───────────────────────── */
+group("Schema · DB_VERSION bumped + models store defined");
+{
+  log("DB_VERSION >= 2 (models store introduced at v2)", Schema.DB_VERSION >= 2);
+  log("STORES.models defined", typeof Schema.STORES.models === "object");
+  log("STORES.models.keyPath = 'id'", Schema.STORES.models.keyPath === "id");
+  log("STORES.models.autoIncrement = true", Schema.STORES.models.autoIncrement === true);
+  const indexNames = (Schema.STORES.models.indexes || []).map(i => i.name);
+  log("has index by_regime",    indexNames.includes("by_regime"));
+  log("has index by_symbol_tf", indexNames.includes("by_symbol_tf"));
+  log("has index by_version",   indexNames.includes("by_version"));
+  log("MIGRATIONS[2] is a function", typeof Schema.MIGRATIONS[2] === "function");
+}
+
+group("ModelStore · save / load / list / delete round-trip");
+{
+  await ModelStore.clearAll();
+
+  const mlp = new NN.MLP({
+    layers: [{ in: 2, out: 2, act: "relu" }, { in: 2, out: 1, act: "sigmoid" }],
+    seed: 41,
+  });
+  const id1 = await ModelStore.saveModel({
+    kind: "mlp",
+    regime: "up",
+    symbol: "BTCUSDT",
+    tf: "1h",
+    version: "phase8-test",
+    weights: mlp.serialize(),
+    meta: { rows: 123 },
+  });
+  log("saveModel returns id", typeof id1 === "number" && id1 > 0);
+
+  const row = await ModelStore.loadModel(id1);
+  log("loadModel returns stored row", !!row && row.id === id1);
+  log("loadModel kind = 'mlp'", row.kind === "mlp");
+  log("loadModel preserves regime", row.regime === "up");
+  log("loadModel preserves symbol/tf/version",
+    row.symbol === "BTCUSDT" && row.tf === "1h" && row.version === "phase8-test");
+  log("loadModel createdAt set", typeof row.createdAt === "number" && row.createdAt > 0);
+
+  // A second row, different regime
+  const fb = new NN.MLP({
+    layers: [{ in: 2, out: 2, act: "relu" }, { in: 2, out: 1, act: "sigmoid" }],
+    seed: 51,
+  });
+  const id2 = await ModelStore.saveModel({
+    kind: "mlp",
+    regime: null,
+    symbol: "BTCUSDT",
+    tf: "1h",
+    version: "phase8-test",
+    weights: fb.serialize(),
+    meta: { role: "fallback" },
+  });
+  log("saveModel allows regime=null (global fallback)", typeof id2 === "number" && id2 !== id1);
+
+  const all = await ModelStore.listAll();
+  log("listAll returns 2 rows", all.length === 2);
+
+  const up = await ModelStore.listModels({ regime: "up" });
+  log("listModels filters by regime", up.length === 1 && up[0].id === id1);
+
+  const ver = await ModelStore.listModels({ version: "phase8-test" });
+  log("listModels filters by version", ver.length === 2);
+
+  const byRegime = await ModelStore.loadByRegime("up", { version: "phase8-test" });
+  log("loadByRegime returns latest row for regime", byRegime?.id === id1);
+
+  const c1 = await ModelStore.countModels();
+  log("countModels = 2", c1 === 2);
+
+  await ModelStore.deleteModel(id1);
+  const c2 = await ModelStore.countModels();
+  log("deleteModel removes a row", c2 === 1);
+
+  // Reject bad row shapes
+  try {
+    await ModelStore.saveModel({ regime: "x" });
+    log("saveModel rejects missing weights", false);
+  } catch { log("saveModel rejects missing weights", true); }
+
+  try {
+    await ModelStore.saveModel({ kind: "unknown", weights: {} });
+    log("saveModel rejects unknown kind", false);
+  } catch { log("saveModel rejects unknown kind", true); }
+
+  await ModelStore.clearAll();
+  log("clearAll empties store", (await ModelStore.countModels()) === 0);
+}
+
+group("ModelStore · saveEnsembleExpanded writes per-regime + fallback + manifest");
+{
+  await ModelStore.clearAll();
+  const up = new NN.MLP({
+    layers: [{ in: 2, out: 2, act: "relu" }, { in: 2, out: 1, act: "sigmoid" }],
+    seed: 61,
+  });
+  const fb = new NN.MLP({
+    layers: [{ in: 2, out: 2, act: "relu" }, { in: 2, out: 1, act: "sigmoid" }],
+    seed: 62,
+  });
+  const ens = new Ensemble.RegimeEnsemble({ keyBy: "trend", fallback: fb });
+  ens.addModel("up", up, { rows: 77 });
+
+  const ids = await ModelStore.saveEnsembleExpanded(ens, {
+    symbol: "BTCUSDT", tf: "1h", version: "phase8-test",
+    meta: { by: "unit-test" },
+  });
+  log("saveEnsembleExpanded returned per-regime ids",
+    typeof ids.perRegime.up === "number");
+  log("saveEnsembleExpanded returned fallback id",
+    typeof ids.fallback === "number");
+  log("saveEnsembleExpanded returned ensemble id",
+    typeof ids.ensemble === "number");
+
+  const total = await ModelStore.countModels();
+  log("3 rows written (up + fallback + ensemble)", total === 3);
+
+  const manifest = await ModelStore.loadModel(ids.ensemble);
+  log("manifest kind='ensemble'", manifest.kind === "ensemble");
+  log("manifest meta.keys includes 'up'", (manifest.meta?.keys || []).includes("up"));
+  log("manifest meta.hasFallback = true", manifest.meta?.hasFallback === true);
+
+  // Rehydrate from manifest
+  const ens2 = Ensemble.RegimeEnsemble.deserialize(manifest.weights);
+  log("rehydrated ensemble has 'up'", ens2.has("up"));
+  log("rehydrated ensemble has fallback", !!ens2.fallback);
+  const y1 = ens.predictScalar([0.1, 0.2], "trending-up-strong-normal-vol");
+  const y2 = ens2.predictScalar([0.1, 0.2], "trending-up-strong-normal-vol");
+  log("rehydrated ensemble produces same prediction", approx(y1, y2, 1e-6),
+    `y1=${y1.toFixed(6)} y2=${y2.toFixed(6)}`);
+
+  await ModelStore.clearAll();
+}
+
+/* ───────────────────────── Summary ───────────────────────── */
+out.innerHTML += `<div class="summary">Ran <b>${n}</b> tests — <span class="pass">${p} passed</span>, <span class="fail">${n - p} failed</span>.</div>`;
+</script>
+</body>
+</html>

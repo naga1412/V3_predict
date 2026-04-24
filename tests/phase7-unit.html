@@ -1,0 +1,570 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>MNP · Phase 7 unit tests</title>
+<style>
+  body { background:#131722; color:#d1d4dc; font:13px/1.5 monospace; padding:20px; }
+  .pass { color:#26a69a; }
+  .fail { color:#ef5350; }
+  .group { margin-top: 12px; font-weight:bold; color:#2962ff; }
+  h1 { color:#fff; font-size:18px; }
+  #out { white-space: pre-wrap; }
+  .note { color:#787b86; }
+  .summary { margin-top: 16px; padding: 8px; border:1px solid #2a2e39; }
+</style>
+</head>
+<body>
+<h1>MNP — Phase 7 unit tests</h1>
+<div id="out">running…</div>
+
+<script type="module">
+const out = document.getElementById("out");
+window.addEventListener("error", (e) => {
+  out.innerHTML += `<span class="fail">✗ ${e.message}</span>\n<span class="note">${e.filename}:${e.lineno}:${e.colno}</span>\n`;
+});
+window.addEventListener("unhandledrejection", (e) => {
+  out.innerHTML += `<span class="fail">✗ unhandled: ${e.reason?.message || e.reason}</span>\n<span class="note">${e.reason?.stack || ''}</span>\n`;
+});
+
+const V = "p7-" + Date.now();
+function findBase() {
+  for (const u of [window.location?.href, document.baseURI, import.meta.url]) {
+    if (u && !u.startsWith("data:") && !u.startsWith("blob:")) return u;
+  }
+  return window.location?.href || "file:///";
+}
+const BASE = findBase();
+const IS_FILE = BASE.startsWith("file:");
+const U = (p) => {
+  const url = new URL(p, BASE).href;
+  return IS_FILE ? url : `${url}?v=${V}`;
+};
+
+let Base, Registry, Orchestrator, Calibration, Eng;
+let TF, MR, MO, BR, SR, VR, VP, CP, OB, LQ, PD, SC;
+try {
+  [Base, Registry, Orchestrator, Calibration, Eng,
+   TF, MR, MO, BR, SR, VR, VP, CP, OB, LQ, PD, SC] = await Promise.all([
+    import(U("../src/modules/baseModule.js")),
+    import(U("../src/modules/registry.js")),
+    import(U("../src/modules/orchestrator.js")),
+    import(U("../src/ml/calibration.js")),
+    import(U("../src/ta/engine.js")),
+    import(U("../src/modules/trendFollow.js")),
+    import(U("../src/modules/meanReversion.js")),
+    import(U("../src/modules/momentum.js")),
+    import(U("../src/modules/breakout.js")),
+    import(U("../src/modules/supportResistance.js")),
+    import(U("../src/modules/volatilityRegime.js")),
+    import(U("../src/modules/volumeProfile.js")),
+    import(U("../src/modules/candlePatterns.js")),
+    import(U("../src/modules/orderBlocks.js")),
+    import(U("../src/modules/liquidity.js")),
+    import(U("../src/modules/premiumDiscount.js")),
+    import(U("../src/modules/sessionCalendar.js")),
+  ]);
+} catch (err) {
+  out.innerHTML = `<span class="fail">✗ import failed: ${err.message}</span>\n<span class="note">${err.stack || ''}</span>`;
+  throw err;
+}
+out.textContent = "";
+
+let n = 0, p = 0;
+const log = (s, ok, err) => {
+  out.innerHTML += `<span class="${ok?'pass':'fail'}">${ok?'✓':'✗'} ${s}${err ? ' — ' + err : ''}</span>\n`;
+  n++; if (ok) p++;
+};
+const group = (s) => { out.innerHTML += `<span class="group">[${s}]</span>\n`; };
+function mkCandle(t, o, h, l, c, v = 1) { return { t, o, h, l, c, v }; }
+
+// ─────────────────────────────────────────────────────────────
+// Build a couple of reusable TA snapshots from real-ish candles.
+const MIN = 60_000;
+// Accelerating quadratic trend keeps MACD histogram robustly positive/negative
+// even in the later bars where a purely linear trend would stabilize near zero.
+function buildUptrend(nb = 260) {
+  const out = [];
+  let t = Date.UTC(2026, 0, 1, 0, 0, 0);
+  for (let i = 0; i < nb; i++) {
+    const base = 100 + i * 0.3 + i * i * 0.002;
+    const o = base - 0.1, c = base + 0.1;
+    out.push(mkCandle(t, o, base + 0.4, base - 0.4, c, 100 + (i % 5) * 10));
+    t += MIN;
+  }
+  return out;
+}
+function buildDowntrend(nb = 260) {
+  const out = [];
+  let t = Date.UTC(2026, 0, 1, 0, 0, 0);
+  const maxP = 100 + (nb - 1) * 0.3 + (nb - 1) * (nb - 1) * 0.002 + 50;
+  for (let i = 0; i < nb; i++) {
+    const base = maxP - (i * 0.3 + i * i * 0.002);
+    const o = base + 0.1, c = base - 0.1;
+    out.push(mkCandle(t, o, base + 0.4, base - 0.4, c, 100));
+    t += MIN;
+  }
+  return out;
+}
+function buildRange(nb = 240) {
+  const out = [];
+  let t = Date.UTC(2026, 0, 1, 0, 0, 0);
+  for (let i = 0; i < nb; i++) {
+    const jitter = (i % 2 === 0) ? 0.1 : -0.1;
+    const base = 100 + jitter;
+    out.push(mkCandle(t, base, base + 0.05, base - 0.05, base, 100));
+    t += MIN;
+  }
+  return out;
+}
+const taUp = Eng.TAEngine.compute(buildUptrend());
+const taDn = Eng.TAEngine.compute(buildDowntrend());
+const taRg = Eng.TAEngine.compute(buildRange());
+
+/* ─────────── baseModule ─────────── */
+group("baseModule");
+{
+  const nu = Base.neutral("x");
+  log("neutral has zero signal", nu.signal === 0 && nu.confidence === 0);
+  log("neutral direction is 'neutral'", nu.direction === "neutral");
+  log("neutral.reasons is array", Array.isArray(nu.reasons));
+
+  const clamped = Base.clampSignal({ signal: 2, confidence: 1.5 });
+  log("clampSignal caps signal at 1", clamped.signal === 1);
+  log("clampSignal caps confidence at 1", clamped.confidence === 1);
+  const below = Base.clampSignal({ signal: -2.5, confidence: -0.5 });
+  log("clampSignal floors signal at -1", below.signal === -1);
+  log("clampSignal floors confidence at 0", below.confidence === 0);
+
+  const pos = Base.clampSignal({ signal: 0.8, confidence: 0.5 });
+  const neg = Base.clampSignal({ signal: -0.8, confidence: 0.5 });
+  const zero = Base.clampSignal({ signal: 0.01, confidence: 0.5 });
+  log("direction='long' when signal > 0.05", pos.direction === "long");
+  log("direction='short' when signal < -0.05", neg.direction === "short");
+  log("direction='neutral' when |signal| ≤ 0.05", zero.direction === "neutral");
+
+  log("num(NaN, 7) = 7", Base.num(NaN, 7) === 7);
+  log("num(3.14) = 3.14", Base.num(3.14) === 3.14);
+  log("lastFinite finds tail value", Base.lastFinite([1, NaN, 3, NaN]) === 3);
+  log("lastFinite([]) is NaN", Number.isNaN(Base.lastFinite([])));
+  log("lastFinite(null) is NaN", Number.isNaN(Base.lastFinite(null)));
+  log("pctDist(110,100) = 0.1", Math.abs(Base.pctDist(110, 100) - 0.1) < 1e-9);
+  log("pctDist(x, 0) = 0 (safe)", Base.pctDist(5, 0) === 0);
+  log("sigmoid(0) = 0.5", Math.abs(Base.sigmoid(0) - 0.5) < 1e-9);
+  log("sigmoid monotone", Base.sigmoid(5) > Base.sigmoid(-5));
+}
+
+/* ─────────── Individual modules ─────────── */
+group("module: trendFollow");
+{
+  const sig = TF.evaluate(taUp);
+  log("strong uptrend → signal > 0", sig.signal > 0);
+  log("strong uptrend → direction long", sig.direction === "long");
+  log("confidence > 0", sig.confidence > 0);
+  log("reasons non-empty", sig.reasons.length > 0);
+
+  const sigDn = TF.evaluate(taDn);
+  log("strong downtrend → signal < 0", sigDn.signal < 0);
+
+  const empty = TF.evaluate({ ema20: [], ema50: [], ema200: [], adx14: { adx: [], plusDI: [], minusDI: [] } });
+  log("empty input → neutral", empty.signal === 0 && empty.confidence === 0);
+}
+
+group("module: meanReversion");
+{
+  const sig = MR.evaluate(taRg);
+  log("returns a signal object", typeof sig === "object" && "signal" in sig);
+  log("confidence in [0,1]", sig.confidence >= 0 && sig.confidence <= 1);
+  log("range market → not hugely confident", sig.confidence < 0.7);
+
+  const empty = MR.evaluate({ close: [], rsi14: [], bb_20_2: {} });
+  log("empty → neutral", empty.signal === 0);
+}
+
+group("module: momentum");
+{
+  const sig = MO.evaluate(taUp);
+  log("uptrend → signal > 0", sig.signal > 0);
+  const sigDn = MO.evaluate(taDn);
+  log("downtrend → signal < 0", sigDn.signal < 0);
+  const empty = MO.evaluate({ close: [], macd_12_26_9: { hist: [] }, roc10: [] });
+  log("empty → neutral", empty.signal === 0 && empty.confidence === 0);
+}
+
+group("module: breakout");
+{
+  // Synthetic TA with a break event
+  const ta = {
+    close: [100, 101, 102, 103, 104, 105, 110],
+    volume: [100, 100, 100, 100, 100, 100, 250],
+    breaks: [{ i: 6, dir: "up", type: "BoS" }],
+  };
+  const sig = BR.evaluate(ta);
+  log("recent up-break → signal > 0", sig.signal > 0);
+  log("volume confirmation in reasons", sig.reasons.some(r => /volume/i.test(r)));
+
+  const stale = {
+    close: new Array(30).fill(100),
+    volume: new Array(30).fill(100),
+    breaks: [{ i: 0, dir: "up", type: "BoS" }],
+  };
+  const sSig = BR.evaluate(stale);
+  log("stale break beyond lookback → near-zero", sSig.confidence <= 0.15);
+
+  const none = BR.evaluate({ close: [100], volume: [100], breaks: [] });
+  log("no breaks → neutral", none.signal === 0 && none.confidence === 0);
+}
+
+group("module: supportResistance");
+{
+  // Close slightly ABOVE the support level so the level qualifies as support
+  // (and the OTHER level is above → resistance far away).
+  const ta = {
+    close: [100.05],
+    atr14: [0.2],
+    levels: [{ price: 100, strength: 3, touches: 3 }, { price: 110, strength: 2 }],
+  };
+  const sig = SR.evaluate(ta);
+  log("near support → long bias", sig.signal > 0);
+
+  // Close slightly BELOW the resistance level so that level qualifies as resistance
+  // and the lower level qualifies as support (far away).
+  const taR = {
+    close: [109.95],
+    atr14: [0.2],
+    levels: [{ price: 100, strength: 3 }, { price: 110, strength: 3 }],
+  };
+  const sigR = SR.evaluate(taR);
+  log("at resistance → short bias", sigR.signal < 0);
+
+  const none = SR.evaluate({ close: [], levels: [] });
+  log("no levels → neutral", none.signal === 0);
+}
+
+group("module: volatilityRegime");
+{
+  const sig = VR.evaluate(taUp);
+  log("shape is a signal object", typeof sig === "object" && "signal" in sig);
+  log("confidence in [0,1]", sig.confidence >= 0 && sig.confidence <= 1);
+
+  const none = VR.evaluate({ close: [], bb_20_2: { mid: [], up: [], lo: [] } });
+  log("empty → neutral", none.signal === 0 && none.confidence === 0);
+}
+
+group("module: volumeProfile");
+{
+  const sig = VP.evaluate(taUp);
+  log("returns a signal object", typeof sig === "object" && "signal" in sig);
+  log("confidence in [0,1]", sig.confidence >= 0 && sig.confidence <= 1);
+  const none = VP.evaluate({ obv: [], cmf20: [], volume: [] });
+  log("no volume indicators → neutral", none.signal === 0 && none.confidence === 0);
+}
+
+group("module: candlePatterns");
+{
+  const ta = {
+    close: [100, 100.5, 101],
+    trend: "down",
+    patterns: [{ i: 2, patterns: ["hammer"] }],
+  };
+  const sig = CP.evaluate(ta);
+  log("hammer against down-trend → long", sig.signal > 0);
+  log("reversal pattern scores stronger against trend", sig.confidence >= 0.3);
+
+  const ta2 = {
+    close: [100, 100.5, 101],
+    trend: "up",
+    patterns: [{ i: 2, patterns: ["bearEngulf"] }],
+  };
+  const sig2 = CP.evaluate(ta2);
+  log("bearEngulf against up-trend → short", sig2.signal < 0);
+
+  const none = CP.evaluate({ close: [100], patterns: [] });
+  log("no patterns → neutral", none.signal === 0 && none.confidence === 0);
+}
+
+group("module: orderBlocks");
+{
+  const ta = {
+    close: [102],
+    atr14: [1],
+    orderBlocks: [{ i: 5, kind: "bull", top: 103, bot: 101, mitigated: false }],
+  };
+  const sig = OB.evaluate(ta);
+  log("inside bull OB → long", sig.signal > 0);
+
+  const ta2 = {
+    close: [99],
+    atr14: [1],
+    orderBlocks: [{ i: 5, kind: "bear", top: 101, bot: 99, mitigated: false }],
+  };
+  const sig2 = OB.evaluate(ta2);
+  log("inside bear OB → short", sig2.signal < 0);
+
+  const mit = {
+    close: [100],
+    atr14: [1],
+    orderBlocks: [{ i: 1, kind: "bull", top: 101, bot: 99, mitigated: true }],
+  };
+  const mSig = OB.evaluate(mit);
+  log("all OBs mitigated → near-zero signal", Math.abs(mSig.signal) < 0.1);
+
+  const none = OB.evaluate({ close: [100], orderBlocks: [] });
+  log("no OBs → neutral", none.signal === 0 && none.confidence === 0);
+}
+
+group("module: liquidity");
+{
+  const ta = {
+    close: new Array(10).fill(100),
+    atr14: [0.5],
+    liquidity: {
+      sweeps: [{ i: 9, kind: "bearish" }],
+      eqHighs: [],
+      eqLows: [],
+    },
+  };
+  const sig = LQ.evaluate(ta);
+  log("recent bearish sweep → long (trap reversal)", sig.signal > 0);
+
+  const ta2 = {
+    close: new Array(10).fill(100),
+    atr14: [0.5],
+    liquidity: { sweeps: [{ i: 9, kind: "bullish" }], eqHighs: [], eqLows: [] },
+  };
+  const sig2 = LQ.evaluate(ta2);
+  log("recent bullish sweep → short (trap reversal)", sig2.signal < 0);
+
+  const none = LQ.evaluate({ close: [100], liquidity: { sweeps: [], eqHighs: [], eqLows: [] } });
+  log("no sweeps/pools → near-zero", Math.abs(none.signal) < 0.1);
+}
+
+group("module: premiumDiscount");
+{
+  const taD = { premiumDiscount: { lastPct: 0.10, lastZone: "discount" } };
+  const sigD = PD.evaluate(taD);
+  log("deep discount → long bias", sigD.signal > 0);
+
+  const taP = { premiumDiscount: { lastPct: 0.90, lastZone: "premium" } };
+  const sigP = PD.evaluate(taP);
+  log("deep premium → short bias", sigP.signal < 0);
+
+  const taE = { premiumDiscount: { lastPct: 0.50, lastZone: "equilibrium" } };
+  const sigE = PD.evaluate(taE);
+  log("equilibrium → neutral", sigE.signal === 0);
+
+  const none = PD.evaluate({});
+  log("missing premiumDiscount → neutral", none.signal === 0);
+}
+
+group("module: sessionCalendar");
+{
+  const taA = { sessions: { tags: ["london"] }, t: [1] };
+  const sigA = SC.evaluate(taA);
+  log("active session → multiplier > 1", sigA.payload?.multiplier > 1);
+
+  const taO = { sessions: { tags: ["off-hours"] }, t: [1] };
+  const sigO = SC.evaluate(taO);
+  log("off-hours → multiplier < 1", sigO.payload?.multiplier < 1);
+
+  // Event calendar dampens further
+  const fakeCal = { isInEventWindow: () => ({ active: true, phase: "pre", event: { name: "FOMC" } }) };
+  const sigE = SC.evaluate(taA, { calendar: fakeCal, now: 1_000 });
+  log("event window further dampens multiplier", sigE.payload.multiplier < sigA.payload.multiplier);
+}
+
+/* ─────────── Registry ─────────── */
+group("registry");
+{
+  log("MODULES is an array", Array.isArray(Registry.MODULES));
+  log("MODULES has 13 entries (12 baseline + CISD)", Registry.MODULES.length === 13);
+
+  const ids = Registry.MODULES.map(m => m.meta.id);
+  const uniqueIds = new Set(ids);
+  log("all module ids are unique", uniqueIds.size === ids.length);
+
+  for (const m of Registry.MODULES) {
+    log(`module "${m.meta.id}" has evaluate()`, typeof m.evaluate === "function");
+  }
+
+  log("MODULES_BY_ID is an object", typeof Registry.MODULES_BY_ID === "object");
+  log("getModule('trend-follow') works", Registry.getModule("trend-follow")?.meta?.id === "trend-follow");
+  log("getModule('nonexistent') returns null", Registry.getModule("nonexistent") === null);
+
+  const list = Registry.listModules();
+  log("listModules returns array of meta copies", Array.isArray(list) && list.length === 13 && list[0].id);
+
+  // meta freezes
+  const m0 = Registry.MODULES[0];
+  let wasFrozen = Object.isFrozen(m0.meta);
+  log("meta objects are frozen", wasFrozen);
+}
+
+/* ─────────── Orchestrator ─────────── */
+group("orchestrator");
+{
+  const r = Orchestrator.runModules(taUp);
+  log("result has signals array", Array.isArray(r.signals));
+  log("signals length = 13 (12 baseline + CISD)", r.signals.length === 13);
+  log("rawScore in [-1,+1]", r.rawScore >= -1 && r.rawScore <= 1);
+  log("probability in [0,1]", r.probability >= 0 && r.probability <= 1);
+  log("uptrend → probability > 0.5", r.probability > 0.5);
+  log("direction is long/short/neutral", ["long","short","neutral"].includes(r.direction));
+  log("reasonsByModule keyed by id", typeof r.reasonsByModule === "object" && "trend-follow" in r.reasonsByModule);
+  log("bySignal keyed by id", typeof r.bySignal === "object" && "trend-follow" in r.bySignal);
+  log("participating count is a number", Number.isFinite(r.participating));
+
+  const rDn = Orchestrator.runModules(taDn);
+  log("downtrend → probability < 0.5", rDn.probability < 0.5);
+
+  // only filter
+  const r2 = Orchestrator.runModules(taUp, { only: ["trend-follow", "momentum"] });
+  log("only-filter runs exactly the listed modules' evaluate", r2.signals.length === 2);
+
+  // exclude filter
+  const r3 = Orchestrator.runModules(taUp, { exclude: ["session-calendar"] });
+  log("exclude-filter removes a module", r3.signals.length === 12);
+
+  // weights override
+  const r4 = Orchestrator.runModules(taUp, { weights: { "trend-follow": 10 } });
+  log("weighted result stays in [-1,+1]", r4.rawScore >= -1 && r4.rawScore <= 1);
+
+  // calibrator hook
+  const calibrator = { predict: () => 0.777 };
+  const r5 = Orchestrator.runModules(taUp, { calibrator });
+  log("custom calibrator applied", Math.abs(r5.probability - 0.777) < 1e-9);
+
+  // Session calendar globalMult applied
+  const taOff = {
+    ...taUp,
+    sessions: { tags: new Array(taUp.t.length).fill("off-hours") },
+  };
+  const rA = Orchestrator.runModules(taUp);
+  const rO = Orchestrator.runModules(taOff);
+  log("globalMult captured as finite number", Number.isFinite(rO.globalMult));
+  log("off-hours gives lower globalMult than default", rO.globalMult < 1 && rO.globalMult < rA.globalMult * 1.01);
+
+  // Error isolation — a pathological TA shouldn't crash the orchestrator;
+  // all 13 signals should still be produced (with clamped shape).
+  const pathTA = { close: undefined, ema20: undefined, bb_20_2: null };
+  const rErr = Orchestrator.runModules(pathTA);
+  log("pathological TA returns all 13 signals", rErr.signals.length === 13);
+  log("pathological run yields finite rawScore", Number.isFinite(rErr.rawScore));
+  log("pathological run yields probability in [0,1]",
+    rErr.probability >= 0 && rErr.probability <= 1);
+}
+
+/* ─────────── Calibration ─────────── */
+group("calibration: Platt");
+{
+  // Synthetic labels that align with scores: positive score → positive label
+  const scores = [], labels = [];
+  for (let i = 0; i < 400; i++) {
+    const s = (Math.random() * 2) - 1;
+    scores.push(s);
+    labels.push(s + (Math.random() - 0.5) * 0.4 > 0 ? 1 : 0);
+  }
+  const m = Calibration.fitPlatt(scores, labels, { epochs: 400, lr: 0.1 });
+  log("model type = 'platt'", m.type === "platt");
+  log("a and b are finite", Number.isFinite(m.a) && Number.isFinite(m.b));
+  log("a > 0 (correlated data)", m.a > 0);
+
+  const p0 = Calibration.plattPredict(m, -1);
+  const p1 = Calibration.plattPredict(m, 0);
+  const p2 = Calibration.plattPredict(m, 1);
+  log("Platt predict in [0,1]", [p0, p1, p2].every(p => p >= 0 && p <= 1));
+  log("Platt monotone in score", p0 < p1 && p1 < p2);
+
+  // Empty-input safe
+  const emptyM = Calibration.fitPlatt([], []);
+  log("empty fit returns defaults", emptyM.a === 0 && emptyM.b === 0);
+}
+
+group("calibration: Isotonic");
+{
+  // Monotone-increasing relationship between scores and label-prob
+  const scores = [], labels = [];
+  for (let i = 0; i < 200; i++) {
+    const s = (i / 200) - 0.5;    // -0.5 → +0.5
+    const prob = 1 / (1 + Math.exp(-s * 6));
+    scores.push(s);
+    labels.push(Math.random() < prob ? 1 : 0);
+  }
+  const iso = Calibration.fitIsotonic(scores, labels);
+  log("model type = 'isotonic'", iso.type === "isotonic");
+  log("xs and ys arrays present", Array.isArray(iso.xs) && Array.isArray(iso.ys));
+  log("xs.length == ys.length", iso.xs.length === iso.ys.length);
+
+  // ys must be monotone non-decreasing (PAV property)
+  let monotone = true;
+  for (let i = 1; i < iso.ys.length; i++) if (iso.ys[i] < iso.ys[i - 1] - 1e-9) { monotone = false; break; }
+  log("isotonic ys are monotone non-decreasing", monotone);
+
+  const lo = Calibration.isotonicPredict(iso, -1);
+  const hi = Calibration.isotonicPredict(iso,  1);
+  log("predict in [0,1]", lo >= 0 && lo <= 1 && hi >= 0 && hi <= 1);
+  log("predict monotone at extremes", lo <= hi);
+
+  // below lower bound clamps to first y
+  log("below-range predict returns first y", Calibration.isotonicPredict(iso, -999) === iso.ys[0]);
+  log("above-range predict returns last y", Calibration.isotonicPredict(iso, 999) === iso.ys[iso.ys.length - 1]);
+
+  const emptyIso = Calibration.fitIsotonic([], []);
+  log("empty isotonic returns default 0.5 prediction", Calibration.isotonicPredict(emptyIso, 0.3) === 0.5);
+}
+
+group("calibration: asPredictor");
+{
+  const plattM = Calibration.fitPlatt([-1, 0, 1, -0.5, 0.5], [0, 0, 1, 0, 1], { epochs: 200 });
+  const pr = Calibration.asPredictor(plattM);
+  log("asPredictor returns object with predict()", typeof pr.predict === "function");
+  log("Platt predictor yields value in [0,1]", pr.predict(0.5) >= 0 && pr.predict(0.5) <= 1);
+
+  const iso = Calibration.fitIsotonic([-1, 0, 1], [0, 0.5, 1]);
+  const pri = Calibration.asPredictor(iso);
+  log("Isotonic predictor yields value in [0,1]", pri.predict(0) >= 0 && pri.predict(0) <= 1);
+
+  const prNone = Calibration.asPredictor(null);
+  log("null model falls back to default predictor", typeof prNone.predict === "function" && Math.abs(prNone.predict(0) - 0.5) < 1e-9);
+
+  let threw = false;
+  try { Calibration.asPredictor({ type: "unknown" }); } catch { threw = true; }
+  log("unknown model type throws", threw);
+}
+
+group("calibration: diagnostics");
+{
+  const probs  = [0.9, 0.1, 0.8, 0.2, 0.55, 0.45];
+  const labels = [  1,   0,   1,   0,    1,    0];
+
+  const brier = Calibration.brierScore(probs, labels);
+  log("brier is finite", Number.isFinite(brier));
+  log("brier > 0 with imperfect calibration", brier > 0);
+  const brierPerfect = Calibration.brierScore([1, 0, 1, 0], [1, 0, 1, 0]);
+  log("brier is 0 with perfect calibration", brierPerfect === 0);
+
+  const ll = Calibration.logLoss(probs, labels);
+  log("logLoss is finite", Number.isFinite(ll));
+  log("logLoss clamps boundary predictions (no -Infinity)",
+    Number.isFinite(Calibration.logLoss([0, 1], [1, 0])));
+
+  const diag = Calibration.reliabilityDiagram(probs, labels, 5);
+  log("reliabilityDiagram length = bins", diag.length === 5);
+  log("bins include range", Array.isArray(diag[0].range) && diag[0].range.length === 2);
+  log("counts sum to n", diag.reduce((s, b) => s + b.count, 0) === probs.length);
+
+  const ece = Calibration.expectedCalibrationError(probs, labels, 5);
+  log("ECE is finite and >= 0", Number.isFinite(ece) && ece >= 0);
+
+  // Empty-safe
+  log("brier([],[]) is NaN", Number.isNaN(Calibration.brierScore([], [])));
+  log("logLoss([],[]) is NaN", Number.isNaN(Calibration.logLoss([], [])));
+}
+
+/* ─────────── Summary ─────────── */
+out.innerHTML += `<div class="summary ${p===n?'pass':'fail'}">` +
+  `${p}/${n} tests passed · ${p===n ? 'ALL GREEN' : (n-p)+' FAILED'}` +
+  `</div>`;
+</script>
+</body>
+</html>

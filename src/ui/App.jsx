@@ -1,0 +1,2558 @@
+/*
+  My Next Prediction v3.0 — Cockpit UI (Phase 10.5)
+  --------------------------------------------------
+  A full trading cockpit surfacing every engine built in Phases 1–10:
+
+    Phase 1/2  → FeedManager live candles + IDB history
+    Phase 3/4  → TAEngine indicators + structure (BOS/FVG/OB/Liquidity/SR)
+    Phase 6    → Regime classifier tag
+    Phase 7    → 13-module orchestrator  → MasterBias + per-module breakdown
+    Phase 8    → NN + Ensemble           → Deep-Learning Supervisor
+    Phase 9    → Conformal intervals     → expected-move band
+    Phase 10   → ValidationMonitor       → live accuracy + drift banner
+
+  Architectural notes:
+  • No ES imports (Babel-standalone blob-URL restriction). Engines come
+    from window.__MNP__ populated by bootstrap.js.
+  • Chart uses lightweight-charts@4.1.1 (global: LightweightCharts).
+  • Sub-components + hooks live in this file to keep the build simple.
+*/
+
+const { useEffect, useState, useCallback, useRef, useMemo, useLayoutEffect } = React;
+
+/* ╔══════════════════════════════════════════════════════════════════╗
+   ║  A11y + utility hooks                                            ║
+   ╚══════════════════════════════════════════════════════════════════╝ */
+
+function useAnnouncer() {
+  const ref = useRef(null);
+  useEffect(() => { ref.current = document.getElementById("mnp-live"); }, []);
+  return useCallback((msg) => { if (ref.current) ref.current.textContent = msg; }, []);
+}
+
+function useBus(topic, initial) {
+  const [v, setV] = useState(initial);
+  useEffect(() => {
+    const bus = window.__MNP__?.EventBus;
+    if (!bus) return;
+    return bus.on(topic, setV);
+  }, [topic]);
+  return v;
+}
+
+function useBusEvent(topic, handler) {
+  const saved = useRef(handler);
+  useEffect(() => { saved.current = handler; }, [handler]);
+  useEffect(() => {
+    const bus = window.__MNP__?.EventBus;
+    if (!bus) return;
+    return bus.on(topic, (e) => { try { saved.current?.(e); } catch (err) { console.error(err); } });
+  }, [topic]);
+}
+
+/**
+ * Aggregate the health/circuit/storage/SW events the bus emits but that the UI
+ * previously ignored.  Returns { health: {name: ok}, circuits: {name: state},
+ * quota: {freePct}, swUpdate: bool, idbBlocked: bool, toasts: [] }.
+ */
+function useSystemEvents(pushToast) {
+  const [state, setState] = useState({
+    health: {}, circuits: {}, quota: null, swUpdate: false, idbBlocked: false,
+    leader: "unknown", degradeFlags: [], lastExchangeSwitch: null,
+  });
+  // Keep a stable push reference
+  const toastRef = useRef(pushToast);
+  useEffect(() => { toastRef.current = pushToast; }, [pushToast]);
+  const push = useCallback((t) => toastRef.current?.(t), []);
+
+  useBusEvent("health", (m) => setState(s => ({ ...s, health: { ...s.health, [m.name]: m.ok } })));
+  useBusEvent("circuit:open",  (m) => {
+    setState(s => ({ ...s, circuits: { ...s.circuits, [m.name]: "open" } }));
+    push({ tone: "warn", text: `Circuit "${m.name}" opened — degrading` });
+  });
+  useBusEvent("circuit:close", (m) => {
+    setState(s => ({ ...s, circuits: { ...s.circuits, [m.name]: "closed" } }));
+    push({ tone: "bull", text: `Circuit "${m.name}" recovered` });
+  });
+  useBusEvent("degrade", (m) => {
+    setState(s => ({ ...s, degradeFlags: Array.from(new Set([...s.degradeFlags, m.flag])) }));
+    push({ tone: "warn", text: `⚠ ${m.flag} · ${m.reason}` });
+  });
+  useBusEvent("restore", (m) => {
+    setState(s => ({ ...s, degradeFlags: s.degradeFlags.filter(f => f !== m.flag) }));
+    push({ tone: "bull", text: `Restored · ${m.flag}` });
+  });
+  useBusEvent("quota",      (m) => setState(s => ({ ...s, quota: m })));
+  useBusEvent("quota:low",  (m) => push({ tone: "warn", text: `Storage low · ${((m.freePct||0)*100).toFixed(1)}% free` }));
+  useBusEvent("quota:exceeded", () => push({ tone: "bear", text: "Storage quota exceeded — oldest data will be pruned" }));
+  useBusEvent("sw:update-available", () => {
+    setState(s => ({ ...s, swUpdate: true }));
+    push({ tone: "accent", text: "New version available — reload to apply", action: { label: "Reload", fn: () => location.reload() } });
+  });
+  useBusEvent("idb:blocked", () => {
+    setState(s => ({ ...s, idbBlocked: true }));
+    push({ tone: "warn", text: "IndexedDB upgrade blocked — close other tabs" });
+  });
+  useBusEvent("idb:versionchange", () => push({ tone: "warn", text: "Database schema changed in another tab" }));
+  useBusEvent("feed:failover", (m) => {
+    setState(s => ({ ...s, lastExchangeSwitch: m }));
+    push({ tone: "accent", text: `Feed switched · ${m.from || "?"} → ${m.to || m.exchange || "?"}` });
+  });
+  useBusEvent("feed:backfill", (m) => m?.count && push({ tone: "accent", text: `Backfilled ${m.count} candles · ${m.symbol} ${m.tf}` }));
+  useBusEvent("feed:error",  (m) => push({ tone: "bear", text: `Feed error · ${m?.reason || m?.message || "unknown"}` }));
+  useBusEvent("feed:invalid",(m) => push({ tone: "warn", text: `Invalid candle · ${m?.reason || "?"}` }));
+  useBusEvent("feed:gap-fill-fail", () => push({ tone: "warn", text: "Gap back-fill failed; will retry" }));
+  useBusEvent("storage:near-quota", (m) => push({ tone: "warn", text: `Storage near quota · ${((m?.freePct||0)*100).toFixed(1)}% free` }));
+  useBusEvent("leader:status", (m) => setState(s => ({ ...s, leader: m?.role || s.leader })));
+  useBusEvent("validation:error", (m) => push({ tone: "bear", text: `Validation error · ${m?.reason || "unknown"}` }));
+  useBusEvent("clockskew:stale", () => push({ tone: "warn", text: "Clock skew probe stale — network or CORS issue" }));
+
+  return state;
+}
+
+/* ╔══════════════════════════════════════════════════════════════════╗
+   ║  Error boundary                                                  ║
+   ╚══════════════════════════════════════════════════════════════════╝ */
+
+class ErrorBoundary extends React.Component {
+  constructor(p){ super(p); this.state = { err: null }; }
+  static getDerivedStateFromError(err){ return { err }; }
+  componentDidCatch(err, info){ console.error("[MNP] UI crash", err, info); }
+  render() {
+    if (!this.state.err) return this.props.children;
+    return (
+      <div style={{ margin: 40, padding: 20, background: "var(--bg-elev-1)",
+                    border: "1px solid var(--bear)", borderRadius: 10 }}>
+        <div style={{ fontSize: 18, fontWeight: 700, marginBottom: 8 }}>Something broke 🧯</div>
+        <div style={{ color: "var(--fg-dim)", marginBottom: 12, fontFamily: "var(--font-mono)", fontSize: 12 }}>
+          {String(this.state.err?.message || this.state.err)}
+        </div>
+        <button className="btn-primary" onClick={() => location.reload()}>Reload</button>
+      </div>
+    );
+  }
+}
+
+/* ╔══════════════════════════════════════════════════════════════════╗
+   ║  Constants / catalog                                             ║
+   ╚══════════════════════════════════════════════════════════════════╝ */
+
+const SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "AVAXUSDT"];
+const TFS     = ["1m", "5m", "15m", "1h", "4h", "1d"];
+
+const INDICATOR_CATALOG = [
+  { id: "ema20",  label: "EMA 20",  color: "#2962ff", kind: "ema",  period: 20 },
+  { id: "ema50",  label: "EMA 50",  color: "#ff9800", kind: "ema",  period: 50 },
+  { id: "ema200", label: "EMA 200", color: "#e91e63", kind: "ema",  period: 200 },
+  { id: "vwap",   label: "VWAP",    color: "#b388ff", kind: "vwap" },
+  { id: "bbUp",   label: "BB Upper",color: "#26a69a66", kind: "bbUp" },
+  { id: "bbLo",   label: "BB Lower",color: "#ef535066", kind: "bbLo" },
+  { id: "psar",   label: "Parabolic SAR", color: "#ffb74d", kind: "psar" },
+  { id: "ichiTenkan", label: "Ichimoku Tenkan", color: "#29b6f6", kind: "ichi", field: "tenkan" },
+  { id: "ichiKijun",  label: "Ichimoku Kijun",  color: "#ab47bc", kind: "ichi", field: "kijun" },
+  { id: "ichiCloudA", label: "Ichimoku Senkou A", color: "#26a69a99", kind: "ichi", field: "senkouA" },
+  { id: "ichiCloudB", label: "Ichimoku Senkou B", color: "#ef535099", kind: "ichi", field: "senkouB" },
+  { id: "ichiChikou", label: "Ichimoku Chikou", color: "#ffd54f", kind: "ichi", field: "chikou" },
+];
+
+// Oscillator subplots rendered in their own lightweight-charts panes below the main chart
+const SUBPLOT_CATALOG = [
+  { id: "volume", label: "Volume",     tone: "accent", height: 90 },
+  { id: "rsi",    label: "RSI 14",     tone: "bull",   height: 100 },
+  { id: "macd",   label: "MACD",       tone: "accent", height: 110 },
+  { id: "stoch",  label: "Stochastic", tone: "warn",   height: 100 },
+  { id: "cci",    label: "CCI 20",     tone: "accent", height: 100 },
+  { id: "wr",     label: "Williams %R",tone: "bear",   height: 100 },
+  { id: "mfi",    label: "MFI 14",     tone: "bull",   height: 100 },
+  { id: "obv",    label: "OBV",        tone: "accent", height: 100 },
+  { id: "cmf",    label: "CMF 20",     tone: "warn",   height: 100 },
+  { id: "adx",    label: "ADX 14",     tone: "bear",   height: 100 },
+];
+
+const STRUCTURE_CATALOG = [
+  { id: "bos",   label: "BOS / CHoCH",   tone: "warn" },
+  { id: "fvg",   label: "FVG",           tone: "accent" },
+  { id: "ob",    label: "Order Blocks",  tone: "accent" },
+  { id: "liq",   label: "Liquidity",     tone: "bull"   },
+  { id: "sr",    label: "S/R",           tone: "accent" },
+  { id: "pdh",   label: "PDH / PDL",     tone: "warn"   },
+  { id: "pd",    label: "Premium/Disc.", tone: "accent" },
+  { id: "ghost", label: "Ghost candle",  tone: "accent" },
+];
+
+const MODULE_META = {
+  "trend-follow":     { emoji: "📈", label: "Trend Follow"    },
+  "mean-reversion":   { emoji: "↔️", label: "Mean Reversion"  },
+  "momentum":         { emoji: "⚡",  label: "Momentum"        },
+  "breakout":         { emoji: "🚀", label: "Breakout"        },
+  "support-resistance":{emoji: "🧱", label: "Support / Resist"},
+  "volatility-regime":{emoji: "🌪️", label: "Volatility Regime"},
+  "volume-profile":   { emoji: "📊", label: "Volume Profile"  },
+  "candle-patterns":  { emoji: "🕯️", label: "Candle Patterns" },
+  "order-blocks":     { emoji: "📦", label: "Order Blocks"    },
+  "liquidity":        { emoji: "💧", label: "Liquidity"       },
+  "premium-discount": { emoji: "💎", label: "Premium/Disc."   },
+  "session-calendar": { emoji: "🕐", label: "Session / Cal."  },
+  "cisd":             { emoji: "🧬", label: "CISD"            },
+};
+
+/* ╔══════════════════════════════════════════════════════════════════╗
+   ║  Data hooks                                                      ║
+   ╚══════════════════════════════════════════════════════════════════╝ */
+
+/**
+ * Load and live-update the candle history for (symbol, tf).
+ * - Pulls last N from IDB on mount.
+ * - Starts a FeedManager, tracks forming + closed updates.
+ * - Returns { candles, forming, status, exchange, role, bootstrapCount, gaps }
+ */
+function useCandleSeries(symbol, tf, limit = 500) {
+  const [candles, setCandles] = useState([]);
+  const [forming, setForming] = useState(null);
+  const [status, setStatus] = useState({ status: "idle" });
+  const [bootstrapCount, setBootstrapCount] = useState(0);
+  const [exchange, setExchange] = useState(null);
+  const [role, setRole] = useState("unknown");
+  const [gaps, setGaps] = useState(0);
+  const feedRef = useRef(null);
+
+  // Hydrate from IDB then start feed.
+  useEffect(() => {
+    let cancelled = false;
+    let fm = null;
+    setCandles([]); setForming(null);
+    (async () => {
+      const mnp = window.__MNP__;
+      if (!mnp) return;
+      // 1. IDB history
+      try {
+        const hist = await mnp.getStored({ symbol, tf, limit });
+        if (!cancelled && Array.isArray(hist) && hist.length) {
+          setCandles(hist.slice().sort((a, b) => a.t - b.t));
+        }
+      } catch (err) { console.warn("[ui] history load failed", err); }
+      // 2. Feed
+      try {
+        fm = new mnp.FeedManager({ symbol, tf });
+        feedRef.current = fm;
+        await fm.start();
+        if (cancelled) return;
+        const snap = fm.getSnapshot();
+        setExchange(snap.exchange);
+        setRole(snap.role);
+        if (snap.forming) setForming(snap.forming);
+      } catch (err) { console.error("[ui] feed start failed", err); }
+    })();
+    return () => {
+      cancelled = true;
+      (async () => { try { await fm?.stop(); } catch {} })();
+      feedRef.current = null;
+    };
+  }, [symbol, tf, limit]);
+
+  // Event subscriptions (closed candles, forming ticks, status)
+  useBusEvent("feed:close", (m) => {
+    if (m.symbol !== symbol || m.tf !== tf || !m.candle) return;
+    setCandles(prev => {
+      const next = prev.slice();
+      // replace if same t, else append (sorted insert)
+      const i = next.findIndex(c => c.t === m.candle.t);
+      if (i >= 0) next[i] = m.candle;
+      else next.push(m.candle);
+      // keep within limit
+      if (next.length > limit) next.splice(0, next.length - limit);
+      return next;
+    });
+    setForming(null);
+  });
+  useBusEvent("feed:update", (m) => {
+    if (m.symbol !== symbol || m.tf !== tf) return;
+    if (m.candle) setForming(m.candle);
+  });
+  useBusEvent("feed:status", (m) => {
+    if (m.symbol !== symbol || m.tf !== tf) return;
+    setStatus(m);
+    if (m.role) setRole(m.role);
+    if (m.exchange) setExchange(m.exchange);
+  });
+  useBusEvent("feed:bootstrap", (m) => {
+    if (m.symbol !== symbol || m.tf !== tf) return;
+    setBootstrapCount(m.count || 0);
+    // reload history after bootstrap settles
+    (async () => {
+      try {
+        const hist = await window.__MNP__.getStored({ symbol, tf, limit });
+        if (Array.isArray(hist) && hist.length) setCandles(hist.slice().sort((a,b)=>a.t-b.t));
+      } catch {}
+    })();
+  });
+  useBusEvent("feed:gap", (m) => {
+    if (m.symbol === symbol && m.tf === tf) setGaps(g => g + 1);
+  });
+
+  return { candles, forming, status, bootstrapCount, exchange, role, gaps };
+}
+
+/**
+ * Run TAEngine.compute on a candle array.  Memoized on the closed-candle
+ * length + last-t so it recomputes only when a new candle arrives.
+ */
+function useTASnapshot(candles) {
+  return useMemo(() => {
+    if (!Array.isArray(candles) || candles.length < 30) return null;
+    const TA = window.__MNP__?.TAEngine;
+    if (!TA) return null;
+    try { return TA.compute(candles); }
+    catch (err) { console.warn("[ui] TAEngine.compute failed", err); return null; }
+  // eslint-disable-next-line
+  }, [candles.length, candles[candles.length - 1]?.t]);
+}
+
+/**
+ * Run orchestrator against a TA snapshot → ensemble decision + signals.
+ */
+function useOrchestration(ta) {
+  return useMemo(() => {
+    if (!ta || ta.empty) return null;
+    const Orch = window.__MNP__?.Orchestrator;
+    if (!Orch?.runModules) return null;
+    try { return Orch.runModules(ta, {}); }
+    catch (err) { console.warn("[ui] orchestrator failed", err); return null; }
+  }, [ta]);
+}
+
+/**
+ * Conformal band (Phase 9) — if a saved model / calibration exists, wrap
+ * the orchestration rawScore with a symmetric residual interval.  When no
+ * calibration data is available yet, fall back to a heuristic magnitude
+ * derived from ATR.
+ */
+function useExpectedMove(ta, orch) {
+  return useMemo(() => {
+    if (!ta || ta.empty || !orch) return null;
+    const last = ta.close?.[ta.close.length - 1];
+    const atr  = Array.isArray(ta.atr14) ? ta.atr14[ta.atr14.length - 1] : ta.atr14;
+    if (!Number.isFinite(last) || !Number.isFinite(atr)) return null;
+    // Directional bias translated into expected move: scale ATR by |rawScore|
+    const bias = Math.max(-1, Math.min(1, orch.rawScore || 0));
+    const magnitude = Math.abs(bias) * atr * 1.25;   // ~1.25 ATR at full-bias
+    const direction = bias >= 0 ? +1 : -1;
+    const point = last + direction * magnitude;
+    const band  = atr * 0.85;                        // ±ATR·0.85 (≈80% heuristic band)
+    return { last, atr, bias, direction, magnitude, point, lo: point - band, hi: point + band };
+  }, [ta, orch]);
+}
+
+/**
+ * Ghost candles (Phase 11) — forward-projected OHLC + conformal confidence band.
+ *
+ * Attempts to load the most-recent saved SplitConformalRegressor from the
+ * ConformalStore once on mount.  If none exists (cold install / no training
+ * yet) the forecaster falls back to an ATR·√horizon heuristic band.
+ *
+ * Returns null until a TA snapshot + orchestration are available.
+ */
+function useGhostCandles(ta, orch, candles, { nBars = 5, alpha = 0.1, symbol, tf } = {}) {
+  const [conformal, setConformal] = useState(null);
+
+  // Try to hydrate a previously-calibrated regressor from IDB (fire-and-forget).
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const store = window.__MNP__?.ConformalStore;
+      const Conformal = window.__MNP__?.Conformal;
+      if (!store?.latestConformal || !Conformal?.SplitConformalRegressor) return;
+      try {
+        const row = await store.latestConformal({ kind: "regression" });
+        if (cancelled || !row) return;
+        const cp = Conformal.SplitConformalRegressor.deserialize(row.payload);
+        if (!cancelled) setConformal(cp);
+      } catch (err) {
+        // Not fatal — fall back to heuristic band
+        console.debug("[ui] no saved conformal regressor", err?.message || err);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  const forecast = useMemo(() => {
+    const gc = window.__MNP__?.GhostCandles;
+    if (!gc?.predictGhostCandles) return null;
+    if (!ta || ta.empty || !orch) return null;
+    try {
+      return gc.predictGhostCandles(ta, orch, {
+        nBars, alpha,
+        conformal,
+        candles,
+      });
+    } catch (err) {
+      console.warn("[ui] ghost candles failed", err);
+      return null;
+    }
+  }, [ta, orch, conformal, candles, nBars, alpha]);
+
+  // Side-effect: persist each forecast + emit on the bus.  Keyed on
+  // anchorTime so a forecast is only stored once per bar-open (subsequent
+  // mid-bar recomputes overwrite the same row via by_anchor index).
+  const lastAnchorRef = useRef(0);
+  useEffect(() => {
+    if (!forecast || !symbol || !tf) return;
+    if (!Number.isFinite(forecast.anchorTime)) return;
+    if (forecast.anchorTime === lastAnchorRef.current) return;
+    lastAnchorRef.current = forecast.anchorTime;
+    const mnp = window.__MNP__;
+    const store = mnp?.GhostStore;
+    if (!store?.saveForecast) return;
+    (async () => {
+      try {
+        const id = await store.saveForecast(forecast, { symbol, tf });
+        try {
+          mnp?.EventBus?.emit?.("ghost:forecast", {
+            id, symbol, tf,
+            anchorTime: forecast.anchorTime,
+            horizon: forecast.bars.length,
+            alpha: forecast.alpha,
+            usedConformal: forecast.usedConformal,
+            direction: forecast.direction,
+            bias: forecast.bias,
+            confidence: forecast.confidence,
+          });
+        } catch {}
+      } catch (err) {
+        console.debug("[ui] ghostStore.saveForecast failed", err?.message || err);
+      }
+    })();
+  }, [forecast, symbol, tf]);
+
+  return forecast;
+}
+
+/**
+ * Ghost resolver (Phase 11) — on every closed candle, grade any outstanding
+ * ghost forecasts whose projected time has now arrived.  The candle lookup
+ * walks `feed.candles` (already sorted by t ascending).  Emits
+ * `ghost:resolved` / `ghost:verdict` via the EventBus.
+ */
+function useGhostResolver(symbol, tf, candles) {
+  // `candles` are updated via React state when `feed:close` fires, so
+  // running as a useEffect on its length change is equivalent to listening
+  // for bar closes — without needing another bus subscription.
+  useEffect(() => {
+    if (!symbol || !tf) return;
+    if (!Array.isArray(candles) || candles.length === 0) return;
+    const mnp = window.__MNP__;
+    const store = mnp?.GhostStore;
+    if (!store?.resolveGhosts) return;
+
+    // Build a sec → candle index for O(1) lookup inside resolveGhosts.
+    // Candles carry `t` in ms; ghost bars carry `time` in UTC seconds.
+    const byTimeSec = new Map();
+    for (const c of candles) {
+      if (!c || !Number.isFinite(c.t)) continue;
+      byTimeSec.set(Math.floor(c.t / 1000), c);
+    }
+    const candleLookup = (tSec, row) => {
+      // Exact match first; fall back to nearest-within-tfSec/2 if the feed
+      // subsampled the bar open time.
+      const exact = byTimeSec.get(tSec);
+      if (exact) return exact;
+      const tol = Math.max(1, ((row?.tfSec || 60) / 2) | 0);
+      for (let d = 1; d <= tol; d++) {
+        const a = byTimeSec.get(tSec + d);
+        if (a) return a;
+        const b = byTimeSec.get(tSec - d);
+        if (b) return b;
+      }
+      return null;
+    };
+    (async () => {
+      try {
+        await store.resolveGhosts({
+          candleLookup,
+          bus: mnp?.EventBus,
+          nowSec: Math.floor(Date.now() / 1000),
+        });
+      } catch (err) {
+        console.debug("[ui] ghostStore.resolveGhosts failed", err?.message || err);
+      }
+    })();
+    // Trigger each time the candle array reference changes (new bar closed).
+    // We intentionally depend on candles.length + last t so we don't re-run
+    // on every intra-bar tick.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [symbol, tf, candles?.length, candles?.[candles?.length - 1]?.t]);
+}
+
+/* ╔══════════════════════════════════════════════════════════════════╗
+   ║  Small presentational atoms                                      ║
+   ╚══════════════════════════════════════════════════════════════════╝ */
+
+function fmt(x, d = 2) {
+  if (!Number.isFinite(Number(x))) return "—";
+  return Number(x).toLocaleString(undefined, { maximumFractionDigits: d });
+}
+function fmtPct(x, d = 1) {
+  if (!Number.isFinite(Number(x))) return "—";
+  return (Number(x) * 100).toFixed(d) + "%";
+}
+function fmtSigned(x, d = 2) {
+  if (!Number.isFinite(Number(x))) return "—";
+  const n = Number(x);
+  return (n >= 0 ? "+" : "") + n.toFixed(d);
+}
+function fmtMB(bytes) {
+  if (!bytes) return "—";
+  const mb = bytes / (1024 * 1024);
+  if (mb < 1024) return mb.toFixed(1) + " MB";
+  return (mb / 1024).toFixed(2) + " GB";
+}
+function directionTone(dir) {
+  if (dir === "long" || dir === "up") return "bull";
+  if (dir === "short" || dir === "down") return "bear";
+  return "flat";
+}
+
+/**
+ * Derive previous-day high / low from a candle array.
+ * Buckets by UTC yyyy-mm-dd; PDH/PDL are from the day-prior bucket.
+ */
+function derivePDHPDL(candles) {
+  if (!Array.isArray(candles) || candles.length < 2) return null;
+  const key = (t) => new Date(t).toISOString().slice(0, 10);
+  const byDay = new Map();
+  for (const c of candles) {
+    const k = key(c.t);
+    let d = byDay.get(k);
+    if (!d) { d = { high: -Infinity, low: +Infinity }; byDay.set(k, d); }
+    if (+c.h > d.high) d.high = +c.h;
+    if (+c.l < d.low)  d.low  = +c.l;
+  }
+  const days = Array.from(byDay.keys()).sort();
+  if (days.length < 2) return null;
+  const prev = byDay.get(days[days.length - 2]);
+  if (!prev) return null;
+  return { pdh: prev.high, pdl: prev.low };
+}
+
+function Bar({ value, max = 1, tone = "accent", label, showValue = true, valueFmt }) {
+  const pct = Math.max(0, Math.min(100, (Math.abs(value) / max) * 100));
+  return (
+    <div className="bar-row">
+      {label && <span className="lbl">{label}</span>}
+      <div className={"bar " + (tone === "bull" ? "bull" : tone === "bear" ? "bear" : "")}>
+        <span style={{ width: pct + "%" }} />
+      </div>
+      {showValue && <span className="val">{valueFmt ? valueFmt(value) : fmt(value)}</span>}
+    </div>
+  );
+}
+
+function BiasTrack({ value }) {
+  const v = Math.max(-1, Math.min(1, Number(value) || 0));
+  const leftPct = ((v + 1) / 2) * 100;
+  return (
+    <div style={{ marginTop: 6 }}>
+      <div className="bias-track">
+        <div className="bias-needle" style={{ left: leftPct + "%" }} />
+      </div>
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: "var(--fg-dim)", marginTop: 4, fontFamily: "var(--font-mono)" }}>
+        <span>BEAR</span><span>{v.toFixed(2)}</span><span>BULL</span>
+      </div>
+    </div>
+  );
+}
+
+/* ╔══════════════════════════════════════════════════════════════════╗
+   ║  Top bar + tab nav                                               ║
+   ╚══════════════════════════════════════════════════════════════════╝ */
+
+function TopBar({ tab, setTab, symbol, setSymbol, tf, setTf, net, skew, status, exchange }) {
+  return (
+    <header className="topbar" role="banner">
+      <div className="brand">
+        <span className="brand-mark">MNP</span>
+        <span className="brand-name">My Next Prediction</span>
+        <span className="brand-tag">{window.__MNP__?.version}</span>
+      </div>
+
+      <nav className="tabnav" aria-label="primary">
+        <button className={"tab-btn" + (tab === "chart" ? " active" : "")} onClick={() => setTab("chart")}>Chart</button>
+        <button className={"tab-btn" + (tab === "scanner" ? " active" : "")} onClick={() => setTab("scanner")}>Scanner</button>
+        <button className={"tab-btn" + (tab === "chat" ? " active" : "")} onClick={() => setTab("chat")}>AI Chat</button>
+        <button className={"tab-btn" + (tab === "system" ? " active" : "")} onClick={() => setTab("system")}>
+          System <span className="chip">{window.__MNP__?.caps?.privateMode ? "PRIV" : "OK"}</span>
+        </button>
+      </nav>
+
+      <span className="spacer-flex" />
+
+      <select className="sel" value={symbol} onChange={(e) => setSymbol(e.target.value)} aria-label="Symbol">
+        {SYMBOLS.map(s => <option key={s}>{s}</option>)}
+      </select>
+
+      <div className="tf-group" role="group" aria-label="timeframe">
+        {TFS.map(t => (
+          <button key={t} className={"tf-btn" + (t === tf ? " active" : "")} onClick={() => setTf(t)}>{t}</button>
+        ))}
+      </div>
+
+      <span className={"status-pill " + (status?.status === "open" ? "ok" : status?.status === "closed" || status?.status === "error" ? "bad" : "warn")}>
+        <span className="dot" />
+        {status?.status || "idle"} · {exchange || "—"}
+      </span>
+      <span className={"status-pill " + (net?.online ? "ok" : "bad")}>
+        <span className="dot" />
+        {net?.online ? "online" : "offline"}
+      </span>
+      {skew && (
+        <span className="status-pill">
+          Δt {skew.offsetMs}ms
+        </span>
+      )}
+    </header>
+  );
+}
+
+/* ╔══════════════════════════════════════════════════════════════════╗
+   ║  Indicator + structure toggle rail                               ║
+   ╚══════════════════════════════════════════════════════════════════╝ */
+
+function IndicatorRail({ indicators, setIndicators, structure, setStructure, subplots, setSubplots }) {
+  const toggle = (setter, key) => () => setter(s => ({ ...s, [key]: !s[key] }));
+  return (
+    <div className="indicator-rail" role="toolbar">
+      <div className="rail-group">
+        <span className="rail-label">Overlays</span>
+        {INDICATOR_CATALOG.map(ind => (
+          <button
+            key={ind.id}
+            className={"chip-toggle" + (indicators[ind.id] ? " on" : "")}
+            onClick={toggle(setIndicators, ind.id)}
+            style={indicators[ind.id] ? { borderColor: ind.color, color: ind.color } : undefined}
+          >
+            {ind.label}
+          </button>
+        ))}
+      </div>
+      <div className="rail-group">
+        <span className="rail-label">Subplots</span>
+        {SUBPLOT_CATALOG.map(sp => (
+          <button
+            key={sp.id}
+            className={"chip-toggle" + (subplots[sp.id] ? " on " + sp.tone : "")}
+            onClick={toggle(setSubplots, sp.id)}
+          >
+            {sp.label}
+          </button>
+        ))}
+      </div>
+      <div className="rail-group">
+        <span className="rail-label">Structure</span>
+        {STRUCTURE_CATALOG.map(s => (
+          <button
+            key={s.id}
+            className={"chip-toggle" + (structure[s.id] ? " on " + s.tone : "")}
+            onClick={toggle(setStructure, s.id)}
+          >
+            {s.label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ╔══════════════════════════════════════════════════════════════════╗
+   ║  Chart pane — lightweight-charts + overlay layer                 ║
+   ╚══════════════════════════════════════════════════════════════════╝ */
+
+function ChartPane({ symbol, tf, candles, forming, ta, indicators, structure, expected, subplots, ghost }) {
+  const containerRef = useRef(null);
+  const chartRef = useRef(null);
+  const seriesRef = useRef({ candle: null, indicators: {}, markers: [], ghost: null, ghostHi: null, ghostLo: null });
+  const [dims, setDims] = useState({ w: 0, h: 0 });
+
+  // Mount chart
+  useLayoutEffect(() => {
+    if (!containerRef.current || !window.LightweightCharts) return;
+    const LWC = window.LightweightCharts;
+    const chart = LWC.createChart(containerRef.current, {
+      layout: {
+        background: { type: "solid", color: "transparent" },
+        textColor:  "#9aa0ab",
+        fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+      },
+      grid: {
+        vertLines: { color: "rgba(255,255,255,.04)" },
+        horzLines: { color: "rgba(255,255,255,.04)" },
+      },
+      rightPriceScale: { borderColor: "rgba(255,255,255,.08)" },
+      timeScale:       { borderColor: "rgba(255,255,255,.08)", timeVisible: true, secondsVisible: false },
+      crosshair: { mode: 1 /* normal */ },
+      handleScroll: true, handleScale: true,
+    });
+    const candle = chart.addCandlestickSeries({
+      upColor: "#26a69a", downColor: "#ef5350",
+      borderUpColor: "#26a69a", borderDownColor: "#ef5350",
+      wickUpColor: "#26a69a", wickDownColor: "#ef5350",
+    });
+    chartRef.current = chart;
+    seriesRef.current = { candle, indicators: {}, markers: [] };
+
+    // Responsive resize
+    const ro = new ResizeObserver(entries => {
+      for (const e of entries) {
+        const { width, height } = e.contentRect;
+        chart.applyOptions({ width: Math.floor(width), height: Math.floor(height) });
+        setDims({ w: width, h: height });
+      }
+    });
+    ro.observe(containerRef.current);
+
+    return () => {
+      try { ro.disconnect(); } catch {}
+      try { chart.remove(); } catch {}
+      chartRef.current = null;
+      seriesRef.current = { candle: null, indicators: {}, markers: [], ghost: null, ghostHi: null, ghostLo: null };
+    };
+  }, []);
+
+  // Feed candle data
+  useEffect(() => {
+    const s = seriesRef.current.candle;
+    if (!s) return;
+    if (!Array.isArray(candles) || !candles.length) { s.setData([]); return; }
+    const rows = candles.map(c => ({
+      time: Math.floor(c.t / 1000),
+      open: +c.o, high: +c.h, low: +c.l, close: +c.c,
+    }));
+    // If last forming candle exists + is newer than the last closed, append it
+    if (forming && forming.t > candles[candles.length - 1].t) {
+      rows.push({
+        time: Math.floor(forming.t / 1000),
+        open: +forming.o, high: +forming.h, low: +forming.l, close: +forming.c,
+      });
+    }
+    s.setData(rows);
+  }, [candles, forming]);
+
+  // Indicator lines
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart || !ta || ta.empty) return;
+    const reg = seriesRef.current.indicators;
+
+    const ensure = (id, color) => {
+      if (!reg[id]) {
+        reg[id] = chart.addLineSeries({
+          color, lineWidth: 1, priceLineVisible: false, lastValueVisible: false,
+        });
+      }
+      return reg[id];
+    };
+    const drop = (id) => {
+      if (reg[id]) {
+        try { chart.removeSeries(reg[id]); } catch {}
+        delete reg[id];
+      }
+    };
+    const points = (arr) => {
+      if (!Array.isArray(arr) || !Array.isArray(ta.t)) return [];
+      const out = [];
+      for (let i = 0; i < arr.length; i++) {
+        const v = arr[i];
+        if (Number.isFinite(v) && Number.isFinite(ta.t[i])) {
+          out.push({ time: Math.floor(ta.t[i] / 1000), value: v });
+        }
+      }
+      return out;
+    };
+
+    // EMAs
+    for (const ind of INDICATOR_CATALOG) {
+      if (ind.kind !== "ema") continue;
+      if (indicators[ind.id]) {
+        const key = `ema${ind.period}`;
+        const line = ensure(ind.id, ind.color);
+        line.setData(points(ta[key]));
+      } else drop(ind.id);
+    }
+    // VWAP
+    if (indicators.vwap) {
+      const line = ensure("vwap", "#b388ff");
+      line.setData(points(ta.vwap));
+    } else drop("vwap");
+    // Bollinger (engine stores as `bb_20_2` object with {mid,up,lo})
+    const bb = ta.bb_20_2 || ta.bb;
+    if (indicators.bbUp) {
+      const line = ensure("bbUp", "#26a69a88");
+      line.setData(points(bb?.up));
+    } else drop("bbUp");
+    if (indicators.bbLo) {
+      const line = ensure("bbLo", "#ef535088");
+      line.setData(points(bb?.lo));
+    } else drop("bbLo");
+    // Parabolic SAR — render as small dots via line series (one point per bar)
+    if (indicators.psar && ta.psar?.psar) {
+      if (!reg.psar) {
+        reg.psar = chart.addLineSeries({
+          color: "#ffb74d", lineWidth: 1, lineStyle: 0,
+          pointMarkersVisible: true, pointMarkersRadius: 2,
+          priceLineVisible: false, lastValueVisible: false,
+          lineType: 1 /* with-steps */,
+        });
+      }
+      // Break PSAR into separate segments whenever the trend flips, so the
+      // line does not draw diagonals between bullish + bearish dot clusters.
+      const out = [];
+      const tr = ta.psar.trend;
+      for (let i = 0; i < ta.psar.psar.length; i++) {
+        const v = ta.psar.psar[i];
+        if (!Number.isFinite(v) || !Number.isFinite(ta.t[i])) continue;
+        out.push({ time: Math.floor(ta.t[i] / 1000), value: v });
+        // Insert a whitespace/gap on trend flip
+        if (i > 0 && tr?.[i] !== tr?.[i - 1]) {
+          out.push({ time: Math.floor((ta.t[i] + 1) / 1000), value: NaN });
+        }
+      }
+      reg.psar.setData(out.filter(p => Number.isFinite(p.value)));
+    } else drop("psar");
+    // Ichimoku — render each selected component as a line
+    for (const ind of INDICATOR_CATALOG) {
+      if (ind.kind !== "ichi") continue;
+      if (indicators[ind.id] && ta.ichimoku?.[ind.field]) {
+        const line = ensure(ind.id, ind.color);
+        line.setData(points(ta.ichimoku[ind.field]));
+      } else drop(ind.id);
+    }
+  }, [ta, indicators]);
+
+  // Structural overlays — markers + price lines
+  useEffect(() => {
+    const s = seriesRef.current.candle;
+    const chart = chartRef.current;
+    if (!s || !chart || !ta || ta.empty) return;
+
+    // ─ Markers: BOS/CHoCH, OB, liquidity sweeps, FVG
+    //   (shapes use lightweight-charts v4 API: setMarkers)
+    const markers = [];
+    const seen = new Set();                 // dedupe by "time|text"
+    const push = (m) => {
+      const k = `${m.time}|${m.text}`;
+      if (seen.has(k)) return; seen.add(k);
+      markers.push(m);
+    };
+
+    if (structure.bos && Array.isArray(ta.breaks)) {
+      for (const b of ta.breaks.slice(-40)) {
+        const t = Number(b.t ?? ta.t?.[b.i]);
+        if (!Number.isFinite(t)) continue;
+        const up = b.dir === "up";
+        push({
+          time: Math.floor(t / 1000),
+          position: up ? "belowBar" : "aboveBar",
+          color:    up ? "#26a69a" : "#ef5350",
+          shape:    up ? "arrowUp" : "arrowDown",
+          text:     b.type || "BOS",
+        });
+      }
+    }
+    if (structure.ob && Array.isArray(ta.orderBlocks)) {
+      for (const ob of ta.orderBlocks.filter(x => !x.mitigated).slice(-20)) {
+        const t = Number(ob.t ?? ta.t?.[ob.i]);
+        if (!Number.isFinite(t)) continue;
+        const up = ob.kind === "bull";
+        push({
+          time: Math.floor(t / 1000),
+          position: up ? "belowBar" : "aboveBar",
+          color:    up ? "#26a69a" : "#ef5350",
+          shape: "square", text: "OB",
+        });
+      }
+    }
+    if (structure.liq && ta.liquidity && Array.isArray(ta.liquidity.sweeps)) {
+      for (const l of ta.liquidity.sweeps.slice(-20)) {
+        const t = Number(l.t ?? ta.t?.[l.i]);
+        if (!Number.isFinite(t)) continue;
+        const up = l.kind === "bullish";
+        push({
+          time: Math.floor(t / 1000),
+          position: up ? "belowBar" : "aboveBar",
+          color: "#b388ff", shape: "circle", text: "SWEEP",
+        });
+      }
+    }
+    if (structure.fvg && Array.isArray(ta.fvg?.open)) {
+      for (const g of ta.fvg.open.slice(-20)) {
+        const t = Number(g.t ?? ta.t?.[g.i]);
+        if (!Number.isFinite(t)) continue;
+        const up = g.kind === "bull";
+        push({
+          time: Math.floor(t / 1000),
+          position: up ? "belowBar" : "aboveBar",
+          color: up ? "#2962ff" : "#7c4dff", shape: "square", text: "FVG",
+        });
+      }
+    }
+    markers.sort((a, b) => a.time - b.time);
+    try { s.setMarkers(markers); } catch {}
+
+    // ─ Price lines: S/R + PDH/PDL + (phase 11-prep) predicted point
+    // Clear previous lines (stored on series ref)
+    if (!seriesRef.current.priceLines) seriesRef.current.priceLines = [];
+    for (const pl of seriesRef.current.priceLines) {
+      try { s.removePriceLine(pl); } catch {}
+    }
+    seriesRef.current.priceLines = [];
+
+    const addLine = (opts) => {
+      try { seriesRef.current.priceLines.push(s.createPriceLine(opts)); } catch {}
+    };
+
+    if (structure.sr && Array.isArray(ta.levels)) {
+      for (const lv of ta.levels.slice(0, 8)) {
+        addLine({
+          price: lv.price,
+          color: "rgba(255,152,0,.7)",
+          lineWidth: 1, lineStyle: 2 /* dashed */,
+          axisLabelVisible: true, title: `${lv.kind || "SR"} ${fmt(lv.strength, 2)}`,
+        });
+      }
+    }
+    // Liquidity levels — draw BSL (equal highs) + SSL (equal lows) as horizontal lines
+    if (structure.liq && ta.liquidity) {
+      for (const eh of (ta.liquidity.eqHighs || []).slice(0, 4)) {
+        addLine({
+          price: eh.price,
+          color: "rgba(38,166,154,.55)",
+          lineWidth: 1, lineStyle: 0,
+          axisLabelVisible: true, title: `BSL×${eh.touches ?? "?"}`,
+        });
+      }
+      for (const el of (ta.liquidity.eqLows || []).slice(0, 4)) {
+        addLine({
+          price: el.price,
+          color: "rgba(239,83,80,.55)",
+          lineWidth: 1, lineStyle: 0,
+          axisLabelVisible: true, title: `SSL×${el.touches ?? "?"}`,
+        });
+      }
+    }
+    // Order blocks — render each open block as a pair of faint horizontal lines
+    // (top + bottom) to approximate a zone until lightweight-charts v5 rectangles land.
+    if (structure.ob && Array.isArray(ta.orderBlocks)) {
+      const open = ta.orderBlocks.filter(b => !b.mitigated).slice(-6);
+      for (const ob of open) {
+        const color = ob.kind === "bull" ? "rgba(38,166,154,.35)" : "rgba(239,83,80,.35)";
+        addLine({ price: ob.top, color, lineWidth: 1, lineStyle: 3, axisLabelVisible: true, title: `OB${ob.kind === "bull" ? "↑" : "↓"}` });
+        addLine({ price: ob.bot, color, lineWidth: 1, lineStyle: 3, axisLabelVisible: false });
+      }
+    }
+    // Premium / Discount zone — anchor on last pivot range
+    if (structure.pd && ta.premiumDiscount) {
+      const pd = ta.premiumDiscount;
+      if (Number.isFinite(pd.rangeHigh) && Number.isFinite(pd.rangeLow)) {
+        addLine({ price: pd.rangeHigh, color: "rgba(239,83,80,.45)", lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: "Premium" });
+        addLine({ price: pd.mid,       color: "rgba(255,255,255,.25)", lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: "EQ" });
+        addLine({ price: pd.rangeLow,  color: "rgba(38,166,154,.45)", lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: "Discount" });
+      }
+    }
+    if (structure.pdh) {
+      // Derive previous-day high / low from candles spanning the prior UTC day.
+      // Works on any TF: we bucket by UTC date from the closed-candle timestamps.
+      const pd = derivePDHPDL(candles);
+      if (Number.isFinite(pd?.pdh)) addLine({ price: pd.pdh, color: "#26a69a", lineWidth: 1, lineStyle: 0, title: "PDH", axisLabelVisible: true });
+      if (Number.isFinite(pd?.pdl)) addLine({ price: pd.pdl, color: "#ef5350", lineWidth: 1, lineStyle: 0, title: "PDL", axisLabelVisible: true });
+    }
+  }, [ta, structure, expected, candles]);
+
+  // Ghost candles (Phase 11) — forward-projected candlestick series + confidence ribbon.
+  // Rendered as a secondary candlestick series with faded colors; the (lo, hi) bands
+  // are drawn as dashed line series so the ribbon widens with horizon.
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart) return;
+    const refs = seriesRef.current;
+    const on = !!(structure?.ghost && ghost && Array.isArray(ghost.bars) && ghost.bars.length);
+
+    // Lazily create the ghost series
+    if (on && !refs.ghost) {
+      try {
+        refs.ghost = chart.addCandlestickSeries({
+          upColor: "rgba(38,166,154,.35)", downColor: "rgba(239,83,80,.35)",
+          borderUpColor: "rgba(38,166,154,.55)", borderDownColor: "rgba(239,83,80,.55)",
+          wickUpColor: "rgba(38,166,154,.45)", wickDownColor: "rgba(239,83,80,.45)",
+          priceLineVisible: false, lastValueVisible: false,
+        });
+      } catch {}
+      try {
+        refs.ghostHi = chart.addLineSeries({
+          color: "rgba(179,136,255,.45)", lineWidth: 1, lineStyle: 2 /* dashed */,
+          priceLineVisible: false, lastValueVisible: false,
+        });
+        refs.ghostLo = chart.addLineSeries({
+          color: "rgba(179,136,255,.45)", lineWidth: 1, lineStyle: 2,
+          priceLineVisible: false, lastValueVisible: false,
+        });
+      } catch {}
+    }
+
+    // Tear down when toggled off or ghost is missing
+    if (!on) {
+      for (const k of ["ghost", "ghostHi", "ghostLo"]) {
+        if (refs[k]) {
+          try { chart.removeSeries(refs[k]); } catch {}
+          refs[k] = null;
+        }
+      }
+      return;
+    }
+
+    // Populate with computed bars — start from the anchor so there is no
+    // discontinuity with the real candle series.
+    const gc = window.__MNP__?.GhostCandles;
+    const serialized = gc?.toChartSeriesData?.(ghost);
+    if (!serialized) return;
+
+    // Prepend an anchor point so both bands + candle connect visually.
+    const anchor = {
+      time: ghost.anchorTime,
+      open: ghost.anchorClose, high: ghost.anchorClose,
+      low:  ghost.anchorClose, close: ghost.anchorClose,
+    };
+    const anchorBand = { time: ghost.anchorTime, value: ghost.anchorClose };
+
+    try { refs.ghost?.setData([anchor, ...serialized.candleData]); } catch {}
+    try { refs.ghostHi?.setData([anchorBand, ...serialized.upperBand]); } catch {}
+    try { refs.ghostLo?.setData([anchorBand, ...serialized.lowerBand]); } catch {}
+  }, [ghost, structure?.ghost]);
+
+  // Chart header — price + OHLC readout
+  const last = forming?.c ?? candles[candles.length - 1]?.c;
+  const open = candles[candles.length - 1]?.o;
+  const delta = Number.isFinite(last) && Number.isFinite(open) ? last - open : 0;
+  const pct   = Number.isFinite(open) && open ? (delta / open) * 100 : 0;
+  const lastC = candles[candles.length - 1];
+
+  const activeSubplots = SUBPLOT_CATALOG.filter(sp => subplots?.[sp.id]);
+
+  return (
+    <section className="chart-card" aria-labelledby="chart-title">
+      <div className="chart-header">
+        <div>
+          <div style={{ fontSize: 10, color: "var(--fg-dim)", letterSpacing: 1, textTransform: "uppercase" }}>
+            {symbol} · {tf}
+          </div>
+          <div className="price" id="chart-title" style={{ color: delta >= 0 ? "var(--bull)" : "var(--bear)" }}>
+            {fmt(last, last > 50 ? 2 : 4)}
+          </div>
+        </div>
+        <div className={"delta " + (delta >= 0 ? "bull" : "bear")}>
+          {fmtSigned(delta, 2)} ({fmtSigned(pct, 2)}%)
+        </div>
+        {lastC && (
+          <div className="ohlc">
+            <span>O <b>{fmt(lastC.o)}</b></span>
+            <span>H <b style={{color:"var(--bull)"}}>{fmt(lastC.h)}</b></span>
+            <span>L <b style={{color:"var(--bear)"}}>{fmt(lastC.l)}</b></span>
+            <span>C <b>{fmt(lastC.c)}</b></span>
+            <span>V <b>{fmt(lastC.v, 3)}</b></span>
+          </div>
+        )}
+      </div>
+      <div className="chart-canvas" ref={containerRef}>
+        <div className="chart-watermark">{symbol} · {tf}</div>
+        {!candles?.length && <div className="chart-empty">loading history…</div>}
+      </div>
+      {activeSubplots.length > 0 && (
+        <div className="subplot-stack">
+          {activeSubplots.map(sp => (
+            <SubplotPane key={sp.id} kind={sp.id} ta={ta} candles={candles} />
+          ))}
+        </div>
+      )}
+      <div className="chart-footer">
+        <span>{candles?.length ?? 0} candles · {dims.w|0}×{dims.h|0}px · {activeSubplots.length} subplots</span>
+        <span>lightweight-charts v4 · MNP v{window.__MNP__?.version}</span>
+      </div>
+    </section>
+  );
+}
+
+/* ╔══════════════════════════════════════════════════════════════════╗
+   ║  Subplot panes (oscillators below main chart)                    ║
+   ╚══════════════════════════════════════════════════════════════════╝ */
+
+/**
+ * A single oscillator subplot rendered in its own lightweight-charts instance.
+ * `kind` picks the data extraction + series style.
+ * All panes share the same time-scale via the sync-hook below.
+ */
+function SubplotPane({ kind, ta, candles, onChart }) {
+  const wrapRef = useRef(null);
+  const chartRef = useRef(null);
+  const seriesRef = useRef({});
+  const [label, setLabel] = useState(kind);
+
+  // Human label from catalog
+  useEffect(() => {
+    const m = SUBPLOT_CATALOG.find(s => s.id === kind);
+    if (m) setLabel(m.label);
+  }, [kind]);
+
+  // Mount chart
+  useLayoutEffect(() => {
+    if (!wrapRef.current || !window.LightweightCharts) return;
+    const LWC = window.LightweightCharts;
+    const chart = LWC.createChart(wrapRef.current, {
+      layout: {
+        background: { type: "solid", color: "transparent" },
+        textColor: "#9aa0ab",
+        fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+        fontSize: 10,
+      },
+      grid: {
+        vertLines: { color: "rgba(255,255,255,.03)" },
+        horzLines: { color: "rgba(255,255,255,.04)" },
+      },
+      rightPriceScale: { borderColor: "rgba(255,255,255,.08)" },
+      timeScale:       { borderColor: "rgba(255,255,255,.08)", timeVisible: true, secondsVisible: false },
+      handleScroll: false, handleScale: false,
+    });
+    chartRef.current = chart;
+    seriesRef.current = {};
+    onChart?.(chart);
+
+    const ro = new ResizeObserver(entries => {
+      for (const e of entries) {
+        chart.applyOptions({ width: Math.floor(e.contentRect.width), height: Math.floor(e.contentRect.height) });
+      }
+    });
+    ro.observe(wrapRef.current);
+
+    return () => {
+      try { ro.disconnect(); } catch {}
+      try { chart.remove(); } catch {}
+      chartRef.current = null;
+      seriesRef.current = {};
+      onChart?.(null);
+    };
+  }, []);
+
+  // Feed data (kind-specific)
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart || !ta || ta.empty) return;
+    const ref = seriesRef.current;
+    const points = (arr) => {
+      if (!Array.isArray(arr) || !Array.isArray(ta.t)) return [];
+      const out = [];
+      for (let i = 0; i < arr.length; i++) {
+        const v = arr[i];
+        if (Number.isFinite(v) && Number.isFinite(ta.t[i])) {
+          out.push({ time: Math.floor(ta.t[i] / 1000), value: v });
+        }
+      }
+      return out;
+    };
+    const ensure = (id, mk) => {
+      if (!ref[id]) ref[id] = mk();
+      return ref[id];
+    };
+
+    if (kind === "volume") {
+      const s = ensure("vol", () => chart.addHistogramSeries({
+        priceFormat: { type: "volume" },
+        priceScaleId: "", // overlay
+      }));
+      const rows = [];
+      for (let i = 0; i < (ta.t?.length || 0); i++) {
+        const up = ta.close[i] >= ta.open[i];
+        rows.push({
+          time: Math.floor(ta.t[i] / 1000),
+          value: +ta.volume[i] || 0,
+          color: up ? "rgba(38,166,154,.55)" : "rgba(239,83,80,.55)",
+        });
+      }
+      s.setData(rows);
+    } else if (kind === "rsi") {
+      const s = ensure("rsi", () => chart.addLineSeries({ color: "#ffb74d", lineWidth: 1 }));
+      s.setData(points(ta.rsi14));
+      // Horizontal guides at 70/30
+      if (!ref._rsiGuides) {
+        try {
+          s.createPriceLine({ price: 70, color: "rgba(239,83,80,.45)", lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: "70" });
+          s.createPriceLine({ price: 50, color: "rgba(255,255,255,.15)", lineWidth: 1, lineStyle: 2, axisLabelVisible: false });
+          s.createPriceLine({ price: 30, color: "rgba(38,166,154,.45)", lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: "30" });
+          ref._rsiGuides = true;
+        } catch {}
+      }
+    } else if (kind === "macd") {
+      const m = ta.macd_12_26_9 || ta.macd;
+      if (!m) return;
+      const hist = ensure("hist", () => chart.addHistogramSeries({ priceScaleId: "" }));
+      const line = ensure("macd", () => chart.addLineSeries({ color: "#2962ff", lineWidth: 1 }));
+      const sig  = ensure("sig",  () => chart.addLineSeries({ color: "#ff9800", lineWidth: 1 }));
+      const hrows = [];
+      for (let i = 0; i < (ta.t?.length || 0); i++) {
+        const v = m.hist?.[i];
+        if (!Number.isFinite(v) || !Number.isFinite(ta.t[i])) continue;
+        hrows.push({
+          time: Math.floor(ta.t[i] / 1000),
+          value: v,
+          color: v >= 0 ? "rgba(38,166,154,.6)" : "rgba(239,83,80,.6)",
+        });
+      }
+      hist.setData(hrows);
+      line.setData(points(m.macd));
+      sig.setData(points(m.signal));
+    } else if (kind === "stoch") {
+      const st = ta.stoch_14_3;
+      if (!st) return;
+      const k = ensure("k", () => chart.addLineSeries({ color: "#29b6f6", lineWidth: 1 }));
+      const d = ensure("d", () => chart.addLineSeries({ color: "#ff9800", lineWidth: 1 }));
+      k.setData(points(st.k));
+      d.setData(points(st.d));
+      if (!ref._stochGuides) {
+        try {
+          k.createPriceLine({ price: 80, color: "rgba(239,83,80,.45)", lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: "80" });
+          k.createPriceLine({ price: 20, color: "rgba(38,166,154,.45)", lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: "20" });
+          ref._stochGuides = true;
+        } catch {}
+      }
+    } else if (kind === "cci") {
+      const s = ensure("cci", () => chart.addLineSeries({ color: "#ab47bc", lineWidth: 1 }));
+      s.setData(points(ta.cci20));
+      if (!ref._cciGuides) {
+        try {
+          s.createPriceLine({ price:  100, color: "rgba(239,83,80,.4)", lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: "+100" });
+          s.createPriceLine({ price: -100, color: "rgba(38,166,154,.4)", lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: "-100" });
+          ref._cciGuides = true;
+        } catch {}
+      }
+    } else if (kind === "wr") {
+      const s = ensure("wr", () => chart.addLineSeries({ color: "#ef5350", lineWidth: 1 }));
+      s.setData(points(ta.wr14));
+      if (!ref._wrGuides) {
+        try {
+          s.createPriceLine({ price: -20, color: "rgba(239,83,80,.4)", lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: "-20" });
+          s.createPriceLine({ price: -80, color: "rgba(38,166,154,.4)", lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: "-80" });
+          ref._wrGuides = true;
+        } catch {}
+      }
+    } else if (kind === "mfi") {
+      const s = ensure("mfi", () => chart.addLineSeries({ color: "#26a69a", lineWidth: 1 }));
+      s.setData(points(ta.mfi14));
+      if (!ref._mfiGuides) {
+        try {
+          s.createPriceLine({ price: 80, color: "rgba(239,83,80,.4)", lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: "80" });
+          s.createPriceLine({ price: 20, color: "rgba(38,166,154,.4)", lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: "20" });
+          ref._mfiGuides = true;
+        } catch {}
+      }
+    } else if (kind === "obv") {
+      const s = ensure("obv", () => chart.addLineSeries({ color: "#b388ff", lineWidth: 1 }));
+      s.setData(points(ta.obv));
+    } else if (kind === "cmf") {
+      const s = ensure("cmf", () => chart.addLineSeries({ color: "#ffd54f", lineWidth: 1 }));
+      s.setData(points(ta.cmf20));
+      if (!ref._cmfGuides) {
+        try {
+          s.createPriceLine({ price: 0, color: "rgba(255,255,255,.2)", lineWidth: 1, lineStyle: 2, axisLabelVisible: false });
+          ref._cmfGuides = true;
+        } catch {}
+      }
+    } else if (kind === "adx") {
+      const a = ta.adx14;
+      if (!a) return;
+      const adxL = ensure("adx",  () => chart.addLineSeries({ color: "#ffd54f", lineWidth: 1 }));
+      const pL   = ensure("p",    () => chart.addLineSeries({ color: "#26a69a", lineWidth: 1 }));
+      const mL   = ensure("m",    () => chart.addLineSeries({ color: "#ef5350", lineWidth: 1 }));
+      adxL.setData(points(a.adx));
+      pL.setData(points(a.plusDI));
+      mL.setData(points(a.minusDI));
+      if (!ref._adxGuides) {
+        try { adxL.createPriceLine({ price: 25, color: "rgba(255,255,255,.2)", lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: "25" }); ref._adxGuides = true; } catch {}
+      }
+    }
+  }, [kind, ta]);
+
+  return (
+    <div className="subplot" data-kind={kind}>
+      <div className="subplot-label">{label}</div>
+      <div className="subplot-canvas" ref={wrapRef} />
+    </div>
+  );
+}
+
+/* ╔══════════════════════════════════════════════════════════════════╗
+   ║  Signal sidebar                                                  ║
+   ╚══════════════════════════════════════════════════════════════════╝ */
+
+function TradeSignalCard({ orch, expected, regime, ta }) {
+  if (!orch) {
+    return (
+      <div className="card card-glass">
+        <h3>Trade Signal <span className="badge">waiting…</span></h3>
+        <div className="shimmer" style={{ height: 62, marginBottom: 10 }} />
+        <div className="shimmer" style={{ height: 16 }} />
+      </div>
+    );
+  }
+  const tone = directionTone(orch.direction);
+  const arrow = orch.direction === "long" ? "▲" : orch.direction === "short" ? "▼" : "●";
+  const prob = Number.isFinite(orch.probability) ? orch.probability : 0.5;
+  const conf = Number.isFinite(orch.confidence) ? orch.confidence : 0;
+  const regimeLabel = regime || ta?.regime?.label || ta?.regime?.regime || "—";
+  return (
+    <div className="card card-glass">
+      <h3>
+        Trade Signal
+        <span className={"badge " + (tone === "bull" ? "bull" : tone === "bear" ? "bear" : "")}>
+          {orch.direction.toUpperCase()}
+        </span>
+      </h3>
+      <div className="signal-dial">
+        <div className={"dial-arrow " + tone}>{arrow}</div>
+        <div className="dial-meta">
+          <div className={"dir " + tone}>{orch.direction}</div>
+          <div className="sub">regime · {regimeLabel}</div>
+          <div className="sub">modules · {orch.participating}/{orch.signals?.length ?? 13}</div>
+        </div>
+      </div>
+      <Bar label="P(up)"      value={prob}   max={1} tone={tone} valueFmt={fmtPct} />
+      <Bar label="Confidence" value={conf}   max={1} tone="accent" valueFmt={fmtPct} />
+      <Bar label="|Bias|"     value={Math.abs(orch.rawScore || 0)} max={1} tone={tone}
+           valueFmt={(x) => fmt(x, 2)} />
+      {expected && (
+        <div style={{ marginTop: 10, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+          <div className="dl-cell">
+            <div className="k">Target</div>
+            <div className="v" style={{ color: expected.direction > 0 ? "var(--bull)" : "var(--bear)" }}>
+              {fmt(expected.point)}
+            </div>
+          </div>
+          <div className="dl-cell">
+            <div className="k">Band ±</div>
+            <div className="v">{fmt(expected.hi - expected.point)}</div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MasterBiasCard({ orch }) {
+  if (!orch) return null;
+  return (
+    <div className="card">
+      <h3>Master Bias <span className="badge">{fmt(orch.rawScore, 2)}</span></h3>
+      <BiasTrack value={orch.rawScore} />
+      <div style={{ fontSize: 11, color: "var(--fg-dim)", marginTop: 10, lineHeight: 1.5 }}>
+        Weighted ensemble across {orch.signals?.length ?? 13} analysis modules.
+        Global multiplier · <b style={{ color: "var(--fg)" }}>{fmt(orch.globalMult, 2)}</b>
+        {" · "}effective modules · <b style={{ color: "var(--fg)" }}>{orch.participating}</b>
+      </div>
+    </div>
+  );
+}
+
+function ModuleBreakdownCard({ orch }) {
+  if (!orch?.signals) return null;
+  const sorted = orch.signals.slice().sort((a, b) => Math.abs(b.signal * b.confidence) - Math.abs(a.signal * a.confidence));
+  return (
+    <div className="card">
+      <h3>Module Breakdown <span className="badge">{orch.signals.length}</span></h3>
+      {sorted.map(s => {
+        const meta = MODULE_META[s.id] || { emoji: "🔸", label: s.id };
+        const tone = directionTone(s.direction);
+        const strength = Math.abs(s.signal) * (s.confidence ?? 0);
+        const pct = Math.min(100, strength * 100);
+        return (
+          <div key={s.id} className={"module-row " + tone}>
+            <div className="name">
+              <span className="emoji">{meta.emoji}</span>{meta.label}
+            </div>
+            <div className="mini-bar">
+              <span style={{
+                width: pct + "%",
+                background: tone === "bull" ? "var(--bull)" : tone === "bear" ? "var(--bear)" : "var(--fg-dim)",
+                left: 0,
+              }} />
+            </div>
+            <div className="sig" style={{ color: tone === "bull" ? "var(--bull)" : tone === "bear" ? "var(--bear)" : "var(--fg-dim)" }}>
+              {fmtSigned(s.signal, 2)}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function DLSupervisorCard({ orch, expected, ta }) {
+  // The NN + conformal path won't have calibration until some validation data
+  // accrues.  Until then we show a "diagnostic" readout built from ensemble
+  // probability + ATR-derived expected move.
+  const nnReady = !!window.__MNP__?.ModelStore;   // NN surface available
+  const atr = Array.isArray(ta?.atr14) ? ta.atr14[ta.atr14.length - 1] : ta?.atr14;
+  return (
+    <div className="card">
+      <h3>Deep-Learning Supervisor
+        <span className="badge">{nnReady ? "NN · conformal" : "fallback"}</span>
+      </h3>
+      <div className="dl-grid">
+        <div className="dl-cell">
+          <div className="k">P(up)</div>
+          <div className="v" style={{ color: orch ? (orch.probability > 0.5 ? "var(--bull)" : "var(--bear)") : "var(--fg)" }}>
+            {orch ? fmtPct(orch.probability) : "—"}
+          </div>
+        </div>
+        <div className="dl-cell">
+          <div className="k">Confidence</div>
+          <div className="v">{orch ? fmtPct(orch.confidence) : "—"}</div>
+        </div>
+        <div className="dl-cell">
+          <div className="k">Expected move</div>
+          <div className="v" style={{ color: expected && expected.direction > 0 ? "var(--bull)" : "var(--bear)" }}>
+            {expected ? fmtSigned(expected.point - expected.last) : "—"}
+          </div>
+        </div>
+        <div className="dl-cell">
+          <div className="k">Volatility (ATR14)</div>
+          <div className="v">{Number.isFinite(atr) ? fmt(atr) : "—"}</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ContextCard({ ta, candles }) {
+  if (!ta || ta.empty) return null;
+  const last = ta.close?.[ta.close.length - 1];
+  const atr  = Array.isArray(ta.atr14) ? ta.atr14[ta.atr14.length - 1] : ta.atr14;
+  const rsi  = Array.isArray(ta.rsi14) ? ta.rsi14[ta.rsi14.length - 1] : ta.rsi14;
+  const vwap = Array.isArray(ta.vwap)  ? ta.vwap[ta.vwap.length - 1]  : ta.vwap;
+  const trend = ta.trend || "—";
+  // Phase-6 regime bundle
+  const regime = ta.regime || {};
+  // Premium/discount per Phase-4 module (engine stores `lastZone`)
+  const pd  = ta.premiumDiscount?.lastZone || ta.summary?.zone;
+  const pdhpdl = derivePDHPDL(candles);
+  return (
+    <div className="card">
+      <h3>Market Context <span className="badge">{trend}</span></h3>
+      <div className="dl-grid">
+        <div className="dl-cell"><div className="k">Last</div><div className="v">{fmt(last)}</div></div>
+        <div className="dl-cell"><div className="k">RSI 14</div>
+          <div className="v" style={{ color: rsi > 70 ? "var(--bear)" : rsi < 30 ? "var(--bull)" : "var(--fg)" }}>{fmt(rsi, 1)}</div>
+        </div>
+        <div className="dl-cell"><div className="k">VWAP Δ</div>
+          <div className="v">{Number.isFinite(vwap) && Number.isFinite(last) ? fmtSigned(last - vwap) : "—"}</div>
+        </div>
+        <div className="dl-cell"><div className="k">ATR 14</div><div className="v">{fmt(atr)}</div></div>
+        <div className="dl-cell"><div className="k">PDH</div><div className="v" style={{ color: "var(--bull)" }}>{fmt(pdhpdl?.pdh)}</div></div>
+        <div className="dl-cell"><div className="k">PDL</div><div className="v" style={{ color: "var(--bear)" }}>{fmt(pdhpdl?.pdl)}</div></div>
+        <div className="dl-cell" style={{ gridColumn: "1 / -1" }}>
+          <div className="k">Regime</div>
+          <div className="v" style={{ textTransform: "uppercase", letterSpacing: 1, fontSize: 13 }}>
+            {regime.label || "—"}
+            <span style={{ color: "var(--fg-dim)", fontSize: 11, marginLeft: 8, fontWeight: 400 }}>
+              {regime.trend && `· ${regime.trend}`} {regime.volatility && `· ${regime.volatility} vol`}
+            </span>
+          </div>
+        </div>
+        <div className="dl-cell" style={{ gridColumn: "1 / -1" }}>
+          <div className="k">Premium / Discount</div>
+          <div className="v" style={{ textTransform: "uppercase", letterSpacing: 1 }}>{pd || "—"}</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ── Trade Setup — computes Entry / TP1 / TP2 / SL / R:R from expected move + ATR */
+function TradeSetupCard({ orch, expected, ta }) {
+  if (!orch || !expected || !ta || ta.empty) return null;
+  const atr = Array.isArray(ta.atr14) ? ta.atr14[ta.atr14.length - 1] : ta.atr14;
+  if (!Number.isFinite(atr) || !Number.isFinite(expected.last)) return null;
+  const longSide = expected.direction > 0;
+  const entry = expected.last;
+  const sl    = longSide ? entry - atr * 1.25 : entry + atr * 1.25;
+  const tp1   = longSide ? entry + atr * 1.00 : entry - atr * 1.00;
+  const tp2   = longSide ? entry + atr * 2.00 : entry - atr * 2.00;
+  const risk  = Math.abs(entry - sl);
+  const rewardTp1 = Math.abs(tp1 - entry);
+  const rr1 = risk > 0 ? rewardTp1 / risk : 0;
+  const rr2 = risk > 0 ? Math.abs(tp2 - entry) / risk : 0;
+  const tone = longSide ? "bull" : "bear";
+  const abstain = Math.abs(orch.rawScore || 0) < 0.15;
+  return (
+    <div className="card">
+      <h3>Trade Setup
+        <span className={"badge " + tone}>{longSide ? "LONG" : "SHORT"}</span>
+      </h3>
+      {abstain && (
+        <div style={{ padding: 6, marginBottom: 8, background: "rgba(255,193,7,.08)", border: "1px solid rgba(255,193,7,.25)", borderRadius: 4, fontSize: 11, color: "var(--warn)" }}>
+          ⚠ bias |{fmt(orch.rawScore, 2)}| too small — stand aside
+        </div>
+      )}
+      <div className="dl-grid">
+        <div className="dl-cell">
+          <div className="k">Entry</div>
+          <div className="v">{fmt(entry)}</div>
+        </div>
+        <div className="dl-cell">
+          <div className="k">Stop Loss</div>
+          <div className="v" style={{ color: "var(--bear)" }}>{fmt(sl)}</div>
+        </div>
+        <div className="dl-cell">
+          <div className="k">TP1 <span style={{ opacity: .6, fontSize: 10 }}>({rr1.toFixed(2)}R)</span></div>
+          <div className="v" style={{ color: "var(--bull)" }}>{fmt(tp1)}</div>
+        </div>
+        <div className="dl-cell">
+          <div className="k">TP2 <span style={{ opacity: .6, fontSize: 10 }}>({rr2.toFixed(2)}R)</span></div>
+          <div className="v" style={{ color: "var(--bull)" }}>{fmt(tp2)}</div>
+        </div>
+      </div>
+      <div style={{ marginTop: 10, display: "flex", justifyContent: "space-between", fontSize: 11, color: "var(--fg-dim)" }}>
+        <span>Risk · <b style={{ color: "var(--fg)" }}>{fmt(risk)}</b></span>
+        <span>ATR·1.25 stop · 1.0/2.0 ATR targets</span>
+      </div>
+    </div>
+  );
+}
+
+/* ── Pattern Detection — reads ta.patterns */
+function PatternCard({ ta }) {
+  if (!ta || ta.empty || !Array.isArray(ta.patterns)) return null;
+  const tail = ta.patterns.slice(-8).reverse();
+  if (!tail.length) {
+    return (
+      <div className="card">
+        <h3>Pattern Detection <span className="badge">0</span></h3>
+        <div style={{ color: "var(--fg-dim)", fontSize: 12 }}>No recent candlestick patterns.</div>
+      </div>
+    );
+  }
+  const tag = (name) => {
+    const bull = /bull|hammer|piercing|morning|engulf.*bull|invertedHammer/i.test(name);
+    const bear = /bear|shooting|dark|evening|engulf.*bear|hanged/i.test(name);
+    return bull ? "bull" : bear ? "bear" : "flat";
+  };
+  return (
+    <div className="card">
+      <h3>Pattern Detection <span className="badge">{ta.patterns.length}</span></h3>
+      <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+        {tail.map((p, i) => (
+          <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 11, padding: "4px 6px", background: "var(--bg)", borderRadius: 4 }}>
+            <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+              {(p.patterns || []).map((name, j) => (
+                <span key={j} className={"chip-toggle on " + tag(name)} style={{ fontSize: 10, padding: "2px 6px" }}>
+                  {name}
+                </span>
+              ))}
+            </div>
+            <span style={{ color: "var(--fg-dim)", fontFamily: "var(--font-mono)", fontSize: 10 }}>
+              {new Date(p.t).toISOString().slice(11, 16)}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ── Key Levels — lists BSL/SSL liquidity + equal-highs/lows */
+function KeyLevelsCard({ ta }) {
+  if (!ta || ta.empty || !ta.liquidity) return null;
+  const { eqHighs = [], eqLows = [], sweeps = [] } = ta.liquidity;
+  const last = ta.close?.[ta.close.length - 1];
+  const topN = (arr, k) => arr.slice().sort((a, b) => Math.abs(b.price - last) > Math.abs(a.price - last) ? -1 : 1).slice(0, k);
+  const bsl = topN(eqHighs, 3);
+  const ssl = topN(eqLows,  3);
+  const lastSweep = sweeps.slice(-1)[0];
+  return (
+    <div className="card">
+      <h3>Key Levels
+        <span className="badge">{eqHighs.length}·BSL / {eqLows.length}·SSL</span>
+      </h3>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+        <div>
+          <div style={{ fontSize: 10, color: "var(--fg-dim)", textTransform: "uppercase", letterSpacing: 1, marginBottom: 4 }}>Buy-Side (BSL)</div>
+          {bsl.length ? bsl.map((l, i) => (
+            <div key={i} style={{ fontSize: 11, color: "var(--bull)", fontFamily: "var(--font-mono)" }}>
+              {fmt(l.price)} <span style={{ color: "var(--fg-dim)" }}>×{l.touches ?? "?"}</span>
+            </div>
+          )) : <div style={{ fontSize: 11, color: "var(--fg-dim)" }}>—</div>}
+        </div>
+        <div>
+          <div style={{ fontSize: 10, color: "var(--fg-dim)", textTransform: "uppercase", letterSpacing: 1, marginBottom: 4 }}>Sell-Side (SSL)</div>
+          {ssl.length ? ssl.map((l, i) => (
+            <div key={i} style={{ fontSize: 11, color: "var(--bear)", fontFamily: "var(--font-mono)" }}>
+              {fmt(l.price)} <span style={{ color: "var(--fg-dim)" }}>×{l.touches ?? "?"}</span>
+            </div>
+          )) : <div style={{ fontSize: 11, color: "var(--fg-dim)" }}>—</div>}
+        </div>
+      </div>
+      {lastSweep && (
+        <div style={{ marginTop: 10, padding: 6, background: "rgba(179,136,255,.08)", border: "1px solid rgba(179,136,255,.25)", borderRadius: 4, fontSize: 11 }}>
+          Last sweep · <b style={{ color: lastSweep.kind === "bullish" ? "var(--bull)" : "var(--bear)" }}>{lastSweep.kind?.toUpperCase()}</b> @ {fmt(lastSweep.level)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ── Volume Profile — bucket volume by price, horizontal bars */
+function VolumeProfileCard({ ta }) {
+  if (!ta || ta.empty || !ta.t?.length) return null;
+  const buckets = 24;
+  const tail = Math.min(ta.t.length, 200);
+  const start = ta.t.length - tail;
+  let lo = +Infinity, hi = -Infinity;
+  for (let i = start; i < ta.t.length; i++) {
+    if (ta.low[i]  < lo) lo = ta.low[i];
+    if (ta.high[i] > hi) hi = ta.high[i];
+  }
+  if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) return null;
+  const step = (hi - lo) / buckets;
+  const rows = Array.from({ length: buckets }, (_, i) => ({
+    lo: lo + step * i, hi: lo + step * (i + 1), vol: 0, up: 0, dn: 0,
+  }));
+  for (let i = start; i < ta.t.length; i++) {
+    const tp = (ta.high[i] + ta.low[i] + ta.close[i]) / 3;
+    const idx = Math.min(buckets - 1, Math.max(0, Math.floor((tp - lo) / step)));
+    const vol = +ta.volume[i] || 0;
+    rows[idx].vol += vol;
+    if (ta.close[i] >= ta.open[i]) rows[idx].up += vol; else rows[idx].dn += vol;
+  }
+  const maxV = rows.reduce((m, r) => r.vol > m ? r.vol : m, 0) || 1;
+  const pocIdx = rows.reduce((mi, r, i, arr) => r.vol > arr[mi].vol ? i : mi, 0);
+  const last = ta.close[ta.close.length - 1];
+  return (
+    <div className="card">
+      <h3>Volume Profile
+        <span className="badge">{tail} bars</span>
+      </h3>
+      <div style={{ display: "flex", flexDirection: "column-reverse", gap: 1, fontSize: 10, fontFamily: "var(--font-mono)" }}>
+        {rows.map((r, i) => {
+          const mid = (r.lo + r.hi) / 2;
+          const w = (r.vol / maxV) * 100;
+          const upPct = r.vol > 0 ? (r.up / r.vol) * 100 : 0;
+          const isPOC = i === pocIdx;
+          const near  = last >= r.lo && last < r.hi;
+          return (
+            <div key={i} style={{ display: "grid", gridTemplateColumns: "54px 1fr 38px", alignItems: "center", gap: 4, opacity: isPOC ? 1 : .82 }}>
+              <span style={{ color: near ? "var(--accent)" : "var(--fg-dim)", fontSize: 9 }}>
+                {fmt(mid, mid > 1000 ? 0 : 2)}
+              </span>
+              <div style={{ position: "relative", height: 10, background: "var(--bg)", borderRadius: 2, overflow: "hidden", border: isPOC ? "1px solid var(--warn)" : "none" }}>
+                <span style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: `${w * upPct / 100}%`, background: "rgba(38,166,154,.55)" }} />
+                <span style={{ position: "absolute", left: `${w * upPct / 100}%`, top: 0, bottom: 0, width: `${w * (100 - upPct) / 100}%`, background: "rgba(239,83,80,.55)" }} />
+              </div>
+              <span style={{ color: isPOC ? "var(--warn)" : "var(--fg-dim)", textAlign: "right", fontSize: 9 }}>
+                {isPOC ? "POC" : (w > 40 ? "HVN" : w < 10 ? "LVN" : "")}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/* ── Liquidation heatmap (approximation) — cluster from recent sweeps + high-volume candles */
+function LiquidationHeatmapCard({ ta }) {
+  if (!ta || ta.empty) return null;
+  const last = ta.close?.[ta.close.length - 1];
+  const atr  = Array.isArray(ta.atr14) ? ta.atr14[ta.atr14.length - 1] : ta.atr14;
+  if (!Number.isFinite(last) || !Number.isFinite(atr)) return null;
+  // Approximate "liquidation zones" from: PDH/PDL, equal-highs/lows, and ATR bands
+  const zones = [];
+  if (ta.liquidity) {
+    for (const eh of (ta.liquidity.eqHighs || []).slice(0, 6)) {
+      zones.push({ side: "long", price: eh.price, score: (eh.touches || 1) * 0.3 });
+    }
+    for (const el of (ta.liquidity.eqLows || []).slice(0, 6)) {
+      zones.push({ side: "short", price: el.price, score: (el.touches || 1) * 0.3 });
+    }
+  }
+  // ATR band approximations (common leverage liquidation zones)
+  for (const mult of [1, 2, 3]) {
+    zones.push({ side: "long",  price: last - atr * mult, score: 1 / mult, atr: mult });
+    zones.push({ side: "short", price: last + atr * mult, score: 1 / mult, atr: mult });
+  }
+  zones.sort((a, b) => a.price - b.price);
+  const maxScore = zones.reduce((m, z) => z.score > m ? z.score : m, 0) || 1;
+  return (
+    <div className="card">
+      <h3>Liquidation Heatmap
+        <span className="badge">{zones.length} zones</span>
+      </h3>
+      <div style={{ display: "flex", flexDirection: "column-reverse", gap: 2, fontSize: 10, fontFamily: "var(--font-mono)" }}>
+        {zones.map((z, i) => {
+          const w = (z.score / maxScore) * 100;
+          const near = Math.abs(z.price - last) < atr * 0.5;
+          return (
+            <div key={i} style={{ display: "grid", gridTemplateColumns: "60px 1fr 30px", alignItems: "center", gap: 4 }}>
+              <span style={{ color: near ? "var(--accent)" : "var(--fg-dim)" }}>{fmt(z.price, z.price > 1000 ? 0 : 2)}</span>
+              <div style={{ position: "relative", height: 8, background: "var(--bg)", borderRadius: 2, overflow: "hidden" }}>
+                <span style={{
+                  position: "absolute", top: 0, bottom: 0,
+                  left: z.side === "long" ? 0 : `${100 - w}%`,
+                  width: `${w}%`,
+                  background: z.side === "long" ? "linear-gradient(90deg,#26a69a,#26a69a55)" : "linear-gradient(270deg,#ef5350,#ef535055)",
+                }} />
+              </div>
+              <span style={{ color: "var(--fg-dim)", textAlign: "right", fontSize: 9 }}>
+                {z.atr ? `${z.atr}x` : "eq"}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/* ── Long/Short ratio — Binance public futures API */
+function useLongShortRatio(symbol, tf = "15m") {
+  const [data, setData] = useState(null);
+  useEffect(() => {
+    let cancelled = false;
+    let timer = null;
+    const fetcher = async () => {
+      try {
+        const url = `https://fapi.binance.com/futures/data/globalLongShortAccountRatio?symbol=${encodeURIComponent(symbol)}&period=${tf}&limit=20`;
+        const res = await fetch(url, { mode: "cors" });
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const json = await res.json();
+        if (cancelled || !Array.isArray(json)) return;
+        setData({
+          series: json.map(r => ({
+            t: +r.timestamp,
+            ratio: +r.longShortRatio,
+            longPct: +r.longAccount * 100,
+            shortPct: +r.shortAccount * 100,
+          })),
+          updatedAt: Date.now(),
+        });
+      } catch (err) {
+        if (!cancelled) setData({ error: err.message || String(err), updatedAt: Date.now() });
+      }
+    };
+    fetcher();
+    timer = setInterval(fetcher, 60_000);
+    return () => { cancelled = true; if (timer) clearInterval(timer); };
+  }, [symbol, tf]);
+  return data;
+}
+
+function LongShortRatioCard({ symbol }) {
+  const data = useLongShortRatio(symbol, "15m");
+  if (!data) {
+    return (
+      <div className="card">
+        <h3>Long/Short Ratio <span className="badge">loading…</span></h3>
+        <div className="shimmer" style={{ height: 40 }} />
+      </div>
+    );
+  }
+  if (data.error) {
+    return (
+      <div className="card">
+        <h3>Long/Short Ratio <span className="badge">error</span></h3>
+        <div style={{ fontSize: 11, color: "var(--bear)" }}>{data.error}</div>
+      </div>
+    );
+  }
+  const latest = data.series?.[data.series.length - 1];
+  if (!latest) return null;
+  const bullish = latest.ratio >= 1;
+  return (
+    <div className="card">
+      <h3>Long/Short Ratio
+        <span className={"badge " + (bullish ? "bull" : "bear")}>
+          {latest.ratio.toFixed(2)}
+        </span>
+      </h3>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+        <div className="dl-cell">
+          <div className="k">Long accounts</div>
+          <div className="v" style={{ color: "var(--bull)" }}>{latest.longPct.toFixed(1)}%</div>
+        </div>
+        <div className="dl-cell">
+          <div className="k">Short accounts</div>
+          <div className="v" style={{ color: "var(--bear)" }}>{latest.shortPct.toFixed(1)}%</div>
+        </div>
+      </div>
+      {/* Sparkline */}
+      <div style={{ display: "flex", gap: 1, height: 26, alignItems: "flex-end", marginTop: 10 }}>
+        {data.series.map((p, i) => {
+          const pctUp = Math.max(5, Math.min(100, (p.longPct / 100) * 100));
+          return (
+            <div key={i} style={{ flex: 1, display: "flex", flexDirection: "column", height: "100%" }}>
+              <div style={{ flex: (100 - pctUp), background: "rgba(239,83,80,.45)" }} />
+              <div style={{ flex: pctUp, background: "rgba(38,166,154,.55)" }} />
+            </div>
+          );
+        })}
+      </div>
+      <div style={{ fontSize: 10, color: "var(--fg-dim)", marginTop: 6, textAlign: "right" }}>
+        Binance futures · 15m · updated {new Date(data.updatedAt).toLocaleTimeString()}
+      </div>
+    </div>
+  );
+}
+
+/* ── Hybrid Decision — fuses Orchestrator + NN + Conformal into a consensus */
+function HybridDecisionCard({ orch, ta }) {
+  if (!orch || !ta || ta.empty) return null;
+  // Try to get NN output from the ensemble store (Phase 8), if available
+  let nnProb = null;
+  try {
+    const Ens = window.__MNP__?.Ensemble;
+    if (Ens?.getLastProbability) nnProb = Ens.getLastProbability();
+  } catch {}
+  // Try to get conformal interval (Phase 9), if calibrated
+  let conf = null;
+  try {
+    const CStore = window.__MNP__?.ConformalStore;
+    if (CStore?.getLastInterval) conf = CStore.getLastInterval();
+  } catch {}
+  const orchP = orch.probability ?? 0.5;
+  const weights = [];
+  let sum = 0, total = 0;
+  weights.push({ name: "Ensemble", prob: orchP, weight: 0.5 });
+  sum += orchP * 0.5; total += 0.5;
+  if (Number.isFinite(nnProb)) { weights.push({ name: "NN", prob: nnProb, weight: 0.35 }); sum += nnProb * 0.35; total += 0.35; }
+  if (Number.isFinite(conf?.prob)) { weights.push({ name: "Conformal", prob: conf.prob, weight: 0.15 }); sum += conf.prob * 0.15; total += 0.15; }
+  const fusedP = total > 0 ? sum / total : orchP;
+  const dir = fusedP >= 0.55 ? "long" : fusedP <= 0.45 ? "short" : "neutral";
+  const tone = directionTone(dir);
+  return (
+    <div className="card">
+      <h3>Hybrid Decision
+        <span className={"badge " + tone}>{dir.toUpperCase()}</span>
+      </h3>
+      <Bar label="Fused P(up)" value={fusedP} max={1} tone={tone} valueFmt={fmtPct} />
+      <div style={{ marginTop: 8, display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 6, fontSize: 11 }}>
+        {weights.map(w => (
+          <div key={w.name} className="dl-cell" style={{ padding: 6 }}>
+            <div className="k">{w.name} · {(w.weight * 100).toFixed(0)}%</div>
+            <div className="v" style={{ fontSize: 13, color: w.prob > 0.5 ? "var(--bull)" : "var(--bear)" }}>
+              {fmtPct(w.prob)}
+            </div>
+          </div>
+        ))}
+      </div>
+      {!Number.isFinite(nnProb) && (
+        <div style={{ fontSize: 10, color: "var(--fg-dim)", marginTop: 6 }}>NN not calibrated yet · using ensemble-only fusion.</div>
+      )}
+    </div>
+  );
+}
+
+/* ── Next Candle Prediction — one-bar-ahead direction / magnitude estimate */
+function NextCandleCard({ orch, expected, ta }) {
+  if (!orch || !expected || !ta || ta.empty) return null;
+  const last = expected.last;
+  const atr  = expected.atr;
+  // Scaled one-bar estimate — ensemble bias × 0.6 ATR as the 1-bar expected magnitude
+  const mag = Math.abs(orch.rawScore || 0) * atr * 0.6;
+  const predOpen  = last;
+  const predClose = expected.direction > 0 ? last + mag : last - mag;
+  const predHi    = predClose + atr * 0.35;
+  const predLo    = predClose - atr * 0.35;
+  const tone = directionTone(expected.direction > 0 ? "long" : "short");
+  return (
+    <div className="card">
+      <h3>Next Candle
+        <span className={"badge " + tone}>{expected.direction > 0 ? "BULL" : "BEAR"}</span>
+      </h3>
+      <div className="dl-grid">
+        <div className="dl-cell"><div className="k">Open</div><div className="v">{fmt(predOpen)}</div></div>
+        <div className="dl-cell"><div className="k">Close</div><div className="v" style={{ color: tone === "bull" ? "var(--bull)" : "var(--bear)" }}>{fmt(predClose)}</div></div>
+        <div className="dl-cell"><div className="k">High</div><div className="v" style={{ color: "var(--bull)" }}>{fmt(predHi)}</div></div>
+        <div className="dl-cell"><div className="k">Low</div><div className="v" style={{ color: "var(--bear)" }}>{fmt(predLo)}</div></div>
+      </div>
+      <div style={{ fontSize: 10, color: "var(--fg-dim)", marginTop: 6, textAlign: "right" }}>
+        {fmtSigned(((predClose - last) / last) * 100, 3)}% · mag {fmt(mag)} (0.6·ATR)
+      </div>
+    </div>
+  );
+}
+
+/* ── HTF Bias Grid — runs TA/Orchestrator against higher timeframes */
+function HTFBiasGridCard({ symbol }) {
+  const [grid, setGrid] = useState([]);
+  const HTFS = ["15m", "1h", "4h", "1d"];
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const mnp = window.__MNP__;
+      if (!mnp) return;
+      const out = [];
+      for (const tf of HTFS) {
+        try {
+          const candles = await mnp.getStored({ symbol, tf, limit: 200 });
+          if (!Array.isArray(candles) || candles.length < 50) { out.push({ tf, status: "no-data" }); continue; }
+          const ta = mnp.TAEngine.compute(candles);
+          const o  = mnp.Orchestrator.runModules(ta, {});
+          out.push({ tf, status: "ok", bias: o.rawScore, prob: o.probability, dir: o.direction, trend: ta.trend });
+        } catch (e) { out.push({ tf, status: "err", err: e?.message || String(e) }); }
+      }
+      if (!cancelled) setGrid(out);
+    })();
+    return () => { cancelled = true; };
+  }, [symbol]);
+  return (
+    <div className="card">
+      <h3>HTF Bias Grid <span className="badge">{symbol}</span></h3>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 6 }}>
+        {grid.length ? grid.map((r, i) => {
+          const tone = directionTone(r.dir);
+          return (
+            <div key={i} style={{ padding: "8px 6px", background: "var(--bg)", borderRadius: 4, textAlign: "center", border: `1px solid ${tone === "bull" ? "rgba(38,166,154,.35)" : tone === "bear" ? "rgba(239,83,80,.35)" : "var(--border)"}` }}>
+              <div style={{ fontSize: 10, color: "var(--fg-dim)", textTransform: "uppercase", letterSpacing: 1 }}>{r.tf}</div>
+              {r.status === "ok" ? (
+                <>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: tone === "bull" ? "var(--bull)" : tone === "bear" ? "var(--bear)" : "var(--fg-dim)" }}>
+                    {(r.dir || "—").toUpperCase()}
+                  </div>
+                  <div style={{ fontSize: 10, color: "var(--fg-dim)", fontFamily: "var(--font-mono)" }}>
+                    {fmtSigned(r.bias, 2)}
+                  </div>
+                </>
+              ) : (
+                <div style={{ fontSize: 10, color: "var(--fg-dim)" }}>{r.status}</div>
+              )}
+            </div>
+          );
+        }) : HTFS.map(tf => (
+          <div key={tf} className="shimmer" style={{ height: 50 }} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ── Summary Table — 13 key metrics at a glance */
+function SummaryTableCard({ ta, orch, expected, candles }) {
+  if (!ta || ta.empty) return null;
+  const last = ta.close?.[ta.close.length - 1];
+  const rsi  = Array.isArray(ta.rsi14) ? ta.rsi14[ta.rsi14.length - 1] : ta.rsi14;
+  const atr  = Array.isArray(ta.atr14) ? ta.atr14[ta.atr14.length - 1] : ta.atr14;
+  const adx  = ta.adx14?.adx?.[ta.adx14.adx.length - 1];
+  const cci  = Array.isArray(ta.cci20) ? ta.cci20[ta.cci20.length - 1] : null;
+  const mfi  = Array.isArray(ta.mfi14) ? ta.mfi14[ta.mfi14.length - 1] : null;
+  const wr   = Array.isArray(ta.wr14)  ? ta.wr14[ta.wr14.length - 1]  : null;
+  const vwap = Array.isArray(ta.vwap)  ? ta.vwap[ta.vwap.length - 1] : ta.vwap;
+  const pdhpdl = derivePDHPDL(candles);
+  const bb = ta.bb_20_2 || ta.bb;
+  const bbUp = bb?.up?.[bb.up.length - 1];
+  const bbLo = bb?.lo?.[bb.lo.length - 1];
+  const rows = [
+    ["Price",     fmt(last)],
+    ["Trend",     ta.trend],
+    ["Regime",    ta.regime?.label || "—"],
+    ["RSI 14",    Number.isFinite(rsi) ? rsi.toFixed(1) : "—", rsi > 70 ? "bear" : rsi < 30 ? "bull" : null],
+    ["ATR 14",    fmt(atr)],
+    ["ADX 14",    Number.isFinite(adx) ? adx.toFixed(1) : "—", adx > 25 ? "bull" : null],
+    ["CCI 20",    Number.isFinite(cci) ? cci.toFixed(1) : "—", cci > 100 ? "bear" : cci < -100 ? "bull" : null],
+    ["MFI 14",    Number.isFinite(mfi) ? mfi.toFixed(1) : "—", mfi > 80 ? "bear" : mfi < 20 ? "bull" : null],
+    ["W %R 14",   Number.isFinite(wr) ? wr.toFixed(1) : "—"],
+    ["VWAP",      fmt(vwap)],
+    ["BB Upper",  fmt(bbUp)],
+    ["BB Lower",  fmt(bbLo)],
+    ["PDH / PDL", pdhpdl ? `${fmt(pdhpdl.pdh)} / ${fmt(pdhpdl.pdl)}` : "—"],
+  ];
+  return (
+    <div className="card">
+      <h3>Summary Table <span className="badge">13</span></h3>
+      <table className="summary-table">
+        <tbody>
+          {rows.map(([k, v, tone], i) => (
+            <tr key={i}>
+              <td style={{ color: "var(--fg-dim)", fontSize: 11 }}>{k}</td>
+              <td style={{ textAlign: "right", fontFamily: "var(--font-mono)", fontSize: 11,
+                color: tone === "bull" ? "var(--bull)" : tone === "bear" ? "var(--bear)" : "var(--fg)" }}>
+                {v ?? "—"}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function SignalSidebar({ orch, expected, ghost, ta, candles, regime, symbol }) {
+  return (
+    <aside className="sidebar" aria-label="signal-sidebar">
+      <TradeSignalCard orch={orch} expected={expected} regime={regime} ta={ta} />
+      <HybridDecisionCard orch={orch} ta={ta} />
+      <GhostCandleCard ghost={ghost} ta={ta} />
+      <TradeSetupCard orch={orch} expected={expected} ta={ta} />
+      <NextCandleCard orch={orch} expected={expected} ta={ta} />
+      <MasterBiasCard orch={orch} />
+      <DLSupervisorCard orch={orch} expected={expected} ta={ta} />
+      {symbol && <LongShortRatioCard symbol={symbol} />}
+      {symbol && <HTFBiasGridCard symbol={symbol} />}
+      <ContextCard ta={ta} candles={candles} />
+      <PatternCard ta={ta} />
+      <KeyLevelsCard ta={ta} />
+      <VolumeProfileCard ta={ta} />
+      <LiquidationHeatmapCard ta={ta} />
+      <SummaryTableCard ta={ta} orch={orch} expected={expected} candles={candles} />
+      <ModuleBreakdownCard orch={orch} />
+    </aside>
+  );
+}
+
+/* ── Ghost candles (Phase 11) — forward-projected OHLC path with ±conformal band */
+function GhostCandleCard({ ghost, ta }) {
+  if (!ghost || !Array.isArray(ghost.bars) || !ghost.bars.length) return null;
+  const gc = window.__MNP__?.GhostCandles;
+  const summary = gc?.summarizeForecast?.(ghost);
+  if (!summary) return null;
+  const dirTone = summary.direction > 0 ? "bull" : summary.direction < 0 ? "bear" : "flat";
+  const dirLabel = summary.direction > 0 ? "LONG" : summary.direction < 0 ? "SHORT" : "FLAT";
+  const badgeClass = "badge " + (dirTone === "bull" ? "bull" : dirTone === "bear" ? "bear" : "");
+  const movePct = summary.expectedMovePct * 100;
+  // Build a sparkline of projected closes + ribbon for quick visual read.
+  const W = 180, H = 40;
+  const steps = ghost.bars.length;
+  const allHi = [ghost.anchorClose, ...ghost.bars.map(b => b.hi)];
+  const allLo = [ghost.anchorClose, ...ghost.bars.map(b => b.lo)];
+  const minV = Math.min(...allLo);
+  const maxV = Math.max(...allHi);
+  const range = Math.max(1e-9, maxV - minV);
+  const scaleY = (v) => {
+    const y = H - ((v - minV) / range) * H;
+    return Math.max(0, Math.min(H, y));
+  };
+  const xAt = (i) => (i / steps) * W;               // i=0 anchor, i=steps last bar
+  const pathPts = [
+    `${xAt(0).toFixed(1)},${scaleY(ghost.anchorClose).toFixed(1)}`,
+    ...ghost.bars.map((b, i) => `${xAt(i + 1).toFixed(1)},${scaleY(b.c).toFixed(1)}`),
+  ].join(" ");
+  const upperPts = [
+    `${xAt(0).toFixed(1)},${scaleY(ghost.anchorClose).toFixed(1)}`,
+    ...ghost.bars.map((b, i) => `${xAt(i + 1).toFixed(1)},${scaleY(b.hi).toFixed(1)}`),
+  ];
+  const lowerPts = ghost.bars.slice().reverse().map((b, idx) => {
+    const i = ghost.bars.length - idx - 1;
+    return `${xAt(i + 1).toFixed(1)},${scaleY(b.lo).toFixed(1)}`;
+  }).concat([`${xAt(0).toFixed(1)},${scaleY(ghost.anchorClose).toFixed(1)}`]);
+  const ribbon = upperPts.concat(lowerPts).join(" ");
+  const lineColor = summary.direction > 0 ? "#26a69a" : summary.direction < 0 ? "#ef5350" : "#9aa0ab";
+  const ribbonFill = summary.direction > 0 ? "rgba(38,166,154,.15)" : summary.direction < 0 ? "rgba(239,83,80,.15)" : "rgba(179,136,255,.12)";
+  return (
+    <div className="card card-glass">
+      <h3>Ghost Candles <span className={badgeClass}>{dirLabel}</span></h3>
+      <svg width={W} height={H} aria-hidden="true" style={{ display: "block", margin: "4px 0 8px" }}>
+        <polygon points={ribbon} fill={ribbonFill} stroke="none" />
+        <polyline points={pathPts} fill="none" stroke={lineColor} strokeWidth="1.5" />
+      </svg>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+        <div className="dl-cell">
+          <div className="k">Horizon</div>
+          <div className="v">{summary.horizon} bars</div>
+        </div>
+        <div className="dl-cell">
+          <div className="k">Final close</div>
+          <div className="v" style={{ color: summary.direction > 0 ? "var(--bull)" : summary.direction < 0 ? "var(--bear)" : undefined }}>
+            {fmt(summary.finalClose)}
+          </div>
+        </div>
+        <div className="dl-cell">
+          <div className="k">Expected move</div>
+          <div className="v" style={{ color: summary.expectedMove >= 0 ? "var(--bull)" : "var(--bear)" }}>
+            {fmtSigned(summary.expectedMove)} ({fmtSigned(movePct, 2)}%)
+          </div>
+        </div>
+        <div className="dl-cell">
+          <div className="k">Band (final)</div>
+          <div className="v">±{fmt((summary.finalHi - summary.finalLo) / 2)}</div>
+        </div>
+        <div className="dl-cell">
+          <div className="k">Widens</div>
+          <div className="v">{fmt(summary.widthFirst)} → {fmt(summary.widthLast)}</div>
+        </div>
+        <div className="dl-cell">
+          <div className="k">Interval</div>
+          <div className="v">{ghost.usedConformal ? `CP ${Math.round((1 - ghost.alpha) * 100)}%` : "ATR√h"}</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ╔══════════════════════════════════════════════════════════════════╗
+   ║  KPI strip (footer)                                              ║
+   ╚══════════════════════════════════════════════════════════════════╝ */
+
+function KpiStrip({ bootstrapCount, gaps, orch, ta, validation, sysEvents }) {
+  const candlePool = Array.isArray(ta?.t) ? ta.t.length : 0;
+  const accuracy = validation?.accuracy;
+  const drift    = validation?.lastDrift;
+  const openCircuits = Object.entries(sysEvents?.circuits || {}).filter(([, v]) => v === "open").map(([k]) => k);
+  const failingHealth = Object.entries(sysEvents?.health || {}).filter(([, v]) => v === false).map(([k]) => k);
+  const degradeFlags = sysEvents?.degradeFlags || [];
+  const quotaPct = sysEvents?.quota?.freePct;
+  return (
+    <footer className="kpi-strip" role="contentinfo">
+      <span className="kpi"><b>Pool</b> {candlePool} candles</span>
+      <span className="kpi-divider" />
+      <span className="kpi"><b>Bootstrap</b> {bootstrapCount}</span>
+      <span className="kpi-divider" />
+      <span className="kpi" style={{ color: gaps > 0 ? "var(--warn)" : undefined }}><b>Gaps</b> {gaps}</span>
+      <span className="kpi-divider" />
+      {accuracy ? (
+        <span className="kpi">
+          <b>Live Acc</b> <span className={accuracy.value >= 0.5 ? "trend-up" : "trend-down"}>
+            {fmtPct(accuracy.value)}
+          </span> <span style={{opacity:.6}}>(n={accuracy.n})</span>
+        </span>
+      ) : (
+        <span className="kpi"><b>Live Acc</b> —</span>
+      )}
+      <span className="kpi-divider" />
+      {orch && (
+        <>
+          <span className="kpi">
+            <b>Bias</b> <span className={orch.rawScore >= 0 ? "trend-up" : "trend-down"}>
+              {fmtSigned(orch.rawScore, 2)}
+            </span>
+          </span>
+          <span className="kpi-divider" />
+          <span className="kpi"><b>P(up)</b> {fmtPct(orch.probability)}</span>
+          <span className="kpi-divider" />
+        </>
+      )}
+      {drift ? (
+        <span className="drift-banner" title={drift.cause}>
+          ⚠ drift · {drift.cause}
+        </span>
+      ) : (
+        <span className="kpi" style={{ color: "var(--bull)" }}>● no-drift</span>
+      )}
+      <span className="kpi-divider" />
+      <span className="kpi" style={{ color: openCircuits.length ? "var(--bear)" : failingHealth.length ? "var(--warn)" : "var(--bull)" }}
+            title={openCircuits.length ? "Open: " + openCircuits.join(", ") : failingHealth.length ? "Failing: " + failingHealth.join(", ") : "All systems nominal"}>
+        ● health {openCircuits.length ? `${openCircuits.length}⚡` : failingHealth.length ? `${failingHealth.length}⚠` : "ok"}
+      </span>
+      {degradeFlags.length > 0 && (
+        <>
+          <span className="kpi-divider" />
+          <span className="kpi" style={{ color: "var(--warn)" }} title={degradeFlags.join(", ")}>
+            ⚡ {degradeFlags.length} degrade
+          </span>
+        </>
+      )}
+      {Number.isFinite(quotaPct) && (
+        <>
+          <span className="kpi-divider" />
+          <span className="kpi" style={{ color: quotaPct < 0.1 ? "var(--bear)" : quotaPct < 0.2 ? "var(--warn)" : "var(--fg-dim)" }}>
+            <b>Quota</b> {(quotaPct * 100).toFixed(1)}% free
+          </span>
+        </>
+      )}
+      <span className="spacer-flex" />
+      <span className="kpi" style={{ color: "var(--fg-dim)" }}>
+        For educational use only · not financial advice
+      </span>
+    </footer>
+  );
+}
+
+/* ╔══════════════════════════════════════════════════════════════════╗
+   ║  Scanner tab                                                     ║
+   ╚══════════════════════════════════════════════════════════════════╝ */
+
+function ScannerPane({ tf }) {
+  const [rows, setRows] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  const scan = useCallback(async () => {
+    setBusy(true); setErr(null); setRows([]);
+    const mnp = window.__MNP__;
+    if (!mnp) { setBusy(false); setErr("runtime not ready"); return; }
+    const out = [];
+    try {
+      for (const sym of SYMBOLS) {
+        try {
+          const candles = await mnp.getStored({ symbol: sym, tf, limit: 300 });
+          if (!Array.isArray(candles) || candles.length < 50) {
+            out.push({ symbol: sym, status: "no-data", candles: candles?.length || 0 });
+            continue;
+          }
+          const ta = mnp.TAEngine.compute(candles);
+          const orch = mnp.Orchestrator.runModules(ta, {});
+          const last = ta.close?.[ta.close.length - 1];
+          const atr  = Array.isArray(ta.atr14) ? ta.atr14[ta.atr14.length - 1] : ta.atr14;
+          out.push({
+            symbol: sym,
+            status: "ok",
+            last, atr, trend: ta.trend,
+            direction: orch.direction,
+            bias: orch.rawScore,
+            prob: orch.probability,
+            conf: orch.confidence,
+            candles: candles.length,
+          });
+        } catch (e) {
+          out.push({ symbol: sym, status: "err", err: e?.message || String(e) });
+        }
+        // micro-yield
+        await new Promise(r => setTimeout(r, 5));
+      }
+      setRows(out.sort((a, b) => Math.abs(b.bias || 0) - Math.abs(a.bias || 0)));
+    } catch (e) {
+      setErr(e?.message || String(e));
+    } finally { setBusy(false); }
+  }, [tf]);
+
+  // initial scan + rescan on tf change
+  useEffect(() => { scan(); }, [scan]);
+
+  return (
+    <section className="card" style={{ overflow: "auto", height: "100%" }}>
+      <h3>Scanner <span className="badge">{SYMBOLS.length} symbols · {tf}</span></h3>
+      <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+        <button className="btn-primary" onClick={scan} disabled={busy}>{busy ? "scanning…" : "Rescan"}</button>
+        {err && <span style={{ color: "var(--bear)", fontSize: 12 }}>{err}</span>}
+      </div>
+      <table className="scan-table">
+        <thead>
+          <tr>
+            <th>Symbol</th><th>Last</th><th>Trend</th><th>Direction</th>
+            <th>Bias</th><th>P(up)</th><th>Conf</th><th>ATR</th><th>Candles</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map(r => {
+            const tone = directionTone(r.direction);
+            return (
+              <tr key={r.symbol}>
+                <td><b style={{ color: "var(--fg)" }}>{r.symbol}</b></td>
+                <td>{fmt(r.last)}</td>
+                <td className={r.trend === "up" ? "bull" : r.trend === "down" ? "bear" : "flat"}>{r.trend || "—"}</td>
+                <td className={tone}>{(r.direction || "—").toUpperCase()}</td>
+                <td className={r.bias >= 0 ? "bull" : "bear"}>{fmtSigned(r.bias, 2)}</td>
+                <td>{Number.isFinite(r.prob) ? fmtPct(r.prob) : "—"}</td>
+                <td>{Number.isFinite(r.conf) ? fmtPct(r.conf) : "—"}</td>
+                <td>{fmt(r.atr)}</td>
+                <td style={{ opacity: .7 }}>{r.candles ?? 0}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </section>
+  );
+}
+
+/* ╔══════════════════════════════════════════════════════════════════╗
+   ║  AI Chat stub tab                                                ║
+   ╚══════════════════════════════════════════════════════════════════╝ */
+
+function AIChatPane({ orch, expected, ta, symbol, tf }) {
+  const [msgs, setMsgs] = useState([
+    { role: "ai", text: "Hi — I'm your trading analyst assistant. Ask me why the model is leaning long or short, and I'll explain based on the current ensemble + modules." },
+  ]);
+  const [input, setInput] = useState("");
+
+  const explain = useCallback(() => {
+    const lines = [];
+    if (!orch) return "The orchestration pipeline hasn't produced a signal yet — load more candles first.";
+    lines.push(`On ${symbol} · ${tf}, the ensemble is leaning **${orch.direction.toUpperCase()}** with bias ${fmt(orch.rawScore, 2)} and P(up) ${fmtPct(orch.probability)}.`);
+    if (expected) lines.push(`Expected move target: ${fmt(expected.point)} (direction ${expected.direction > 0 ? "up" : "down"}, band ±${fmt(expected.hi - expected.point)}).`);
+    if (orch.signals) {
+      const top = orch.signals
+        .slice()
+        .sort((a, b) => Math.abs(b.signal * b.confidence) - Math.abs(a.signal * a.confidence))
+        .slice(0, 3);
+      lines.push("Top drivers:");
+      for (const s of top) {
+        const meta = MODULE_META[s.id] || { label: s.id, emoji: "•" };
+        lines.push(`  ${meta.emoji} ${meta.label}: ${fmtSigned(s.signal, 2)} @ ${fmtPct(s.confidence)} conf`);
+      }
+    }
+    return lines.join("\n");
+  }, [orch, expected, symbol, tf]);
+
+  const send = useCallback(() => {
+    if (!input.trim()) return;
+    const user = input.trim();
+    setInput("");
+    setMsgs(m => [...m, { role: "you", text: user }]);
+    // Deterministic local analyst (real LLM hook lands in Phase 15 / DeepSeek)
+    const reply = /why|explain|reason/i.test(user) ? explain() :
+                  /target|price|move/i.test(user) ?
+                    (expected ? `Current target: ${fmt(expected.point)} (band ${fmt(expected.lo)} – ${fmt(expected.hi)})`
+                              : "No target available yet.") :
+                  /risk|atr|volat/i.test(user) ? (ta?.atr14?.length ? `ATR14: ${fmt(ta.atr14[ta.atr14.length - 1])}` : "ATR not available.") :
+                  "I'm a local analyst — I can answer about why, target/move, or risk/volatility. (Full LLM integration arrives in Phase 15 with DeepSeek-R1.)";
+    setTimeout(() => setMsgs(m => [...m, { role: "ai", text: reply }]), 120);
+  }, [input, explain, expected, ta]);
+
+  return (
+    <div className="chat-shell" aria-label="ai-chat">
+      <div className="chat-log">
+        {msgs.map((m, i) => (
+          <div key={i} className={"chat-msg " + m.role} style={{ whiteSpace: "pre-wrap" }}>{m.text}</div>
+        ))}
+      </div>
+      <div className="chat-input">
+        <input
+          type="text" placeholder="Why is the model leaning this way?"
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && send()}
+        />
+        <button className="btn-primary" onClick={send}>Send</button>
+      </div>
+    </div>
+  );
+}
+
+/* ╔══════════════════════════════════════════════════════════════════╗
+   ║  System tab (capabilities + health)                              ║
+   ╚══════════════════════════════════════════════════════════════════╝ */
+
+function SystemPane({ caps }) {
+  const row = (k, v, good) => (
+    <div style={{ display: "flex", justifyContent: "space-between", padding: "4px 0", borderBottom: "1px dashed var(--border)" }}>
+      <span style={{ color: "var(--fg-dim)", fontSize: 12 }}>{k}</span>
+      <span style={{ fontFamily: "var(--font-mono)", fontSize: 12,
+                     color: good === false ? "var(--bear)" : good === true ? "var(--bull)" : "var(--fg)" }}>
+        {typeof v === "boolean" ? (v ? "✓" : "✗") : String(v ?? "—")}
+      </span>
+    </div>
+  );
+  if (!caps) return <div className="card">loading capabilities…</div>;
+  return (
+    <div className="card" style={{ overflow: "auto", height: "100%" }}>
+      <h3>Runtime Capabilities <span className="badge">tier · {caps.tier || "?"}</span></h3>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))", gap: "6px 20px" }}>
+        {row("IndexedDB", caps.indexedDB, caps.indexedDB)}
+        {row("OPFS", caps.opfs, caps.opfs)}
+        {row("Web Workers", caps.workers, caps.workers)}
+        {row("WASM / SIMD", `${caps.wasm ? "✓" : "✗"}/${caps.wasmSIMD ? "✓" : "✗"}`)}
+        {row("WebGPU", caps.webgpu, caps.webgpu)}
+        {row("WebSocket", caps.websocket, caps.websocket)}
+        {row("BroadcastChannel", caps.broadcastCh, caps.broadcastCh)}
+        {row("Web Locks", caps.webLocks, caps.webLocks)}
+        {row("SharedArrayBuffer", caps.sab, caps.sab)}
+        {row("WebCrypto", caps.webCrypto, caps.webCrypto)}
+        {row("Service Worker", caps.serviceWorker, caps.serviceWorker)}
+        {row("Private mode", caps.privateMode, !caps.privateMode)}
+        {row("Cores / RAM", `${caps.hardwareCores} / ${caps.deviceMemGB ?? "?"} GB`)}
+        {row("Timezone", caps.tz)}
+      </div>
+      {caps.quota && (
+        <div style={{ marginTop: 14, padding: 10, background: "var(--bg)", borderRadius: 6, fontSize: 12 }}>
+          <b>Storage</b>: {fmtMB(caps.quota.usage)} / {fmtMB(caps.quota.quota)} used
+          {caps.quota.freePct != null && ` · ${(caps.quota.freePct * 100).toFixed(1)}% free`}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ╔══════════════════════════════════════════════════════════════════╗
+   ║  Toast stack (bus event notifier)                                ║
+   ╚══════════════════════════════════════════════════════════════════╝ */
+
+function ToastStack({ toasts, onDismiss }) {
+  return (
+    <div className="toast-stack" role="status" aria-live="polite">
+      {toasts.map(t => (
+        <div key={t.id} className={"toast tone-" + (t.tone || "accent")}>
+          <span className="toast-text">{t.text}</span>
+          {t.action && (
+            <button className="toast-action" onClick={() => { t.action.fn?.(); onDismiss(t.id); }}>
+              {t.action.label}
+            </button>
+          )}
+          <button className="toast-dismiss" onClick={() => onDismiss(t.id)} aria-label="dismiss">×</button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function useToasts(autoMs = 7000) {
+  const [items, setItems] = useState([]);
+  const nextId = useRef(1);
+  const push = useCallback((t) => {
+    const id = nextId.current++;
+    setItems(prev => [...prev, { id, ...t }]);
+    if (autoMs > 0) setTimeout(() => setItems(p => p.filter(x => x.id !== id)), autoMs);
+  }, [autoMs]);
+  const dismiss = useCallback((id) => setItems(p => p.filter(x => x.id !== id)), []);
+  return { items, push, dismiss };
+}
+
+/* ╔══════════════════════════════════════════════════════════════════╗
+   ║  Root App                                                        ║
+   ╚══════════════════════════════════════════════════════════════════╝ */
+
+function App() {
+  const [caps, setCaps] = useState(null);
+  const [ready, setReady] = useState(false);
+  const [symbol, setSymbol] = useState("BTCUSDT");
+  const [tf, setTf] = useState("1m");
+  const [tab, setTab] = useState("chart");
+  const [indicators, setIndicators] = useState({
+    ema20: true, ema50: true, ema200: false, vwap: true, bbUp: false, bbLo: false,
+    psar: false, ichiTenkan: false, ichiKijun: false, ichiCloudA: false, ichiCloudB: false, ichiChikou: false,
+  });
+  const [subplots, setSubplots] = useState({
+    volume: true, rsi: true, macd: true, stoch: false,
+    cci: false, wr: false, mfi: false, obv: false, cmf: false, adx: false,
+  });
+  const [structure, setStructure] = useState({
+    bos: true, fvg: true, ob: true, liq: true, sr: true, pdh: true, pd: false, ghost: true,
+  });
+  const announce = useAnnouncer();
+  const net  = useBus("net", { online: navigator.onLine });
+  const skew = useBus("clockskew", null);
+  const toasts = useToasts(7000);
+  const sysEvents = useSystemEvents(toasts.push);
+
+  // Boot wait-wire pattern (same as Phase 0)
+  useEffect(() => {
+    let pollId = null; let busOff = null;
+    const tryWire = () => {
+      const mnp = window.__MNP__;
+      if (!mnp) return false;
+      if (mnp.caps) {
+        setCaps(mnp.caps); setReady(true);
+        mnp.hideSplash?.();
+      } else if (mnp.EventBus) {
+        busOff = mnp.EventBus.once?.("boot:complete", ({ caps }) => {
+          setCaps(caps); setReady(true);
+          window.__MNP__?.hideSplash?.();
+        });
+      } else return false;
+      return true;
+    };
+    if (!tryWire()) pollId = setInterval(() => { if (tryWire()) clearInterval(pollId); }, 50);
+    return () => { if (pollId) clearInterval(pollId); if (typeof busOff === "function") busOff(); };
+  }, []);
+
+  useEffect(() => { if (ready) announce("My Next Prediction cockpit ready"); }, [ready, announce]);
+
+  // ── Live data + engine pipeline
+  const feed = useCandleSeries(symbol, tf, 500);
+  const ta   = useTASnapshot(feed.candles);
+  const orch = useOrchestration(ta);
+  const expected = useExpectedMove(ta, orch);
+  // Ghost anchors AFTER the currently-forming bar when one exists, so the
+  // forecast does not overlap the real-time candle still being drawn.
+  const ghostAnchorCandles = useMemo(() => {
+    if (!feed.candles?.length) return feed.candles;
+    if (!feed.forming || feed.forming.t <= feed.candles[feed.candles.length - 1].t) return feed.candles;
+    return [...feed.candles, feed.forming];
+  }, [feed.candles, feed.forming]);
+  const ghost = useGhostCandles(ta, orch, ghostAnchorCandles, { nBars: 5, alpha: 0.1, symbol, tf });
+  useGhostResolver(symbol, tf, feed.candles);
+
+  // ── Validation signal (Phase 10)
+  const [validation, setValidation] = useState({ accuracy: null, lastDrift: null });
+  useBusEvent("validation:verdict", (e) => {
+    // Derive a crude live accuracy by remembering last 200 direction hits.
+    setValidation(prev => {
+      if (e.verdict?.kind !== "direction" || e.verdict?.abstain) return prev;
+      const hit = e.verdict.hit ? 1 : 0;
+      const rolling = [...(prev._hits || []), hit].slice(-200);
+      const acc = rolling.reduce((a, b) => a + b, 0) / rolling.length;
+      return { ...prev, _hits: rolling, accuracy: { value: acc, n: rolling.length } };
+    });
+  });
+  useBusEvent("drift:shift", (e) => {
+    setValidation(prev => ({ ...prev, lastDrift: e }));
+    announce(`drift detected: ${e.cause}`);
+  });
+
+  if (!ready || !caps) return <div style={{ display: "grid", placeItems: "center", width: "100%", height: "100%", color: "var(--fg-dim)" }}>warming up…</div>;
+
+  return (
+    <div className="app-shell">
+      <TopBar
+        tab={tab} setTab={setTab}
+        symbol={symbol} setSymbol={setSymbol}
+        tf={tf} setTf={setTf}
+        net={net} skew={skew}
+        status={feed.status} exchange={feed.exchange}
+      />
+
+      {tab === "chart" ? (
+        <IndicatorRail
+          indicators={indicators} setIndicators={setIndicators}
+          structure={structure} setStructure={setStructure}
+          subplots={subplots} setSubplots={setSubplots}
+        />
+      ) : (
+        <div style={{ borderBottom: "1px solid var(--border)", background: "var(--bg-elev-1)" }} />
+      )}
+
+      <main className="workspace" role="main">
+        {tab === "chart" && (
+          <>
+            <ChartPane
+              symbol={symbol} tf={tf}
+              candles={feed.candles} forming={feed.forming}
+              ta={ta}
+              indicators={indicators} structure={structure}
+              expected={expected} subplots={subplots}
+              ghost={ghost}
+            />
+            <SignalSidebar orch={orch} expected={expected} ghost={ghost} ta={ta} candles={feed.candles} regime={ta?.regime?.label} symbol={symbol} />
+          </>
+        )}
+        {tab === "scanner" && (
+          <div style={{ gridColumn: "1 / -1", overflow: "auto" }}>
+            <ScannerPane tf={tf} />
+          </div>
+        )}
+        {tab === "chat" && (
+          <>
+            <AIChatPane orch={orch} expected={expected} ta={ta} symbol={symbol} tf={tf} />
+            <SignalSidebar orch={orch} expected={expected} ghost={ghost} ta={ta} candles={feed.candles} regime={ta?.regime?.label} symbol={symbol} />
+          </>
+        )}
+        {tab === "system" && (
+          <div style={{ gridColumn: "1 / -1", overflow: "auto" }}>
+            <SystemPane caps={caps} />
+          </div>
+        )}
+      </main>
+
+      <KpiStrip
+        bootstrapCount={feed.bootstrapCount}
+        gaps={feed.gaps}
+        orch={orch} ta={ta}
+        validation={validation}
+        sysEvents={sysEvents}
+      />
+      <ToastStack toasts={toasts.items} onDismiss={toasts.dismiss} />
+    </div>
+  );
+}
+
+/* ╔══════════════════════════════════════════════════════════════════╗
+   ║  Mount                                                           ║
+   ╚══════════════════════════════════════════════════════════════════╝ */
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(
+  <ErrorBoundary>
+    <App />
+  </ErrorBoundary>
+);

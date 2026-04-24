@@ -1,0 +1,669 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>MNP · Phase 10 — Auto-validation + drift monitor (unit tests)</title>
+<style>
+  body { background:#131722; color:#d1d4dc; font:13px/1.5 monospace; padding:20px; }
+  .pass { color:#26a69a; }
+  .fail { color:#ef5350; }
+  .group { margin-top: 12px; font-weight:bold; color:#2962ff; }
+  h1 { color:#fff; font-size:18px; }
+  #out { white-space: pre-wrap; }
+  .note { color:#787b86; }
+  .summary { margin-top: 16px; padding: 8px; border:1px solid #2a2e39; }
+</style>
+</head>
+<body>
+<h1>MNP — Phase 10 · Auto-validation + drift monitor</h1>
+<div id="out">running…</div>
+
+<script type="module">
+const out = document.getElementById("out");
+window.addEventListener("error", (e) => {
+  out.innerHTML += `<span class="fail">✗ ${e.message}</span>\n<span class="note">${e.filename}:${e.lineno}:${e.colno}</span>\n`;
+});
+window.addEventListener("unhandledrejection", (e) => {
+  out.innerHTML += `<span class="fail">✗ unhandled: ${e.reason?.message || e.reason}</span>\n<span class="note">${e.reason?.stack || ''}</span>\n`;
+});
+
+const V = "p10-" + Date.now();
+function findBase() {
+  for (const u of [window.location?.href, document.baseURI, import.meta.url]) {
+    if (u && !u.startsWith("data:") && !u.startsWith("blob:")) return u;
+  }
+  return window.location?.href || "file:///";
+}
+const BASE = findBase();
+const IS_FILE = BASE.startsWith("file:");
+const U = (p) => {
+  const url = new URL(p, BASE).href;
+  return IS_FILE ? url : `${url}?v=${V}`;
+};
+
+let Validator, Drift, Monitor, Store, IDB, Schema;
+try {
+  [Validator, Drift, Monitor, Store, IDB, Schema] = await Promise.all([
+    import(U("../src/validation/validator.js")),
+    import(U("../src/validation/drift.js")),
+    import(U("../src/validation/monitor.js")),
+    import(U("../src/validation/predictionStore.js")),
+    import(U("../src/data/idb.js")),
+    import(U("../src/data/schema.js")),
+  ]);
+} catch (err) {
+  out.innerHTML = `<span class="fail">✗ import failed: ${err.message}</span>\n<span class="note">${err.stack || ''}</span>`;
+  throw err;
+}
+out.textContent = "";
+
+let n = 0, p = 0;
+const log = (s, ok, err) => {
+  out.innerHTML += `<span class="${ok?'pass':'fail'}">${ok?'✓':'✗'} ${s}${err ? ' — ' + err : ''}</span>\n`;
+  n++; if (ok) p++;
+};
+const group = (s) => { out.innerHTML += `\n<span class="group">[${s}]</span>\n`; };
+const close = (a, b, eps=1e-9) => Math.abs(a - b) <= eps;
+
+/* ─────────────────────────────────────── deterministic PRNG ─────────────────────────────────────── */
+function mulberry32(seed) {
+  let t = seed >>> 0;
+  return function() {
+    t = (t + 0x6D2B79F5) >>> 0;
+    let r = Math.imul(t ^ (t >>> 15), 1 | t);
+    r = (r + Math.imul(r ^ (r >>> 7), 61 | r)) ^ r;
+    return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function boxMuller(rng) {
+  let u = 0, v = 0;
+  while (u === 0) u = rng();
+  while (v === 0) v = rng();
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+}
+
+/* ════════════════════════════════════ validator — tf utilities ════════════════════════════════════ */
+group("validator · timeframe utilities");
+{
+  log("TF_MS.1m === 60000", Validator.TF_MS["1m"] === 60_000);
+  log("TF_MS.1h === 3600000", Validator.TF_MS["1h"] === 3_600_000);
+  log("TF_MS.1d === 86400000", Validator.TF_MS["1d"] === 86_400_000);
+  log("tfMs('1h') === 3600000", Validator.tfMs("1h") === 3_600_000);
+  log("tfMs('bogus') is NaN", Number.isNaN(Validator.tfMs("bogus")));
+  log("nextCandleOpen(0, '1h') === 3600000", Validator.nextCandleOpen(0, "1h") === 3_600_000);
+  log("nextCandleOpen(0, 'bogus') is NaN", Number.isNaN(Validator.nextCandleOpen(0, "bogus")));
+  log("nextCloseAt(0, '1h') === 7204000", Validator.nextCloseAt(0, "1h") === 7_204_000);
+  log("nextCloseAt respects graceMs override",
+      Validator.nextCloseAt(0, "1h", 1000) === 7_201_000);
+  log("msUntilNextClose clamps to 0 for past",
+      Validator.msUntilNextClose(0, "1h", { now: 9_999_999, graceMs: 0 }) === 0);
+  log("msUntilNextClose > 0 for future",
+      Validator.msUntilNextClose(1_000_000, "1h", { now: 1_000_000, graceMs: 0 }) === 7_200_000);
+  log("msUntilNextClose NaN for bogus tf",
+      Number.isNaN(Validator.msUntilNextClose(0, "bogus")));
+}
+
+/* ════════════════════════════════════ validator — realized metrics ════════════════════════════════════ */
+group("validator · realized direction & return");
+{
+  const up   = { o: 100, h: 105, l: 99, c: 103, v: 1 };
+  const dn   = { o: 100, h: 101, l: 95, c: 97, v: 1 };
+  const flat = { o: 100, h: 100, l: 100, c: 100, v: 1 };
+  log("realizedDirection up", Validator.realizedDirection(up) === "up");
+  log("realizedDirection down", Validator.realizedDirection(dn) === "down");
+  log("realizedDirection flat", Validator.realizedDirection(flat) === "flat");
+  const tiny = { o: 100, h: 100.05, l: 99.95, c: 100.01, v: 1 };
+  log("realizedDirection band=0 sees tiny as up", Validator.realizedDirection(tiny, 0) === "up");
+  log("realizedDirection band=0.001 sees tiny as flat", Validator.realizedDirection(tiny, 0.001) === "flat");
+
+  log("realizedReturn vs open", close(Validator.realizedReturn(up), 0.03));
+  log("realizedReturn vs refPrice", close(Validator.realizedReturn(up, 100), 0.03));
+  log("realizedReturn vs refPrice=50 is 1.06",
+      close(Validator.realizedReturn({ o: 100, c: 103 }, 50), (103 - 50) / 50));
+  log("realizedReturn NaN on bad ref", Number.isNaN(Validator.realizedReturn(up, 0)));
+}
+
+/* ════════════════════════════════════ validator — verdictFor ════════════════════════════════════ */
+group("validator · verdictFor — direction");
+{
+  const cUp   = { o: 100, c: 103 };
+  const pUp   = { kind: "direction", payload: { dir: "up", prob: 0.7 }, t: 0, tf: "1h", symbol: "BTCUSDT" };
+  const pDn   = { kind: "direction", payload: { dir: "down", prob: 0.8 }, t: 0, tf: "1h", symbol: "BTCUSDT" };
+  const pFlat = { kind: "direction", payload: { dir: "flat" }, t: 0, tf: "1h", symbol: "BTCUSDT" };
+  const vU  = Validator.verdictFor(pUp, cUp);
+  const vD  = Validator.verdictFor(pDn, cUp);
+  const vF  = Validator.verdictFor(pFlat, cUp);
+  log("pred up + real up → hit", vU.ok && vU.hit === true && vU.realizedDir === "up");
+  log("pred up prob=0.7, realized match → brier=0.09",
+      close(vU.brier, (0.7 - 1) * (0.7 - 1)));
+  log("pred down + real up → miss", vD.ok && vD.hit === false && vD.realizedDir === "up");
+  log("pred down prob=0.8 → brier=0.64 (miss)", close(vD.brier, 0.64));
+  log("pred flat is abstain (no hit/no miss)", vF.ok && vF.abstain === true && vF.hit === false);
+
+  const bad = Validator.verdictFor({ kind: "direction", payload: { dir: "left" } }, cUp);
+  log("invalid dir → ok:false", bad.ok === false && /invalid/.test(bad.error));
+}
+
+group("validator · verdictFor — return");
+{
+  const c = { o: 100, c: 103 };
+  const p = { kind: "return", payload: { yhat: 0.02, sigma: 0.01 }, t: 0, tf: "1h", symbol: "BTCUSDT" };
+  const v = Validator.verdictFor(p, c);
+  log("return verdict ok", v.ok);
+  log("realized === 0.03", close(v.realized, 0.03));
+  log("residual === 0.01", close(v.residual, 0.01, 1e-12));
+  log("absError === 0.01", close(v.absError, 0.01, 1e-12));
+  log("zScore === 1.0", close(v.zScore, 1.0, 1e-9));
+  const bad = Validator.verdictFor({ kind: "return", payload: { yhat: "no" } }, c);
+  log("bad yhat → ok:false", bad.ok === false);
+}
+
+group("validator · verdictFor — interval");
+{
+  const c = { o: 100, c: 103 };
+  const p1 = { kind: "interval", payload: { lo: 0.01, hi: 0.04 }, t: 0, tf: "1h", symbol: "BTCUSDT" };
+  const v1 = Validator.verdictFor(p1, c);
+  log("interval covers 0.03", v1.ok && v1.covered === true);
+  log("width === 0.03", close(v1.width, 0.03, 1e-12));
+  const p2 = { kind: "interval", payload: { lo: -0.02, hi: 0.01 }, t: 0, tf: "1h", symbol: "BTCUSDT" };
+  const v2 = Validator.verdictFor(p2, c);
+  log("interval does NOT cover 0.03", v2.ok && v2.covered === false);
+  const p3 = { kind: "interval", payload: { lo: 0.05, hi: 0.04 }, t: 0, tf: "1h", symbol: "BTCUSDT" };
+  const v3 = Validator.verdictFor(p3, c);
+  log("lo>hi → ok:false", v3.ok === false);
+}
+
+group("validator · verdictFor — set");
+{
+  const c = { o: 100, c: 103 };
+  const p1 = { kind: "set", payload: { classes: ["long"], direction: "long" }, t: 0, tf: "1h", symbol: "BTCUSDT" };
+  const v1 = Validator.verdictFor(p1, c);
+  log("set {long} covers real up", v1.ok && v1.covered === true);
+  const p2 = { kind: "set", payload: { classes: ["short"], direction: "short" }, t: 0, tf: "1h", symbol: "BTCUSDT" };
+  const v2 = Validator.verdictFor(p2, c);
+  log("set {short} misses real up", v2.ok && v2.covered === false);
+  const p3 = { kind: "set", payload: { classes: [], direction: "abstain" }, t: 0, tf: "1h", symbol: "BTCUSDT" };
+  const v3 = Validator.verdictFor(p3, c);
+  log("empty set is abstain", v3.ok && v3.abstain === true && v3.covered === false);
+  const p4 = { kind: "set", payload: { classes: ["long", "short"], direction: "uncertain" }, t: 0, tf: "1h", symbol: "BTCUSDT" };
+  const v4 = Validator.verdictFor(p4, c);
+  log("full set always covers", v4.ok && v4.covered === true && v4.setSize === 2);
+}
+
+group("validator · validateBatch + summarizeVerdicts");
+{
+  const tf = "1h";
+  const lookup = (sym, tf, t) => {
+    // Synthetic map: next-open t=3600000 → up, t=7200000 → down
+    if (t === 3_600_000) return { o: 100, c: 105 };
+    if (t === 7_200_000) return { o: 100, c: 95 };
+    return null;
+  };
+  const preds = [
+    { symbol: "X", tf, t: 0,           kind: "direction", payload: { dir: "up",   prob: 0.8 } },
+    { symbol: "X", tf, t: 3_600_000,   kind: "direction", payload: { dir: "up",   prob: 0.5 } },
+    { symbol: "X", tf, t: 10_000_000,  kind: "direction", payload: { dir: "up" } }, // no candle → missing
+  ];
+  const res = Validator.validateBatch(preds, lookup);
+  log("batch returns 3 entries", res.length === 3);
+  log("entry 0 present + hit", res[0].verdict?.ok === true && res[0].verdict.hit === true);
+  log("entry 1 present + miss", res[1].verdict?.ok === true && res[1].verdict.hit === false);
+  log("entry 2 missing flag", res[2].missing === true && res[2].verdict === null);
+
+  const verdicts = res.filter(r => r.verdict?.ok).map(r => r.verdict);
+  const sum = Validator.summarizeVerdicts(verdicts);
+  log("summary.n === 2", sum.n === 2);
+  log("summary.directional.n === 2", sum.directional.n === 2);
+  log("summary.directional.hits === 1", sum.directional.hits === 1);
+  log("summary.directional.accuracy === 0.5", close(sum.directional.accuracy, 0.5, 1e-12));
+  log("summary.brier.n === 2", sum.brier.n === 2);
+  log("summary.brier.mean ~ (0.04+0.25)/2", close(sum.brier.mean, (0.04 + 0.25) / 2, 1e-12));
+}
+
+/* ════════════════════════════════════ drift — PSI ════════════════════════════════════ */
+group("drift · PSI basics");
+{
+  const rng = mulberry32(1);
+  const base = []; for (let i = 0; i < 500; i++) base.push(boxMuller(rng));
+  const live = []; for (let i = 0; i < 500; i++) live.push(boxMuller(rng));
+  const { psi } = Drift.psi(base, live, 10);
+  log("PSI same distribution < 0.10", psi < 0.10);
+  log("levelFromPSI stable", Drift.levelFromPSI(psi) === "stable");
+
+  const shifted = []; for (let i = 0; i < 500; i++) shifted.push(boxMuller(rng) + 1.5);
+  const { psi: v2 } = Drift.psi(base, shifted, 10);
+  log("PSI shifted distribution > 0.25", v2 > 0.25);
+  log("levelFromPSI major", Drift.levelFromPSI(v2) === "major");
+
+  const { psi: nan } = Drift.psi([], [], 10);
+  log("PSI empty is NaN", Number.isNaN(nan));
+  log("levelFromPSI NaN → unknown", Drift.levelFromPSI(NaN) === "unknown");
+  log("levelFromPSI 0.05 → stable", Drift.levelFromPSI(0.05) === "stable");
+  log("levelFromPSI 0.15 → shift", Drift.levelFromPSI(0.15) === "shift");
+  log("levelFromPSI 0.5 → major", Drift.levelFromPSI(0.5) === "major");
+}
+
+/* ════════════════════════════════════ drift — KS ════════════════════════════════════ */
+group("drift · KS two-sample");
+{
+  const rng = mulberry32(7);
+  const a = []; for (let i = 0; i < 300; i++) a.push(boxMuller(rng));
+  const b = []; for (let i = 0; i < 300; i++) b.push(boxMuller(rng));
+  const { d, p } = Drift.ksTwoSample(a, b);
+  log("KS same dist D small (<0.2)", d < 0.20);
+  log("KS same dist p > 0.05", p > 0.05);
+  const c = []; for (let i = 0; i < 300; i++) c.push(boxMuller(rng) + 2);
+  const { d: d2, p: p2 } = Drift.ksTwoSample(a, c);
+  log("KS shifted D large (>0.5)", d2 > 0.5);
+  log("KS shifted p near 0", p2 < 0.01);
+  const { d: nd } = Drift.ksTwoSample([], [1, 2]);
+  log("KS empty → NaN D", Number.isNaN(nd));
+}
+
+/* ════════════════════════════════════ drift — RollingAccuracy ════════════════════════════════════ */
+group("drift · RollingAccuracy");
+{
+  const r = new Drift.RollingAccuracy({ capacity: 100 });
+  for (let i = 0; i < 100; i++) r.push(i % 2);
+  log("n=100", r.length === 100);
+  log("accuracy ~ 0.5", close(r.accuracy(), 0.5, 1e-12));
+  const { lo, hi } = r.wilson95();
+  log("Wilson lo < 0.5", lo < 0.5);
+  log("Wilson hi > 0.5", hi > 0.5);
+  log("Wilson hi-lo narrow (n=100)", (hi - lo) < 0.30);
+
+  const r2 = new Drift.RollingAccuracy({ capacity: 3 });
+  r2.push(1); r2.push(1); r2.push(1); r2.push(0); // evicts first 1
+  log("FIFO eviction: ones=2", r2.ones === 2);
+  log("FIFO accuracy 2/3", close(r2.accuracy(), 2/3, 1e-12));
+
+  const ser = r.serialize();
+  const r3  = Drift.RollingAccuracy.deserialize(ser);
+  log("RollingAccuracy roundtrip accuracy", close(r.accuracy(), r3.accuracy(), 1e-12));
+  log("RollingAccuracy roundtrip length", r.length === r3.length);
+
+  r.clear();
+  log("clear → length 0", r.length === 0);
+  log("clear → accuracy NaN", Number.isNaN(r.accuracy()));
+}
+
+/* ════════════════════════════════════ drift — ResidualWindow ════════════════════════════════════ */
+group("drift · ResidualWindow");
+{
+  const w = new Drift.ResidualWindow({ capacity: 50 });
+  for (let i = 1; i <= 50; i++) w.push(i);
+  log("n=50", w.length === 50);
+  log("mean 25.5", close(w.mean(), 25.5, 1e-12));
+  log("std === sqrt(212.5)", close(w.std(), Math.sqrt(212.5), 1e-12));
+  // Verify FIFO behavior: push more, oldest drops
+  for (let i = 51; i <= 60; i++) w.push(i);
+  log("after overflow length still 50", w.length === 50);
+  log("after overflow mean === 35.5", close(w.mean(), 35.5, 1e-12));
+
+  const ser = w.serialize();
+  const w2  = Drift.ResidualWindow.deserialize(ser);
+  log("ResidualWindow roundtrip mean", close(w.mean(), w2.mean(), 1e-12));
+  log("ResidualWindow roundtrip length", w.length === w2.length);
+  // Also verify that RMSE of a known sequence matches √(E[x²]).
+  const w3 = new Drift.ResidualWindow({ capacity: 3 });
+  w3.push(3); w3.push(4); w3.push(0);
+  log("RMSE(3,4,0) === √(25/3)", close(w3.rmse(), Math.sqrt((9 + 16 + 0) / 3), 1e-12));
+}
+
+/* ════════════════════════════════════ drift — ADWINLite ════════════════════════════════════ */
+group("drift · ADWINLite");
+{
+  const rng = mulberry32(42);
+  const d = new Drift.ADWINLite({ delta: 0.002, minSplit: 16 });
+  let trip = false;
+  for (let i = 0; i < 100; i++) if (d.push(rng() < 0.20 ? 1 : 0)) trip = true;
+  log("no drift on steady 20% accuracy stream", trip === false);
+  for (let i = 0; i < 100; i++) if (d.push(rng() < 0.80 ? 1 : 0)) trip = true;
+  log("drift detected after regime shift", trip === true);
+  log("detectionCount > 0", d.detectionCount > 0);
+  log("lastDrift.mean1 > lastDrift.mean0 (upshift)",
+      d.lastDrift && d.lastDrift.mean1 > d.lastDrift.mean0);
+
+  const ser = d.serialize();
+  const d2 = Drift.ADWINLite.deserialize(ser);
+  log("ADWINLite roundtrip size", d.size() === d2.size());
+  log("ADWINLite roundtrip detectionCount", d.detectionCount === d2.detectionCount);
+
+  const dBounded = new Drift.ADWINLite({ maxSize: 64 });
+  for (let i = 0; i < 200; i++) dBounded.push(rng());
+  log("maxSize respected", dBounded.size() <= 64);
+
+  dBounded.clear();
+  log("clear → size 0", dBounded.size() === 0);
+  log("clear → detectionCount 0", dBounded.detectionCount === 0);
+}
+
+/* ════════════════════════════════════ drift — PageHinkley ════════════════════════════════════ */
+group("drift · PageHinkley");
+{
+  const rng = mulberry32(99);
+  const ph = new Drift.PageHinkley({ delta: 0.005, threshold: 0.5, direction: "up" });
+  let trip = false;
+  for (let i = 0; i < 100; i++) if (ph.push(0.02 + 0.01 * rng())) trip = true;
+  log("no drift on steady small residuals", trip === false);
+  for (let i = 0; i < 100; i++) if (ph.push(2 + 0.5 * rng())) trip = true;
+  log("drift detected when residuals jump to ~2", trip === true);
+  log("lastDrift.direction === 'up'", ph.lastDrift && ph.lastDrift.direction === "up");
+
+  const ser = ph.serialize();
+  const ph2 = Drift.PageHinkley.deserialize(ser);
+  log("PageHinkley roundtrip detectionCount", ph.detectionCount === ph2.detectionCount);
+  log("PageHinkley roundtrip direction", ph.direction === ph2.direction);
+}
+
+/* ════════════════════════════════════ schema — stores exist ════════════════════════════════════ */
+group("schema · predictions + validations stores exist");
+{
+  log("STORES.predictions exists", typeof Schema.STORES.predictions === "object");
+  log("predictions keyPath 'id'", Schema.STORES.predictions.keyPath === "id");
+  log("predictions autoIncrement true", Schema.STORES.predictions.autoIncrement === true);
+  const pNames = (Schema.STORES.predictions.indexes || []).map(i => i.name);
+  log("predictions has by_symbol_tf_t", pNames.includes("by_symbol_tf_t"));
+  log("predictions has by_validated", pNames.includes("by_validated"));
+
+  log("STORES.validations exists", typeof Schema.STORES.validations === "object");
+  log("validations keyPath 'id'", Schema.STORES.validations.keyPath === "id");
+  const vNames = (Schema.STORES.validations.indexes || []).map(i => i.name);
+  log("validations has by_symbol_tf_t", vNames.includes("by_symbol_tf_t"));
+  log("DB_VERSION >= 3", Schema.DB_VERSION >= 3);
+}
+
+/* ════════════════════════════════════ predictionStore round-trip ════════════════════════════════════ */
+group("predictionStore · round-trip");
+{
+  try {
+    await Store.clearAll();
+    const id1 = await Store.savePrediction({
+      symbol: "BTCUSDT", tf: "1h", t: 1_000_000, closeAt: 1_003_604_000,
+      kind: "direction", payload: { dir: "up", prob: 0.7 },
+      version: "phase10-test", regime: "trendUp",
+    });
+    log("savePrediction returns numeric id", typeof id1 === "number" && id1 > 0);
+    const loaded = await Store.loadPrediction(id1);
+    log("loadPrediction returns matching row",
+        loaded && loaded.symbol === "BTCUSDT" && loaded.tf === "1h" && loaded.kind === "direction");
+    log("loaded.validated === 0", loaded.validated === 0);
+    log("loaded.payload.dir === up", loaded.payload.dir === "up");
+
+    const count1 = await Store.countPredictions();
+    log("countPredictions === 1", count1 === 1);
+
+    // Due predictions: if closeAt <= now
+    const due1 = await Store.duePredictions({ now: 2_000_000_000 });
+    log("duePredictions picks up overdue row", due1.length === 1 && due1[0].id === id1);
+
+    const due2 = await Store.duePredictions({ now: 0 });
+    log("duePredictions skips future row", due2.length === 0);
+
+    // markValidated
+    const verdict = { ok: true, kind: "direction", hit: true, realizedDir: "up" };
+    await Store.markValidated(id1, verdict);
+    const loaded2 = await Store.loadPrediction(id1);
+    log("markValidated sets validated=1", loaded2.validated === 1);
+    log("markValidated sets verdict", loaded2.verdict?.hit === true);
+
+    const due3 = await Store.duePredictions({ now: 2_000_000_000 });
+    log("validated rows excluded from due", due3.length === 0);
+
+    // listPredictions filters
+    await Store.savePrediction({
+      symbol: "ETHUSDT", tf: "15m", t: 0, closeAt: 1_000,
+      kind: "return", payload: { yhat: 0.01 },
+    });
+    const btc = await Store.listPredictions({ symbol: "BTCUSDT" });
+    log("listPredictions filter symbol", btc.length === 1);
+    const validated = await Store.listPredictions({ validated: true });
+    log("listPredictions filter validated", validated.length === 1 && validated[0].id === id1);
+
+    // validations store
+    const vid = await Store.saveValidation({
+      predictionId: id1,
+      symbol: "BTCUSDT", tf: "1h", t: 1_000_000,
+      kind: "direction", verdict,
+    });
+    log("saveValidation returns id", typeof vid === "number" && vid > 0);
+    log("countValidations === 1", (await Store.countValidations()) === 1);
+    const recent = await Store.recentValidations({ symbol: "BTCUSDT", tf: "1h" });
+    log("recentValidations returns row", recent.length === 1 && recent[0].id === vid);
+
+    await Store.clearAll();
+    log("clearAll wipes stores",
+        (await Store.countPredictions()) === 0 && (await Store.countValidations()) === 0);
+  } catch (err) {
+    log("predictionStore round-trip threw", false, err.message);
+  }
+}
+
+/* ════════════════════════════════════ predictionStore · input validation ════════════════════════════════════ */
+group("predictionStore · input validation");
+{
+  let err;
+  try { await Store.savePrediction({ symbol: "X", tf: "1h", t: 0, closeAt: 1000, kind: "direction" }); }
+  catch (e) { err = e; }
+  log("savePrediction without payload throws", err && /payload/.test(err.message));
+
+  err = null;
+  try { await Store.savePrediction({ symbol: "X", tf: "1h", t: 0, closeAt: 1000, kind: "nope", payload: {} }); }
+  catch (e) { err = e; }
+  log("savePrediction with bogus kind throws", err && /kind/.test(err.message));
+
+  err = null;
+  try { await Store.saveValidation({ symbol: "X", tf: "1h" }); }
+  catch (e) { err = e; }
+  log("saveValidation without predictionId throws", err && /predictionId/.test(err.message));
+}
+
+/* ════════════════════════════════════ ValidationMonitor — submit + tick ════════════════════════════════════ */
+group("ValidationMonitor · submit + tick (in-memory store fake)");
+{
+  // We inject a fake store to keep this unit test IDB-independent and fast.
+  // Shape: mirror the methods ValidationMonitor touches.
+  const fakeStore = (() => {
+    const rows = new Map();
+    let nextId = 1;
+    const vrows = new Map();
+    let nextVId = 1;
+    return {
+      async savePrediction(row) {
+        if (row.id == null) row.id = nextId++;
+        rows.set(row.id, { ...row, validated: row.validated ? 1 : 0 });
+        return row.id;
+      },
+      async loadPrediction(id) { return rows.get(id) || null; },
+      async duePredictions({ now = Date.now(), symbol, tf } = {}) {
+        const out = [];
+        for (const r of rows.values()) {
+          if (r.validated) continue;
+          if (symbol && r.symbol !== symbol) continue;
+          if (tf && r.tf !== tf) continue;
+          if (Number.isFinite(r.closeAt) && r.closeAt <= now) out.push(r);
+        }
+        return out;
+      },
+      async markValidated(id, verdict) {
+        const r = rows.get(id); if (!r) return null;
+        r.validated = 1; r.verdict = verdict; rows.set(id, r); return r;
+      },
+      async saveValidation(row) {
+        if (row.id == null) row.id = nextVId++;
+        vrows.set(row.id, row); return row.id;
+      },
+      async clearAll() { rows.clear(); vrows.clear(); nextId = 1; nextVId = 1; },
+      _rows: rows,
+      _vrows: vrows,
+    };
+  })();
+
+  // Minimal bus that records emissions.
+  const bus = (() => {
+    const log = [];
+    const subs = new Map();
+    return {
+      emit(t, d) { log.push([t, d]); subs.get(t)?.forEach(fn => fn(d)); },
+      on(t, fn) { if (!subs.has(t)) subs.set(t, new Set()); subs.get(t).add(fn); return () => subs.get(t).delete(fn); },
+      _log: log,
+    };
+  })();
+
+  // Candle lookup: provide candles at specific next-candle opens
+  const candles = {
+    "BTCUSDT|1h|3600000": { o: 100, c: 110, t: 3_600_000 },
+    "BTCUSDT|1h|7200000": { o: 110, c: 100, t: 7_200_000 },
+  };
+  const lookup = (sym, tf, t) => candles[`${sym}|${tf}|${t}`] ?? null;
+
+  const mon = new Monitor.ValidationMonitor({ store: fakeStore, bus, candleLookup: lookup });
+  log("ValidationMonitor constructs", mon instanceof Monitor.ValidationMonitor);
+  mon.start();
+
+  try {
+    const id1 = await mon.submit(
+      { symbol: "BTCUSDT", tf: "1h", kind: "direction", payload: { dir: "up", prob: 0.8 } },
+      { refCandle: { t: 0 } },
+    );
+    log("submit returns id", typeof id1 === "number");
+    log("submit emits prediction:submitted",
+        bus._log.some(([t]) => t === "prediction:submitted"));
+
+    // closeAt should be nextOpen + tfMs + graceMs = 0 + 3600000 + 3600000 + 4000 = 7204000
+    const stored = await fakeStore.loadPrediction(id1);
+    log("submitted row has correct closeAt", stored.closeAt === 7_204_000);
+
+    // tick at closeAt+1 → should validate
+    const res = await mon.tick({ now: 7_205_000 });
+    log("tick validates 1 prediction", res.validated === 1);
+    log("tick found 0 missing", res.missing === 0);
+    log("tick recorded 0 errors", res.errors === 0);
+    const verdictEmit = bus._log.find(([t]) => t === "validation:verdict");
+    log("tick emits validation:verdict", !!verdictEmit);
+    log("verdict.hit === true (up pred, up candle)",
+        verdictEmit && verdictEmit[1].verdict.hit === true);
+
+    // idempotency: re-tick does nothing
+    const res2 = await mon.tick({ now: 7_205_000 });
+    log("re-tick validates 0 (idempotent)", res2.validated === 0);
+
+    // Submit a returning prediction that will fail coverage/metric
+    const id2 = await mon.submit(
+      { symbol: "BTCUSDT", tf: "1h", kind: "return", payload: { yhat: 0.05, refPrice: 110 } },
+      { refCandle: { t: 3_600_000 } },
+    );
+    // closeAt = 3_600_000 + 3_600_000 + 3_600_000 + 4000 = 10_804_000
+    // Candle at nextOpen 7_200_000 exists → realized = (100-110)/110 ≈ -0.0909
+    const res3 = await mon.tick({ now: 10_805_000 });
+    log("return prediction validated", res3.validated === 1);
+    const retEmit = bus._log.filter(([t]) => t === "validation:verdict").at(-1);
+    log("return verdict.ok", retEmit && retEmit[1].verdict.ok === true);
+    log("return realized ≈ -0.0909", retEmit && close(retEmit[1].verdict.realized, (100 - 110) / 110, 1e-6));
+
+    // Missing-candle case
+    const id3 = await mon.submit(
+      { symbol: "ETHUSDT", tf: "1h", kind: "direction", payload: { dir: "up" } },
+      { refCandle: { t: 3_600_000 } },
+    );
+    const res4 = await mon.tick({ now: 10_805_000 });
+    log("missing candle reported", res4.missing === 1 && res4.validated === 0);
+
+    log("monitor.stats.submitted === 3", mon.stats.submitted === 3);
+    log("monitor.stats.validated === 2", mon.stats.validated === 2);
+    log("monitor.stats.missing === 1", mon.stats.missing === 1);
+  } catch (err) {
+    log("monitor submit+tick threw", false, err.message);
+  }
+
+  mon.stop();
+}
+
+/* ════════════════════════════════════ ValidationMonitor — drift emission ════════════════════════════════════ */
+group("ValidationMonitor · drift emission (ADWIN on synthetic shift)");
+{
+  // Lightweight fake store again (re-use same pattern)
+  const fakeStore = (() => {
+    const rows = new Map();
+    let nextId = 1;
+    return {
+      async savePrediction(row) { if (row.id == null) row.id = nextId++; rows.set(row.id, row); return row.id; },
+      async loadPrediction(id) { return rows.get(id) || null; },
+      async duePredictions() { return Array.from(rows.values()).filter(r => !r.validated); },
+      async markValidated(id, verdict) { const r = rows.get(id); if (r) { r.validated = 1; r.verdict = verdict; } return r; },
+      async saveValidation() { return 1; },
+    };
+  })();
+  const emissions = [];
+  const bus = { emit(t, d) { emissions.push([t, d]); }, on() { return () => {}; } };
+
+  const mon = new Monitor.ValidationMonitor({
+    store: fakeStore, bus, candleLookup: () => null,
+    adwinDelta: 0.1,   // very aggressive for the test
+  });
+
+  // Inject verdicts directly through _updateDrift (bypasses IDB round-trip).
+  // Phase 1: 80 miss-verdicts
+  for (let i = 0; i < 80; i++) {
+    mon._updateDrift(
+      { symbol: "X", tf: "1h", kind: "direction" },
+      { ok: true, kind: "direction", hit: false, abstain: false },
+    );
+  }
+  log("no drift yet on steady misses", !emissions.some(([t]) => t === "drift:shift"));
+  // Phase 2: 80 hit-verdicts → should trip ADWIN on accuracy
+  let tripped = false;
+  for (let i = 0; i < 80; i++) {
+    const e = mon._updateDrift(
+      { symbol: "X", tf: "1h", kind: "direction" },
+      { ok: true, kind: "direction", hit: true, abstain: false },
+    );
+    if (e) tripped = true;
+  }
+  log("ADWIN trips after regime shift", tripped === true);
+  log("drift:shift emitted",
+      emissions.some(([t, d]) => t === "drift:shift" && d.cause === "accuracy-adwin"));
+  const k = mon.kpis("X", "1h", "direction");
+  log("kpis.accuracy.value finite", Number.isFinite(k.accuracy.value));
+  log("kpis.adwinAcc.detections > 0", k.adwinAcc.detections > 0);
+}
+
+/* ════════════════════════════════════ ValidationMonitor · construction guards ════════════════════════════════════ */
+group("ValidationMonitor · construction guards");
+{
+  let err;
+  try { new Monitor.ValidationMonitor({ candleLookup: () => null }); }
+  catch (e) { err = e; }
+  log("no bus → throws", err && /bus/.test(err.message));
+
+  err = null;
+  try { new Monitor.ValidationMonitor({ bus: { emit() {}, on() {} } }); }
+  catch (e) { err = e; }
+  log("no candleLookup → throws", err && /candleLookup/.test(err.message));
+
+  err = null;
+  try { Monitor.createDefaultMonitor({ candleLookup: () => null }); }
+  catch (e) { err = e; }
+  log("createDefaultMonitor without bus → throws", err && /bus/.test(err.message));
+}
+
+/* ════════════════════════════════════ ValidationMonitor · submit(unknown tf) ════════════════════════════════════ */
+group("ValidationMonitor · submit rejects unknown tf");
+{
+  const mon = new Monitor.ValidationMonitor({
+    store: { async savePrediction() { return 1; } },
+    bus: { emit() {} },
+    candleLookup: () => null,
+  });
+  let err;
+  try { await mon.submit({ symbol: "X", tf: "bogus", kind: "direction", payload: { dir: "up" } }, { refCandle: { t: 0 } }); }
+  catch (e) { err = e; }
+  log("submit throws on bogus tf", err && /unknown tf/.test(err.message));
+}
+
+/* ════════════════════════════════════ summary ════════════════════════════════════ */
+out.innerHTML += `\n<div class="summary ${p===n?'pass':'fail'}">Ran ${n} tests — ${p} passed, ${n-p} failed.</div>`;
+document.title = `MNP p10 ${p}/${n}`;
+</script>
+</body>
+</html>

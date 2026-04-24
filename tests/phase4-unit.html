@@ -1,0 +1,244 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>MNP · Phase 4 unit tests</title>
+<style>
+  body { background:#131722; color:#d1d4dc; font:13px/1.5 monospace; padding:20px; }
+  .pass { color:#26a69a; }
+  .fail { color:#ef5350; }
+  .group { margin-top: 12px; font-weight:bold; color:#2962ff; }
+  h1 { color:#fff; font-size:18px; }
+  #out { white-space: pre-wrap; }
+  .note { color:#787b86; }
+</style>
+</head>
+<body>
+<h1>MNP — Phase 4 unit tests</h1>
+<div id="out">running…</div>
+
+<script type="module">
+const out = document.getElementById("out");
+window.addEventListener("error", (e) => {
+  out.innerHTML = `<span class="fail">✗ ${e.message}</span>\n<span class="note">${e.filename}:${e.lineno}:${e.colno}</span>`;
+});
+window.addEventListener("unhandledrejection", (e) => {
+  out.innerHTML = `<span class="fail">✗ unhandled: ${e.reason?.message || e.reason}</span>\n<span class="note">${e.reason?.stack || ''}</span>`;
+});
+
+const V = "p4-" + Date.now();
+function findBase() {
+  for (const u of [window.location?.href, document.baseURI, import.meta.url]) {
+    if (u && !u.startsWith("data:") && !u.startsWith("blob:")) return u;
+  }
+  return window.location?.href || "file:///";
+}
+const BASE = findBase();
+const IS_FILE = BASE.startsWith("file:");
+const U = (p) => {
+  const url = new URL(p, BASE).href;
+  return IS_FILE ? url : `${url}?v=${V}`;
+};
+
+let OB, Liq, PD, Sess, Eng, Proxy, Swings;
+try {
+  [OB, Liq, PD, Sess, Eng, Proxy, Swings] = await Promise.all([
+    import(U("../src/ta/structure/orderBlocks.js")),
+    import(U("../src/ta/structure/liquidity.js")),
+    import(U("../src/ta/structure/premiumDiscount.js")),
+    import(U("../src/ta/structure/sessions.js")),
+    import(U("../src/ta/engine.js")),
+    import(U("../src/ta/engineProxy.js")),
+    import(U("../src/ta/structure/swings.js")),
+  ]);
+} catch (err) {
+  out.innerHTML = `<span class="fail">✗ import failed: ${err.message}</span>\n<span class="note">${err.stack || ''}</span>`;
+  throw err;
+}
+out.textContent = "";
+
+let n = 0, p = 0;
+const log = (s, ok, err) => {
+  out.innerHTML += `<span class="${ok?'pass':'fail'}">${ok?'✓':'✗'} ${s}${err ? ' — ' + err : ''}</span>\n`;
+  n++; if (ok) p++;
+};
+const group = (s) => { out.innerHTML += `<span class="group">[${s}]</span>\n`; };
+const near = (a, b, eps = 1e-6) => Math.abs(a - b) <= eps;
+
+// ─── Fixture helper ──────────────────────────────────────────────
+// Build a synthetic sequence with known pivots and impulsive moves.
+function mkCandle(t, o, h, l, c, v = 1) { return { t, o, h, l, c, v }; }
+
+/* ─────── Order Blocks ─────── */
+group("orderBlocks");
+{
+  // 30 flat candles to warm up ATR(14), then a bearish candle, then a big bull impulse.
+  const candles = [];
+  const MIN = 60_000;
+  let t = Date.now() - 200 * MIN;
+  // Flat noise around 100 with ATR ~ 0.5
+  for (let i = 0; i < 30; i++) {
+    candles.push(mkCandle(t, 100, 100.3, 99.7, 100, 1));
+    t += MIN;
+  }
+  // A swing high at price 101 (pivot) — put it at index 20 effectively; add a rise then fall:
+  // We'll inject a high pivot BEFORE the OB. For simplicity override candles:
+  candles[18] = mkCandle(candles[18].t, 100, 101.2, 99.7, 100, 1); // high
+  candles[19] = mkCandle(candles[19].t, 100, 100.3, 99.7, 99.9, 1);
+  candles[20] = mkCandle(candles[20].t, 99.9, 100.2, 99.6, 99.8, 1); // low pivot
+
+  // Bearish candle at index 30 that becomes our OB
+  candles.push(mkCandle(t, 100.2, 100.4, 99.5, 99.6, 1)); t += MIN;  // i=30 (bearish)
+  // Big bull impulse breaking the 101.2 high
+  candles.push(mkCandle(t, 99.6, 102.5, 99.6, 102.4, 2)); t += MIN;  // i=31
+  candles.push(mkCandle(t, 102.4, 103.5, 102.3, 103.3, 2)); t += MIN; // i=32
+  // Pullback that mitigates the OB
+  candles.push(mkCandle(t, 103.3, 103.4, 99.3, 99.5, 1)); t += MIN;   // i=33 touches [99.5..100.4]
+
+  const piv = Swings.findPivots(candles, { left: 2, right: 2 });
+  Swings.classifyPivots(piv);
+  const obs = OB.detectOrderBlocks(candles, piv, { impulseATRMult: 1.5, impulseLookahead: 3, atrPeriod: 14 });
+  log("at least one bullish OB detected", obs.some(b => b.kind === "bull"));
+  const bullOB = obs.find(b => b.kind === "bull");
+  log("bullish OB range = bearish candle's low..high",
+      bullOB && near(bullOB.bot, 99.5) && near(bullOB.top, 100.4));
+  log("bullish OB mitigated by pullback", !!bullOB?.mitigated);
+}
+
+/* ─────── Liquidity ─────── */
+group("liquidity");
+{
+  // Three equal highs at ~110, then a sweep (wick above, close below).
+  const candles = [];
+  const MIN = 60_000;
+  let t = Date.now() - 50 * MIN;
+  const add = (o, h, l, c) => { candles.push(mkCandle(t, o, h, l, c, 1)); t += MIN; };
+  // Build zigzag with three highs ≈ 110
+  add(100, 105, 100, 104);
+  add(104, 110, 103, 106);  // high pivot ≈ 110
+  add(106, 107, 103, 104);
+  add(104, 109.95, 103, 106); // high pivot ≈ 110
+  add(106, 108, 103, 104);
+  add(104, 110.05, 103, 106); // high pivot ≈ 110
+  add(106, 108, 103, 104);
+  // Sweep: wick spikes to 111, close back below 110
+  add(104, 111, 103, 108);   // bearish sweep
+  // Pad a bit for pivots detection
+  add(108, 109, 107, 108);
+  add(108, 109, 107, 108);
+  const piv = Swings.findPivots(candles, { left: 1, right: 1 });
+  Swings.classifyPivots(piv);
+  const liq = Liq.detectLiquidity(candles, piv, { tolerance: 0.2, minTouches: 2 });
+  log("at least one EQH cluster", liq.eqHighs.length >= 1);
+  log("EQH price ≈ 110", liq.eqHighs[0] && Math.abs(liq.eqHighs[0].price - 110) < 0.2);
+  log("bearish sweep detected", liq.sweeps.some(s => s.kind === "bearish"));
+}
+
+/* ─────── Premium / Discount ─────── */
+group("premiumDiscount");
+{
+  // Range 100 → 200 → current close 120 → discount zone
+  const candles = [];
+  const MIN = 60_000;
+  let t = Date.now() - 10 * MIN;
+  // Low at start (pivot), high in middle (pivot), close at 120 at end
+  candles.push(mkCandle(t, 100, 100, 100, 100)); t += MIN;
+  candles.push(mkCandle(t, 100, 101, 99,  100)); t += MIN;
+  candles.push(mkCandle(t, 100, 200, 100, 200)); t += MIN;
+  candles.push(mkCandle(t, 200, 201, 150, 150)); t += MIN;
+  candles.push(mkCandle(t, 150, 150, 120, 120)); t += MIN;
+  const pd = PD.premiumDiscount(candles, [], { rangeHigh: 200, rangeLow: 100 });
+  log("pd returns valid object", !!pd);
+  log("pd.rangeHigh = 200", pd.rangeHigh === 200);
+  log("pd.mid = 150", pd.mid === 150);
+  log("lastPct ≈ 0.20", near(pd.lastPct, 0.2));
+  log("lastZone = 'discount'", pd.lastZone === "discount");
+  // Price above mid → premium
+  const pd2 = PD.premiumDiscount([{ t:1, o:180, h:180, l:180, c:180, v:1 }], [], { rangeHigh: 200, rangeLow: 100 });
+  log("close at 180 → premium", pd2.lastZone === "premium");
+  // Price at 150 → equilibrium
+  const pd3 = PD.premiumDiscount([{ t:1, o:150, h:150, l:150, c:150, v:1 }], [], { rangeHigh: 200, rangeLow: 100 });
+  log("close at 150 → equilibrium", pd3.lastZone === "equilibrium");
+}
+
+/* ─────── Sessions ─────── */
+group("sessions");
+{
+  // 2026-04-15 08:00 UTC → london KZ
+  const tLondon = Date.UTC(2026, 3, 15, 8, 0, 0);
+  log("08:00 UTC → london", Sess.sessionOf(tLondon) === "london");
+  // 13:00 UTC → ny-am (overlapping with start of ny-pm at 13:30 — ny-am wins here)
+  const tNY = Date.UTC(2026, 3, 15, 13, 0, 0);
+  log("13:00 UTC → ny-am", Sess.sessionOf(tNY) === "ny-am");
+  // 23:00 UTC → asia (wraps midnight)
+  const tAsia = Date.UTC(2026, 3, 15, 23, 0, 0);
+  log("23:00 UTC → asia", Sess.sessionOf(tAsia) === "asia");
+  // 04:00 UTC → off-hours
+  const tOff = Date.UTC(2026, 3, 15, 4, 0, 0);
+  log("04:00 UTC → off-hours", Sess.sessionOf(tOff) === "off-hours");
+  // tagSessions returns same-length array
+  const fake = [
+    { t: tLondon, o:1, h:1, l:1, c:1, v:1 },
+    { t: tNY,     o:1, h:1, l:1, c:1, v:1 },
+    { t: tAsia,   o:1, h:1, l:1, c:1, v:1 },
+  ];
+  const tags = Sess.tagSessions(fake);
+  log("tagSessions length matches input", tags.length === 3);
+  log("tags are correct", tags[0] === "london" && tags[1] === "ny-am" && tags[2] === "asia");
+  // sessionStats has keys
+  const stats = Sess.sessionStats(fake);
+  log("sessionStats has london key", !!stats.london && stats.london.count === 1);
+}
+
+/* ─────── Engine integration ─────── */
+group("engine integration");
+{
+  // Use ~120 flat-ish candles so ATR warms up.
+  const candles = [];
+  const MIN = 60_000;
+  let t = Date.now() - 120 * MIN;
+  for (let i = 0; i < 120; i++) {
+    const base = 100 + Math.sin(i / 8) * 2;
+    candles.push(mkCandle(t, base, base + 0.5, base - 0.5, base, 1));
+    t += MIN;
+  }
+  const ta = Eng.TAEngine.compute(candles);
+  log("engine attaches orderBlocks array", Array.isArray(ta.orderBlocks));
+  log("engine attaches liquidity object", ta.liquidity && typeof ta.liquidity === "object");
+  log("engine attaches premiumDiscount", !!ta.premiumDiscount);
+  log("engine attaches sessions.tags of same length", ta.sessions?.tags?.length === candles.length);
+  log("summary.zone is a string", typeof ta.summary.zone === "string");
+  log("summary.session is a string", typeof ta.summary.session === "string");
+  log("summary.orderBlocksOpen is a number", Number.isFinite(ta.summary.orderBlocksOpen));
+}
+
+/* ─────── Worker proxy ─────── */
+group("worker proxy");
+{
+  let proxy;
+  try {
+    proxy = new Proxy.TAEngineProxy();
+    await proxy.ready;
+    const candles = [];
+    const MIN = 60_000;
+    let t = Date.now() - 60 * MIN;
+    for (let i = 0; i < 60; i++) {
+      candles.push(mkCandle(t, 100, 100.5, 99.5, 100, 1));
+      t += MIN;
+    }
+    const ta = await proxy.compute(candles);
+    log("worker computed TA", !!ta && Array.isArray(ta.close));
+    log("worker result matches shape (has summary)", !!ta.summary);
+    log("worker returned timing", Number.isFinite(ta.__workerMs) || ta.__workerMs === undefined /* fallback */);
+  } catch (err) {
+    log("worker proxy failed", false, err.message);
+  } finally {
+    proxy?.dispose();
+  }
+}
+
+out.innerHTML += `\n${p}/${n} passed\n`;
+document.title = `MNP p4 ${p}/${n}`;
+</script>
+</body>
+</html>

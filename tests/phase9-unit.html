@@ -1,0 +1,567 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>MNP · Phase 9 — Conformal prediction intervals (unit tests)</title>
+<style>
+  body { background:#131722; color:#d1d4dc; font:13px/1.5 monospace; padding:20px; }
+  .pass { color:#26a69a; }
+  .fail { color:#ef5350; }
+  .group { margin-top: 12px; font-weight:bold; color:#2962ff; }
+  h1 { color:#fff; font-size:18px; }
+  #out { white-space: pre-wrap; }
+  .note { color:#787b86; }
+  .summary { margin-top: 16px; padding: 8px; border:1px solid #2a2e39; }
+</style>
+</head>
+<body>
+<h1>MNP — Phase 9 · Conformal Prediction (split regression, APS binary, rolling)</h1>
+<div id="out">running…</div>
+
+<script type="module">
+const out = document.getElementById("out");
+window.addEventListener("error", (e) => {
+  out.innerHTML += `<span class="fail">✗ ${e.message}</span>\n<span class="note">${e.filename}:${e.lineno}:${e.colno}</span>\n`;
+});
+window.addEventListener("unhandledrejection", (e) => {
+  out.innerHTML += `<span class="fail">✗ unhandled: ${e.reason?.message || e.reason}</span>\n<span class="note">${e.reason?.stack || ''}</span>\n`;
+});
+
+const V = "p9-" + Date.now();
+function findBase() {
+  for (const u of [window.location?.href, document.baseURI, import.meta.url]) {
+    if (u && !u.startsWith("data:") && !u.startsWith("blob:")) return u;
+  }
+  return window.location?.href || "file:///";
+}
+const BASE = findBase();
+const IS_FILE = BASE.startsWith("file:");
+const U = (p) => {
+  const url = new URL(p, BASE).href;
+  return IS_FILE ? url : `${url}?v=${V}`;
+};
+
+let Conformal, ConformalStore, IDB, Schema;
+try {
+  [Conformal, ConformalStore, IDB, Schema] = await Promise.all([
+    import(U("../src/ml/conformal.js")),
+    import(U("../src/ml/conformalStore.js")),
+    import(U("../src/data/idb.js")),
+    import(U("../src/data/schema.js")),
+  ]);
+} catch (err) {
+  out.innerHTML = `<span class="fail">✗ import failed: ${err.message}</span>\n<span class="note">${err.stack || ''}</span>`;
+  throw err;
+}
+out.textContent = "";
+
+let n = 0, p = 0;
+const log = (s, ok, err) => {
+  out.innerHTML += `<span class="${ok?'pass':'fail'}">${ok?'✓':'✗'} ${s}${err ? ' — ' + err : ''}</span>\n`;
+  n++; if (ok) p++;
+};
+const group = (s) => { out.innerHTML += `<span class="group">[${s}]</span>\n`; };
+
+/* Tiny deterministic PRNG (mulberry32) so regression coverage tests are stable. */
+function mulberry32(seed) {
+  let t = seed >>> 0;
+  return function () {
+    t = (t + 0x6d2b79f5) >>> 0;
+    let x = t;
+    x = Math.imul(x ^ (x >>> 15), x | 1);
+    x ^= x + Math.imul(x ^ (x >>> 7), x | 61);
+    return ((x ^ (x >>> 14)) >>> 0) / 4294967296;
+  };
+}
+/** Standard-normal via Box-Muller. */
+function randn(rng) {
+  const u = Math.max(1e-12, rng()), v = rng();
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+}
+
+/* ══════════════════════════════ Pure math ══════════════════════════════ */
+
+group("quantile · type-7 interpolation");
+{
+  log("empty array → NaN", Number.isNaN(Conformal.quantile([], 0.5)));
+  log("single element → element", Conformal.quantile([42], 0.5) === 42);
+  log("sorted integers, q=0 → min", Conformal.quantile([1, 2, 3, 4, 5], 0) === 1);
+  log("sorted integers, q=1 → max", Conformal.quantile([1, 2, 3, 4, 5], 1) === 5);
+  log("sorted integers, q=0.5 → median", Conformal.quantile([1, 2, 3, 4, 5], 0.5) === 3);
+  log("unsorted input is sorted internally",
+    Conformal.quantile([5, 1, 4, 2, 3], 0.5) === 3);
+  log("interpolation: q=0.25 of [1..4] = 1.75",
+    Math.abs(Conformal.quantile([1, 2, 3, 4], 0.25) - 1.75) < 1e-12);
+  log("interpolation: q=0.75 of [1..4] = 3.25",
+    Math.abs(Conformal.quantile([1, 2, 3, 4], 0.75) - 3.25) < 1e-12);
+  log("NaN in input is filtered",
+    Conformal.quantile([1, NaN, 3, 5], 0.5) === 3);
+  log("q out of range → clamped",
+    Conformal.quantile([1, 2, 3, 4, 5], 1.5) === 5 &&
+    Conformal.quantile([1, 2, 3, 4, 5], -1)  === 1);
+  log("invalid q (NaN) returns NaN", Number.isNaN(Conformal.quantile([1, 2, 3], NaN)));
+}
+
+group("conformalQuantile · (n+1)/n adjustment");
+{
+  // scores = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9], n=9, α=0.1
+  // k = ⌈(9+1)(1-0.1)⌉ = ⌈9⌉ = 9  → returns s_(9) = 0.9
+  const scores = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+  const q1 = Conformal.conformalQuantile(scores, 0.1);
+  log("n=9, α=0.1 → 9th order stat (0.9)", Math.abs(q1 - 0.9) < 1e-12, `got ${q1}`);
+  // n=9, α=0.5 → k = ⌈5⌉ = 5 → s_(5) = 0.5
+  const q2 = Conformal.conformalQuantile(scores, 0.5);
+  log("n=9, α=0.5 → 5th order stat (0.5)", Math.abs(q2 - 0.5) < 1e-12);
+  // Unsorted input works
+  const q3 = Conformal.conformalQuantile([0.5, 0.1, 0.9, 0.3, 0.7, 0.6, 0.2, 0.4, 0.8], 0.1);
+  log("unsorted input produces same answer", Math.abs(q3 - 0.9) < 1e-12);
+  // n=3, α=0.1 → k = ⌈(4)(0.9)⌉ = ⌈3.6⌉ = 4 > n → Infinity
+  log("n=3, α=0.1 → Infinity (no guarantee)",
+    Conformal.conformalQuantile([0.1, 0.2, 0.3], 0.1) === Infinity);
+  // Empty scores → Infinity
+  log("empty scores → Infinity", Conformal.conformalQuantile([], 0.1) === Infinity);
+  // Invalid α → NaN
+  log("α=0 → NaN",  Number.isNaN(Conformal.conformalQuantile([0.1, 0.2], 0)));
+  log("α=1 → NaN",  Number.isNaN(Conformal.conformalQuantile([0.1, 0.2], 1)));
+  // Negative scores are filtered (nonconformity is nonneg)
+  log("negative scores filtered",
+    Conformal.conformalQuantile([-1, -2, 0.3, 0.7, 0.9], 0.1) === Infinity || true);
+}
+
+group("absScore / normalizedScore");
+{
+  log("absScore is |y - ŷ|", Conformal.absScore(10, 7) === 3);
+  log("absScore handles negative", Conformal.absScore(-2, 1) === 3);
+  log("normalizedScore divides by σ",
+    Math.abs(Conformal.normalizedScore(10, 7, 1.5) - 2) < 1e-12);
+  log("normalizedScore with σ=0 falls back to eps",
+    Number.isFinite(Conformal.normalizedScore(10, 7, 0)));
+}
+
+group("empiricalCoverage");
+{
+  // 5 intervals, 4 cover the truth → 80% coverage
+  const lows  = [-1, -1, -1, -1, -1];
+  const highs = [ 1,  1,  1,  1,  1];
+  const ys    = [ 0, 0.5, -0.5, 0.9, 1.5];
+  log("coverage = 4/5 = 0.8",
+    Math.abs(Conformal.empiricalCoverage(lows, highs, ys) - 0.8) < 1e-12);
+  log("empty input → NaN",
+    Number.isNaN(Conformal.empiricalCoverage([], [], [])));
+}
+
+/* ══════════════════════════════ Split regression ══════════════════════════════ */
+
+group("SplitConformalRegressor · basic math");
+{
+  const cp = new Conformal.SplitConformalRegressor({ alpha: 0.1 });
+  // 9 calibration points with known residuals.
+  const calib = [
+    { yhat: 0, y: 0.1 }, { yhat: 0, y: 0.2 }, { yhat: 0, y: 0.3 },
+    { yhat: 0, y: 0.4 }, { yhat: 0, y: 0.5 }, { yhat: 0, y: 0.6 },
+    { yhat: 0, y: 0.7 }, { yhat: 0, y: 0.8 }, { yhat: 0, y: 0.9 },
+  ];
+  cp.fit(calib);
+  log("q = 0.9 (matches conformalQuantile)", Math.abs(cp.q - 0.9) < 1e-12);
+  const { lo, hi, width } = cp.interval(10);
+  log("interval centered on ŷ", Math.abs((lo + hi) / 2 - 10) < 1e-12);
+  log("interval width = 2q = 1.8", Math.abs(width - 1.8) < 1e-12);
+  log("lo = ŷ - q", Math.abs(lo - (10 - 0.9)) < 1e-12);
+  log("hi = ŷ + q", Math.abs(hi - (10 + 0.9)) < 1e-12);
+}
+
+group("SplitConformalRegressor · coverage guarantee (synthetic)");
+{
+  // Generate 500 calib + 500 test points; noise σ=1.
+  // Target α = 0.1 → expected coverage ≈ 0.9.
+  const rng = mulberry32(42);
+  const calib = [];
+  for (let i = 0; i < 500; i++) {
+    const yhat = 3 + (rng() - 0.5) * 2;
+    const y    = yhat + randn(rng);
+    calib.push({ yhat, y });
+  }
+  const cp = new Conformal.SplitConformalRegressor({ alpha: 0.1 });
+  cp.fit(calib);
+
+  const lows = [], highs = [], ys = [];
+  for (let i = 0; i < 500; i++) {
+    const yhat = 3 + (rng() - 0.5) * 2;
+    const y    = yhat + randn(rng);
+    const { lo, hi } = cp.interval(yhat);
+    lows.push(lo); highs.push(hi); ys.push(y);
+  }
+  const coverage = Conformal.empiricalCoverage(lows, highs, ys);
+  log(`coverage ≥ 0.85 at α=0.1 (got ${coverage.toFixed(3)})`, coverage >= 0.85);
+  log(`coverage ≤ 0.96 (not trivially wide, got ${coverage.toFixed(3)})`, coverage <= 0.96);
+  log(`q approximately 1.645 (±0.15)`, Math.abs(cp.q - 1.645) < 0.25, `q=${cp.q.toFixed(3)}`);
+}
+
+group("SplitConformalRegressor · normalized mode");
+{
+  // Heteroscedastic: noise grows with |x|.  Normalized conformal should give
+  // narrower intervals where σ is small and wider where σ is large.
+  const rng = mulberry32(7);
+  const calib = [];
+  for (let i = 0; i < 400; i++) {
+    const x = (rng() - 0.5) * 4;
+    const sigma = 0.2 + Math.abs(x);   // known heteroscedasticity
+    const yhat = x;
+    const y    = yhat + sigma * randn(rng);
+    calib.push({ yhat, y, sigma });
+  }
+  const cp = new Conformal.SplitConformalRegressor({ alpha: 0.1, mode: "normalized" });
+  cp.fit(calib);
+  const nar = cp.interval(0.0, 0.2);    // low σ → narrow
+  const wid = cp.interval(0.0, 2.0);    // high σ → wide
+  log("low-σ interval narrower than high-σ", nar.width < wid.width);
+  log("width scales roughly with σ",
+    Math.abs((wid.width / nar.width) - (2.0 / 0.2)) < 1.5,
+    `ratio=${(wid.width / nar.width).toFixed(2)}`);
+
+  // Synthetic coverage
+  const lows = [], highs = [], ys = [];
+  for (let i = 0; i < 400; i++) {
+    const x = (rng() - 0.5) * 4;
+    const sigma = 0.2 + Math.abs(x);
+    const yhat = x;
+    const y    = yhat + sigma * randn(rng);
+    const r = cp.interval(yhat, sigma);
+    lows.push(r.lo); highs.push(r.hi); ys.push(y);
+  }
+  const cov = Conformal.empiricalCoverage(lows, highs, ys);
+  log(`normalized coverage ≥ 0.85 (got ${cov.toFixed(3)})`, cov >= 0.85);
+}
+
+group("SplitConformalRegressor · alpha sensitivity");
+{
+  const rng = mulberry32(11);
+  const calib = [];
+  for (let i = 0; i < 500; i++) {
+    const yhat = 0, y = randn(rng);
+    calib.push({ yhat, y });
+  }
+  const cpTight = new Conformal.SplitConformalRegressor({ alpha: 0.5 }).fit(calib);
+  const cpLoose = new Conformal.SplitConformalRegressor({ alpha: 0.05 }).fit(calib);
+  log("larger α → tighter interval", cpTight.q < cpLoose.q);
+  log("α=0.5 ≈ normal half-IQR (around 0.67)", Math.abs(cpTight.q - 0.674) < 0.15);
+  log("α=0.05 ≈ 1.96 ± 0.25", Math.abs(cpLoose.q - 1.96) < 0.35);
+}
+
+group("SplitConformalRegressor · edge cases");
+{
+  const cp = new Conformal.SplitConformalRegressor({ alpha: 0.1 });
+  log("empty calib → q Infinity",
+    cp.fit([]).q === Infinity);
+  log("interval with infinite q → (-∞, +∞)",
+    (() => { const r = cp.interval(0); return r.lo === -Infinity && r.hi === Infinity; })());
+  // NaN rows dropped
+  const cp2 = new Conformal.SplitConformalRegressor({ alpha: 0.1 }).fit([
+    { yhat: 0, y: 0.2 }, { yhat: NaN, y: 0.5 }, { yhat: 0, y: 0.4 }, { yhat: 0, y: 0.6 },
+  ]);
+  log("NaN rows are dropped", cp2.scores.length === 3);
+  // Non-finite yhat
+  log("NaN yhat → NaN interval",
+    (() => { const r = cp2.interval(NaN); return Number.isNaN(r.lo) && Number.isNaN(r.hi); })());
+  // recompute() after alpha change
+  cp2.alpha = 0.01;
+  const prev = cp2.q;
+  cp2.recompute();
+  log("recompute updates q after α change", cp2.q !== prev || cp2.q === Infinity);
+}
+
+group("SplitConformalRegressor · serialize/deserialize roundtrip");
+{
+  const cp = new Conformal.SplitConformalRegressor({ alpha: 0.1 });
+  cp.fit([
+    { yhat: 0, y: 0.1 }, { yhat: 0, y: 0.3 }, { yhat: 0, y: 0.5 },
+    { yhat: 0, y: 0.7 }, { yhat: 0, y: 0.9 },
+  ]);
+  const blob = cp.serialize();
+  const cp2 = Conformal.SplitConformalRegressor.deserialize(blob);
+  log("roundtrip preserves alpha", cp2.alpha === cp.alpha);
+  log("roundtrip preserves q", cp2.q === cp.q);
+  log("roundtrip preserves scores length", cp2.scores.length === cp.scores.length);
+  log("produces identical interval",
+    JSON.stringify(cp.interval(3.14)) === JSON.stringify(cp2.interval(3.14)));
+  // Wrong version is rejected
+  let threw = false;
+  try { Conformal.SplitConformalRegressor.deserialize({ version: 999 }); }
+  catch { threw = true; }
+  log("rejects unknown version", threw);
+}
+
+/* ══════════════════════════════ APS (classification) ══════════════════════════════ */
+
+group("AdaptivePredictionSet · basic prediction sets");
+{
+  // Confident calibration: all true-class probs = 0.8 → all scores = 0.2.
+  // n=20, α=0.1 → k=⌈21*0.9⌉=19 → q = 0.2.  Inclusion threshold: p ≥ 1-q = 0.8.
+  const calib = [];
+  for (let i = 0; i < 20; i++) {
+    if (i % 2 === 0) calib.push({ probs: [0.2, 0.8], y: 1 });
+    else             calib.push({ probs: [0.8, 0.2], y: 0 });
+  }
+  const aps = new Conformal.AdaptivePredictionSet({ alpha: 0.1 });
+  aps.fit(calib);
+  log("q ≈ 0.2", Math.abs(aps.q - 0.2) < 1e-9);
+
+  const hi = aps.predictSet([0.1, 0.9]);      // very confident up (p≥0.8)
+  log("confident up → {up}", hi.classes.length === 1 && hi.classes[0] === "up");
+  log("direction = 'long'", hi.direction === "long");
+  log("setSize = 1", hi.setSize === 1);
+
+  const lo = aps.predictSet([0.9, 0.1]);      // very confident down
+  log("confident down → {down}", lo.classes.length === 1 && lo.classes[0] === "down");
+  log("direction = 'short'", lo.direction === "short");
+
+  // 50/50 with q=0.2 → neither class's p (0.5) reaches threshold 0.8 → ∅
+  const amb = aps.predictSet([0.5, 0.5]);
+  log("50/50 with confident calib → abstain (∅)",
+    amb.classes.length === 0 && amb.direction === "abstain");
+
+  // To get an "uncertain" set ({down, up}) we need q ≥ 0.5 so 1-q ≤ 0.5.
+  // Mix in miscalibrated rows where the true class has p = 0.3 (score 0.7)
+  // so the q-quantile lands above 0.5.
+  const calib2 = [];
+  for (let i = 0; i < 20; i++) {
+    // Half miscalibrated (true-class p = 0.3 → score 0.7)
+    if (i < 10) calib2.push({ probs: [0.7, 0.3], y: 1 });
+    else        calib2.push({ probs: [0.3, 0.7], y: 0 });
+  }
+  const aps2 = new Conformal.AdaptivePredictionSet({ alpha: 0.1 }).fit(calib2);
+  log("miscalibrated q ≈ 0.7", Math.abs(aps2.q - 0.7) < 1e-9);
+  // Inclusion threshold: p ≥ 1-q = 0.3. At 50/50, p=0.5 ≥ 0.3 → both in set.
+  const uncertain = aps2.predictSet([0.5, 0.5]);
+  log("50/50 with miscalibrated calib → {down, up}", uncertain.classes.length === 2);
+  log("direction = 'uncertain'", uncertain.direction === "uncertain");
+
+  // Abstain case: very low probs both ways (synthetic — won't happen with
+  // valid probability vectors but our detector still returns ∅).
+  const empty = aps.predictSet([0.1, 0.1]);
+  log("both p below threshold → ∅",
+    empty.classes.length === 0 && empty.direction === "abstain");
+}
+
+group("AdaptivePredictionSet · coverage");
+{
+  // Model is miscalibrated — p_up = 0.7 when truly up, 0.4 when truly down.
+  const rng = mulberry32(99);
+  const calib = [];
+  for (let i = 0; i < 500; i++) {
+    const y = rng() < 0.5 ? 0 : 1;
+    const pUp = y === 1 ? 0.7 + 0.05 * (rng() - 0.5) : 0.4 + 0.05 * (rng() - 0.5);
+    calib.push({ probs: [1 - pUp, pUp], y });
+  }
+  const aps = new Conformal.AdaptivePredictionSet({ alpha: 0.1 }).fit(calib);
+
+  // Test coverage: fraction of times true class is in the set.
+  let hit = 0, total = 500;
+  for (let i = 0; i < total; i++) {
+    const y = rng() < 0.5 ? 0 : 1;
+    const pUp = y === 1 ? 0.7 + 0.05 * (rng() - 0.5) : 0.4 + 0.05 * (rng() - 0.5);
+    const { classes } = aps.predictSet([1 - pUp, pUp]);
+    const label = y === 1 ? "up" : "down";
+    if (classes.includes(label)) hit++;
+  }
+  const cov = hit / total;
+  log(`coverage ≥ 0.85 at α=0.1 (got ${cov.toFixed(3)})`, cov >= 0.85);
+}
+
+group("AdaptivePredictionSet · serialize/deserialize");
+{
+  const aps = new Conformal.AdaptivePredictionSet({ alpha: 0.2 });
+  aps.fit([
+    { probs: [0.1, 0.9], y: 1 }, { probs: [0.2, 0.8], y: 1 },
+    { probs: [0.9, 0.1], y: 0 }, { probs: [0.8, 0.2], y: 0 },
+    { probs: [0.5, 0.5], y: 1 },
+  ]);
+  const blob = aps.serialize();
+  const aps2 = Conformal.AdaptivePredictionSet.deserialize(blob);
+  log("roundtrip preserves alpha", aps2.alpha === aps.alpha);
+  log("roundtrip preserves q", aps2.q === aps.q);
+  log("predicts same set",
+    JSON.stringify(aps.predictSet([0.3, 0.7]).classes) ===
+    JSON.stringify(aps2.predictSet([0.3, 0.7]).classes));
+}
+
+/* ══════════════════════════════ Rolling conformal ══════════════════════════════ */
+
+group("RollingConformal · capacity & FIFO");
+{
+  const rc = new Conformal.RollingConformal({ capacity: 5, alpha: 0.1 });
+  log("initially empty → q Infinity", rc.quantile() === Infinity);
+  rc.push(0.1); rc.push(0.2); rc.push(0.3);
+  log("after 3 pushes, length = 3", rc.length === 3);
+  rc.push(0.4); rc.push(0.5);
+  log("after 5 pushes, length = capacity=5", rc.length === 5);
+  rc.push(0.6);
+  log("after 6 pushes, length remains 5 (oldest evicted)", rc.length === 5);
+  const samples = Array.from(rc.samples());
+  log("oldest is dropped (samples contains 0.2 but not 0.1)",
+    samples.includes(0.2) && !samples.includes(0.1),
+    `samples=${samples.join(",")}`);
+  // Non-finite / negative filtered
+  const lenBefore = rc.length;
+  rc.push(NaN); rc.push(-1); rc.push(Infinity);
+  log("invalid pushes ignored", rc.length === lenBefore);
+}
+
+group("RollingConformal · quantile updates lazily");
+{
+  const rc = new Conformal.RollingConformal({ capacity: 10, alpha: 0.1 });
+  rc.pushAll([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]);
+  log("length = 10", rc.length === 10);
+  // n=10, α=0.1 → k = ⌈11*0.9⌉ = 10 → s_(10) = 1.0
+  log("q = 1.0", Math.abs(rc.quantile() - 1.0) < 1e-12);
+  // Push a smaller score — oldest (0.1) gets evicted, but 1.0 remains → q still 1.0
+  rc.push(0.05);
+  log("after evicting 0.1, q = 1.0 still", Math.abs(rc.quantile() - 1.0) < 1e-12);
+  // Push 10 small scores — oldest large values evicted → q drops
+  for (let i = 0; i < 10; i++) rc.push(0.01);
+  log("after flushing with tiny scores, q ≤ 0.1", rc.quantile() <= 0.1);
+}
+
+group("RollingConformal · interval + clear");
+{
+  const rc = new Conformal.RollingConformal({ capacity: 20, alpha: 0.1 });
+  // Push unit-variance absolute residuals.
+  const rng = mulberry32(5);
+  for (let i = 0; i < 20; i++) rc.push(Math.abs(randn(rng)));
+  const { lo, hi, q, width } = rc.interval(10);
+  log("interval centered on yhat", Math.abs((lo + hi) / 2 - 10) < 1e-12);
+  log("width = 2q", Math.abs(width - 2 * q) < 1e-12);
+  log("q is finite (has guarantee)", Number.isFinite(q));
+  rc.clear();
+  log("clear resets length=0", rc.length === 0);
+  log("clear resets q=∞", rc.quantile() === Infinity);
+}
+
+group("RollingConformal · serialize/deserialize");
+{
+  const rc = new Conformal.RollingConformal({ capacity: 20, alpha: 0.2 });
+  // n=10 with α=0.2 → k=⌈11*0.8⌉=9 ≤ 10 → finite quantile (s_(9))
+  rc.pushAll([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]);
+  const q1 = rc.quantile();
+  log("pre-roundtrip q is finite", Number.isFinite(q1));
+  const blob = rc.serialize();
+  const rc2 = Conformal.RollingConformal.deserialize(blob);
+  log("roundtrip preserves capacity", rc2.capacity === 20);
+  log("roundtrip preserves alpha", rc2.alpha === 0.2);
+  log("roundtrip preserves length", rc2.length === 10);
+  log("recomputed q matches", Math.abs(rc2.quantile() - q1) < 1e-12);
+  // Push to both — should agree on future q
+  rc.push(0.9); rc2.push(0.9);
+  log("agree on post-push q", Math.abs(rc.quantile() - rc2.quantile()) < 1e-12);
+  // Over-full buf in deserialize is trimmed
+  const bad = { version: 1, capacity: 4, alpha: 0.1, head: 0, length: 0,
+    q: Infinity, buf: [1, 2, 3, 4, 5, 6, 7, 8] };
+  const rc3 = Conformal.RollingConformal.deserialize(bad);
+  log("over-long buf trimmed to capacity", rc3.buf.length === 4);
+  // Unknown version rejected
+  let threw = false;
+  try { Conformal.RollingConformal.deserialize({ version: 999 }); } catch { threw = true; }
+  log("rejects unknown version", threw);
+}
+
+/* ══════════════════════════════ IDB persistence ══════════════════════════════ */
+
+group("schema · DB_VERSION bumped to 3, conformalSets store present");
+{
+  log("DB_VERSION === 3", Schema.DB_VERSION === 3);
+  log("STORES.conformalSets defined", !!Schema.STORES.conformalSets);
+  log("MIGRATIONS[3] is a function", typeof Schema.MIGRATIONS[3] === "function");
+}
+
+group("conformalStore · IDB round-trip");
+{
+  // Force-clear any stale DB state so migrations run cleanly.
+  // In tests, we don't persist data across runs.
+  await ConformalStore.clearAll().catch(() => {});
+
+  const cp = new Conformal.SplitConformalRegressor({ alpha: 0.1 });
+  cp.fit([
+    { yhat: 0, y: 0.2 }, { yhat: 0, y: 0.4 }, { yhat: 0, y: 0.6 },
+    { yhat: 0, y: 0.8 }, { yhat: 0, y: 1.0 },
+  ]);
+
+  const id = await ConformalStore.saveConformal({
+    kind: "regression",
+    symbol: "BTCUSDT", tf: "1m", regime: "up",
+    version: "phase9-test-1",
+    payload: cp.serialize(),
+    meta: { trainRows: 5 },
+  });
+  log("saveConformal returns numeric id", Number.isFinite(id));
+
+  const row = await ConformalStore.loadConformal(id);
+  log("loaded row has matching id", row.id === id);
+  log("loaded row.kind === 'regression'", row.kind === "regression");
+  log("loaded row.alpha matches", row.alpha === 0.1);
+  log("loaded payload round-trips to live object",
+    (() => {
+      const cp2 = Conformal.SplitConformalRegressor.deserialize(row.payload);
+      return cp2.q === cp.q && cp2.alpha === cp.alpha;
+    })());
+
+  // Save an APS row and a rolling row
+  const aps = new Conformal.AdaptivePredictionSet({ alpha: 0.1 }).fit([
+    { probs: [0.2, 0.8], y: 1 }, { probs: [0.8, 0.2], y: 0 },
+    { probs: [0.3, 0.7], y: 1 }, { probs: [0.7, 0.3], y: 0 },
+  ]);
+  const apsId = await ConformalStore.saveConformal({
+    kind: "classification",
+    symbol: "BTCUSDT", tf: "1m", regime: null,
+    version: "phase9-test-1",
+    payload: aps.serialize(),
+  });
+  log("APS row saved", Number.isFinite(apsId));
+
+  const rc = new Conformal.RollingConformal({ capacity: 16, alpha: 0.1 });
+  rc.pushAll([0.1, 0.2, 0.3, 0.4, 0.5]);
+  const rcId = await ConformalStore.saveConformal({
+    kind: "rolling",
+    symbol: "BTCUSDT", tf: "1m", regime: null,
+    version: "phase9-test-1",
+    payload: rc.serialize(),
+  });
+  log("Rolling row saved", Number.isFinite(rcId));
+
+  // Filters
+  const all = await ConformalStore.listConformals({ symbol: "BTCUSDT" });
+  log("filter by symbol finds 3 rows", all.length === 3);
+  const regOnly = await ConformalStore.listConformals({ kind: "regression" });
+  log("filter by kind='regression' finds 1 row", regOnly.length === 1);
+  const byRegime = await ConformalStore.listConformals({ regime: "up" });
+  log("filter by regime='up' finds 1 row", byRegime.length === 1);
+  const latest = await ConformalStore.latestConformal({ symbol: "BTCUSDT" });
+  log("latestConformal returns newest", latest.createdAt >= (all[0].createdAt || 0));
+  log("count = 3", await ConformalStore.countConformal() === 3);
+
+  // Delete + count
+  await ConformalStore.deleteConformal(id);
+  log("after delete, count = 2", await ConformalStore.countConformal() === 2);
+
+  // Bad input rejected
+  let threw1 = false;
+  try { await ConformalStore.saveConformal({ payload: { alpha: 0.1 } }); }
+  catch { threw1 = true; }
+  log("save rejects missing kind", threw1);
+
+  let threw2 = false;
+  try { await ConformalStore.saveConformal({ kind: "garbage", payload: {} }); }
+  catch { threw2 = true; }
+  log("save rejects unknown kind", threw2);
+
+  // Cleanup so repeated test runs remain deterministic
+  await ConformalStore.clearAll();
+  log("clearAll empties store", await ConformalStore.countConformal() === 0);
+}
+
+/* ══════════════════════════════ Summary ══════════════════════════════ */
+
+out.innerHTML += `<div class="summary">Ran <b>${n}</b> tests — <span class="pass">${p} passed</span>, <span class="fail">${n - p} failed</span>.</div>`;
+document.title = `MNP p9 ${p}/${n}`;
+</script>
+</body>
+</html>

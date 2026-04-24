@@ -1,0 +1,222 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>MNP · Phase 6 unit tests</title>
+<style>
+  body { background:#131722; color:#d1d4dc; font:13px/1.5 monospace; padding:20px; }
+  .pass { color:#26a69a; }
+  .fail { color:#ef5350; }
+  .group { margin-top: 12px; font-weight:bold; color:#2962ff; }
+  h1 { color:#fff; font-size:18px; }
+  #out { white-space: pre-wrap; }
+  .note { color:#787b86; }
+</style>
+</head>
+<body>
+<h1>MNP — Phase 6 unit tests</h1>
+<div id="out">running…</div>
+
+<script type="module">
+const out = document.getElementById("out");
+window.addEventListener("error", (e) => {
+  out.innerHTML = `<span class="fail">✗ ${e.message}</span>\n<span class="note">${e.filename}:${e.lineno}:${e.colno}</span>`;
+});
+window.addEventListener("unhandledrejection", (e) => {
+  out.innerHTML = `<span class="fail">✗ unhandled: ${e.reason?.message || e.reason}</span>\n<span class="note">${e.reason?.stack || ''}</span>`;
+});
+
+const V = "p6-" + Date.now();
+function findBase() {
+  for (const u of [window.location?.href, document.baseURI, import.meta.url]) {
+    if (u && !u.startsWith("data:") && !u.startsWith("blob:")) return u;
+  }
+  return window.location?.href || "file:///";
+}
+const BASE = findBase();
+const IS_FILE = BASE.startsWith("file:");
+const U = (p) => {
+  const url = new URL(p, BASE).href;
+  return IS_FILE ? url : `${url}?v=${V}`;
+};
+
+let Cls, SM, Cal, Eng;
+try {
+  [Cls, SM, Cal, Eng] = await Promise.all([
+    import(U("../src/regime/classifier.js")),
+    import(U("../src/regime/stateMachine.js")),
+    import(U("../src/regime/calendar.js")),
+    import(U("../src/ta/engine.js")),
+  ]);
+} catch (err) {
+  out.innerHTML = `<span class="fail">✗ import failed: ${err.message}</span>\n<span class="note">${err.stack || ''}</span>`;
+  throw err;
+}
+out.textContent = "";
+
+let n = 0, p = 0;
+const log = (s, ok, err) => {
+  out.innerHTML += `<span class="${ok?'pass':'fail'}">${ok?'✓':'✗'} ${s}${err ? ' — ' + err : ''}</span>\n`;
+  n++; if (ok) p++;
+};
+const group = (s) => { out.innerHTML += `<span class="group">[${s}]</span>\n`; };
+function mkCandle(t, o, h, l, c, v = 1) { return { t, o, h, l, c, v }; }
+
+/* ─────── Classifier ─────── */
+group("classifier");
+{
+  // Build a strongly trending-up series so ADX > 25 and EMA stack bullish.
+  const candles = [];
+  const MIN = 60_000;
+  let t = Date.UTC(2026, 0, 1, 0, 0, 0);
+  for (let i = 0; i < 220; i++) {
+    const base = 100 + i * 0.5 + Math.sin(i / 8) * 0.3;
+    const o = base - 0.1, c = base + 0.1;
+    candles.push(mkCandle(t, o, base + 0.4, base - 0.4, c, 1));
+    t += MIN;
+  }
+  const ta = Eng.TAEngine.compute(candles);
+  const r = Cls.classifyRegime(ta);
+  log("regime returns an object", !!r && typeof r === "object");
+  log("trend is 'up' for a steady uptrend", r.trend === "up");
+  log("alignment is bullish-stack", r.alignment === "bullish-stack");
+  log("strength at least moderate", r.strength === "moderate" || r.strength === "strong");
+  log("score.trend > 0", r.score.trend > 0);
+  log("label is a compact string", typeof r.label === "string" && r.label.includes("trending-up"));
+
+  // Ranging/flat series — truly flat so ADX stays weak
+  const flat = [];
+  let t2 = Date.UTC(2026, 0, 1, 0, 0, 0);
+  for (let i = 0; i < 220; i++) {
+    // tiny alternating noise that doesn't create a directional trend
+    const jitter = (i % 2 === 0) ? 0.02 : -0.02;
+    const base = 100 + jitter;
+    flat.push(mkCandle(t2, base, base + 0.05, base - 0.05, base, 1));
+    t2 += MIN;
+  }
+  const taF = Eng.TAEngine.compute(flat);
+  const rF = Cls.classifyRegime(taF);
+  log("flat market classified as range", rF.trend === "range" || rF.strength === "weak");
+
+  // classifySeries returns same length array
+  const series = Cls.classifySeries(taF);
+  log("classifySeries length matches candles", series.length === flat.length);
+
+  // Empty input is safe
+  const empty = Cls.classifyRegime({ close: [] });
+  log("empty input returns defaults", empty.trend === "range");
+}
+
+/* ─────── State Machine ─────── */
+group("stateMachine");
+{
+  const fsm = new SM.RegimeFSM({ confirmBars: 3 });
+  const a = { trend: "up",   strength: "moderate", volatility: "normal", label: "trending-up-moderate-normal-vol" };
+  const b = { trend: "down", strength: "moderate", volatility: "normal", label: "trending-down-moderate-normal-vol" };
+  // First observation sets state immediately
+  fsm.observe(a, { i: 0 });
+  log("cold-start commits first state", fsm.current?.trend === "up");
+  log("history records initial transition", fsm.history.length === 1 && fsm.history[0].from === null);
+  // Observe the same state → no change
+  fsm.observe(a, { i: 1 });
+  log("identical observation doesn't add history", fsm.history.length === 1);
+  // Two bars of B — not enough to switch (confirmBars=3)
+  fsm.observe(b, { i: 2 });
+  fsm.observe(b, { i: 3 });
+  log("2 bars of B don't flip state (hysteresis)", fsm.current?.trend === "up");
+  log("pending observation tracked", fsm._pendingCount === 2);
+  // Third bar of B → switch
+  fsm.observe(b, { i: 4 });
+  log("3 bars of B flip to B", fsm.current?.trend === "down");
+  log("history now has 2 transitions", fsm.history.length === 2);
+  // A single bar of A in the middle of B resets pending counter
+  fsm.observe(a, { i: 5 });
+  log("single counter-observation pending count = 1", fsm._pendingCount === 1);
+  fsm.observe(b, { i: 6 });
+  log("observation matching current clears pending", fsm._pendingCount === 0);
+
+  // runSeries helper
+  const classifications = [a, a, a, b, b, b, b, a, a, a, a];
+  const { committed, transitions } = SM.RegimeFSM.runSeries(classifications);
+  log("runSeries returns committed same length", committed.length === classifications.length);
+  log("runSeries creates correct number of transitions", transitions.length >= 2);
+}
+
+/* ─────── Calendar ─────── */
+group("calendar");
+{
+  const cal = new Cal.EventCalendar([]);
+  cal.upsert({ id: "e1", name: "CPI", at: 10_000, impact: "high", durationMs: 1_000 });
+  cal.upsert({ id: "e2", name: "FOMC", at: 50_000, impact: "high", durationMs: 2_000 });
+  log("calendar count = 2", cal.count() === 2);
+
+  // eventsNear within a wide window
+  const near = cal.eventsNear(12_000, 5_000);
+  log("eventsNear finds e1 within ±5s of 12s", near.length >= 1 && near[0].event.id === "e1");
+  log("phase computed correctly (after)", near[0].phase === "after");
+
+  // before phase
+  const near2 = cal.eventsNear(9_000, 5_000);
+  log("before phase detected", near2[0]?.phase === "before");
+
+  // during phase
+  const near3 = cal.eventsNear(10_500, 5_000);
+  log("during phase detected", near3[0]?.phase === "during");
+
+  // isInEventWindow with tight pre/post so we can test outside the window
+  const tight = { preMs: 500, postMs: 500 };
+  const w = cal.isInEventWindow(10_000, tight);
+  log("at exact event time → active", w.active === true);
+  log("phase = during", w.phase === "during");
+  const w2 = cal.isInEventWindow(0, tight);
+  log("far-past time → inactive", w2.active === false);
+
+  // Impact filtering
+  cal.upsert({ id: "e3", name: "Low-impact", at: 100_000, impact: "low", durationMs: 0 });
+  const high = cal.eventsNear(100_000, 1000, { impact: "high" });
+  log("impact filter excludes low", high.length === 0);
+
+  // Remove
+  cal.remove("e3");
+  log("remove reduces count", cal.count() === 2);
+
+  // tagSeries — pass tight windows so we can verify off-window bars
+  const tagOpts = { preMs: 500, postMs: 500 };
+  const tArr = [0, 9_500, 10_500, 11_500, 20_000, 49_800, 50_000, 52_500, 80_000];
+  const tagged = cal.tagSeries(tArr, tagOpts);
+  log("tagSeries returns flags + weights", tagged.flags instanceof Uint8Array && tagged.weights instanceof Int8Array);
+  log("tags flag timestamps inside windows", tagged.flags[1] === 1 && tagged.flags[2] === 1 && tagged.flags[5] === 1);
+  log("distant timestamps not flagged", tagged.flags[0] === 0 && tagged.flags[4] === 0 && tagged.flags[8] === 0);
+
+  // defaultCalendar
+  const def = Cal.defaultCalendar();
+  log("defaultCalendar has seeded events", def.count() >= 1);
+
+  // Export / fromJSON roundtrip
+  const serial = cal.export();
+  const rehydrated = Cal.EventCalendar.fromJSON(serial);
+  log("JSON roundtrip preserves count", rehydrated.count() === cal.count());
+}
+
+/* ─────── Engine integration ─────── */
+group("engine integration");
+{
+  const candles = [];
+  const MIN = 60_000;
+  let t = Date.UTC(2026, 0, 1);
+  for (let i = 0; i < 150; i++) {
+    const base = 100 + i * 0.1;
+    candles.push(mkCandle(t, base, base + 0.5, base - 0.5, base, 1));
+    t += MIN;
+  }
+  const ta = Eng.TAEngine.compute(candles);
+  log("engine attaches regime object", ta.regime && typeof ta.regime === "object");
+  log("engine summary includes regime label", typeof ta.summary.regime === "string");
+  log("engine summary includes regime trend", ["up","down","range"].includes(ta.summary.regimeTrend));
+}
+
+out.innerHTML += `\n${p}/${n} passed\n`;
+document.title = `MNP p6 ${p}/${n}`;
+</script>
+</body>
+</html>

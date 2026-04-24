@@ -1,0 +1,149 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>MNP · Phase 1 unit tests</title>
+<style>
+  body { background:#131722; color:#d1d4dc; font:14px/1.5 monospace; padding:20px; }
+  .pass { color:#26a69a; }
+  .fail { color:#ef5350; }
+  .group { margin-top: 12px; font-weight:bold; color:#2962ff; }
+  h1 { color:#fff; font-size:18px; }
+  #out { white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h1>MNP — Phase 1 unit tests</h1>
+<div id="out">running…</div>
+
+<script type="module">
+const out = document.getElementById("out");
+window.addEventListener("error", (e) => {
+  out.innerHTML = `<span class="fail">✗ ${e.message}</span>\n<span style="color:#787b86">${e.filename}:${e.lineno}</span>`;
+});
+window.addEventListener("unhandledrejection", (e) => {
+  out.innerHTML = `<span class="fail">✗ unhandled: ${e.reason?.message || e.reason}</span>`;
+});
+
+const V = "p1-" + Date.now();
+function findBase() {
+  for (const u of [window.location?.href, document.baseURI, import.meta.url]) {
+    if (u && !u.startsWith("data:") && !u.startsWith("blob:")) return u;
+  }
+  return window.location?.href || "file:///";
+}
+const BASE = findBase();
+const IS_FILE = BASE.startsWith("file:");
+const U = (p) => {
+  const url = new URL(p, BASE).href;
+  return IS_FILE ? url : `${url}?v=${V}`;
+};
+let Validator, Buffer_;
+try {
+  [Validator, Buffer_] = await Promise.all([
+    import(U(`../src/data/candleValidator.js`)),
+    import(U(`../src/data/candleBuffer.js`)),
+  ]);
+} catch (err) {
+  out.innerHTML = `<span class="fail">✗ import failed: ${err.message}</span>`;
+  throw err;
+}
+const { validateCandle, validateBatch, tfMs } = Validator;
+const { CandleBuffer } = Buffer_;
+out.textContent = "";
+let n = 0, p = 0;
+const log = (s, ok) => {
+  out.innerHTML += `<span class="${ok?'pass':'fail'}">${ok?'✓':'✗'} ${s}</span>\n`;
+  n++; if (ok) p++;
+};
+const group = (s) => { out.innerHTML += `<span class="group">[${s}]</span>\n`; };
+const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+
+// Use a realistic, post-MIN_T, TF-aligned base timestamp ten minutes ago.
+// (Named T0 to avoid clashing with the module-resolution BASE declared above.)
+const MIN = 60_000;
+const T0 = Math.floor((Date.now() - 10 * MIN) / MIN) * MIN;
+const t1 = T0;
+const t2 = T0 + MIN;
+const t3 = T0 + 2 * MIN;
+
+group("validateCandle");
+log("valid candle", validateCandle({ t: t1, o: 1, h: 2, l: 0.5, c: 1.5, v: 100 }, { tf: "1m" }).ok);
+log("rejects non-object", !validateCandle(null).ok);
+log("rejects NaN", !validateCandle({ t: NaN, o: 1, h: 2, l: 1, c: 1, v: 1 }).ok);
+log("rejects overflow price", !validateCandle({ t: t1, o: 1e20, h: 1e20, l: 1e20, c: 1e20, v: 1 }).ok);
+log("rejects negative volume", !validateCandle({ t: t1, o: 1, h: 2, l: 1, c: 1, v: -1 }).ok);
+log("rejects h<max(o,c,l)", !validateCandle({ t: t1, o: 10, h: 9, l: 5, c: 8, v: 1 }).ok);
+log("rejects l>min(o,c,h)", !validateCandle({ t: t1, o: 10, h: 12, l: 11, c: 9, v: 1 }).ok);
+log("rejects t<MIN_T", !validateCandle({ t: 0, o: 1, h: 1, l: 1, c: 1, v: 1 }).ok);
+log("rejects t>now+2m", !validateCandle({ t: Date.now() + 300_000, o: 1, h: 1, l: 1, c: 1, v: 1 }).ok);
+log("parses string numerics", validateCandle({ t: t1, o: "1.5", h: "2.0", l: "1.0", c: "1.8", v: "100" }, { tf: "1m" }).ok);
+log("tfMs('1m')=60000", tfMs("1m") === 60_000);
+log("tfMs('1h')=3600000", tfMs("1h") === 3_600_000);
+
+group("validateBatch");
+const batch = [
+  { t: t1, o: 1,   h: 2,   l: 0.5, c: 1.5, v: 100 },
+  { t: t2, o: 1.5, h: 1.8, l: 1.4, c: 1.7, v: 50 },
+  { t: t3, o: "bad", h: 2, l: 1, c: 1, v: 1 },
+];
+const r = validateBatch(batch, { tf: "1m" });
+log("batch: 2 valid", r.valid.length === 2);
+log("batch: 1 dropped", r.dropped.length === 1);
+log("batch: dropped reason bad-o", r.dropped[0].reason === "bad-o");
+
+group("CandleBuffer — happy path");
+{
+  const closes = [];
+  const updates = [];
+  const b = new CandleBuffer({ symbol: "X", tf: "1m", onClose: c => closes.push(c.t), onUpdate: u => updates.push(u.t) });
+  b.ingest({ t: t1, o:1, h:1, l:1, c:1, v:1, closed: true });
+  b.ingest({ t: t2, o:1, h:1, l:1, c:1, v:1, closed: true });
+  b.ingest({ t: t3, o:1, h:1, l:1, c:1, v:1, closed: false }); // forming
+  log("two closes emitted in order", eq(closes, [t1, t2]));
+  log("one update emitted", updates.length === 1 && updates[0] === t3);
+}
+
+group("CandleBuffer — out-of-order reorder");
+{
+  const closes = [];
+  const b = new CandleBuffer({ symbol: "X", tf: "1m", onClose: c => closes.push(c.t) });
+  b.seed(t1 - MIN);
+  b.ingest({ t: t2, o:1, h:1, l:1, c:1, v:1, closed: true }); // arrives first
+  b.ingest({ t: t1, o:1, h:1, l:1, c:1, v:1, closed: true }); // out of order
+  log("emits in order despite reverse arrival", eq(closes, [t1, t2]));
+}
+
+group("CandleBuffer — duplicate rejection");
+{
+  const closes = [];
+  const b = new CandleBuffer({ symbol: "X", tf: "1m", onClose: c => closes.push(c.t) });
+  b.ingest({ t: t1, o:1, h:1, l:1, c:1, v:1, closed: true });
+  b.ingest({ t: t1, o:1, h:1, l:1, c:1, v:1, closed: true });  // dup
+  b.ingest({ t: t1, o:1, h:1, l:1, c:1, v:1, closed: true });  // dup
+  log("duplicate closed candles rejected", closes.length === 1);
+}
+
+group("CandleBuffer — gap detection");
+{
+  const closes = [];
+  const gaps = [];
+  const b = new CandleBuffer({
+    symbol: "X", tf: "1m",
+    onClose: c => closes.push(c.t),
+    onGap: g => gaps.push(g),
+  });
+  const g1 = T0;            // first
+  const g2 = T0 + 4 * MIN;  // leap 4m, skipping t+1..t+3
+  b.ingest({ t: g1, o:1, h:1, l:1, c:1, v:1, closed: true });
+  b.ingest({ t: g2, o:1, h:1, l:1, c:1, v:1, closed: true });
+  log("gap event emitted", gaps.length === 1);
+  log("gap range correct", gaps[0].from === g1 + MIN && gaps[0].to === g2 - MIN);
+  log("continues after gap", eq(closes, [g1, g2]));
+}
+
+out.innerHTML += `\n${p}/${n} passed\n`;
+document.title = `MNP tests ${p}/${n}`;
+</script>
+</body>
+</html>
