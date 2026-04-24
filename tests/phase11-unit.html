@@ -58,7 +58,8 @@ python -m http.server 3000
   import * as Conformal   from "../src/ml/conformal.js";
   import * as Ghost       from "../src/ml/ghostCandles.js";
   import * as GhostStore  from "../src/ml/ghostStore.js";
-  window.__p11 = { Schema, IDB, Conformal, Ghost, GhostStore, ok: true };
+  import * as Monitor     from "../src/validation/monitor.js";
+  window.__p11 = { Schema, IDB, Conformal, Ghost, GhostStore, Monitor, ok: true };
   window.dispatchEvent(new CustomEvent("p11-ready"));
 </script>
 
@@ -100,13 +101,14 @@ if (!bundle.ok) {
     "../src/ml/conformal.js",
     "../src/ml/ghostCandles.js",
     "../src/ml/ghostStore.js",
+    "../src/validation/monitor.js",
   ]) {
     const r = await probeFetch(p);
     out.innerHTML += `<span class="${r.ok?'pass':'fail'}">${r.ok?'✓':'✗'} fetch(${p}) → ${r.ok?`${r.status} · ${r.bytes}B`:r.err}</span>\n`;
   }
   throw bundle.err || new Error("module load failed");
 }
-const { Schema, IDB, Conformal, Ghost, GhostStore } = bundle;
+const { Schema, IDB, Conformal, Ghost, GhostStore, Monitor } = bundle;
 out.textContent = "";
 
 let n = 0, p = 0;
@@ -557,6 +559,343 @@ group("Fixture 5 · GhostStore persistence + gradeGhost + resolveGhosts + verdic
     log("clearAll wipes store", (await GhostStore.countGhosts()) === 0);
   } catch (err) {
     log("ghostStore suite threw", false, err.message + "\n" + (err.stack || ""));
+  }
+}
+
+/* ════════════════════════════════════ Fixture 6 — ghost:verdict → ValidationMonitor feedback loop ════════════════════════════════════ */
+group("Fixture 6 · ValidationMonitor.onGhostVerdict → RollingConformal feedback loop");
+{
+  /* ── Stub bus: records all emits, supports .on/.emit ── */
+  function makeBus() {
+    const listeners = new Map();
+    const emitted = [];
+    return {
+      emit(topic, data) {
+        emitted.push([topic, data]);
+        const ls = listeners.get(topic);
+        if (ls) for (const fn of ls.slice()) { try { fn(data); } catch {} }
+      },
+      on(topic, fn) {
+        if (!listeners.has(topic)) listeners.set(topic, []);
+        listeners.get(topic).push(fn);
+        return () => {
+          const arr = listeners.get(topic);
+          if (arr) { const i = arr.indexOf(fn); if (i >= 0) arr.splice(i, 1); }
+        };
+      },
+      emitted,
+    };
+  }
+
+  /* ── Stub conformalStore: in-memory Map keyed by (symbol|tf|version) ── */
+  function makeStubStore() {
+    const rows = new Map();     // id → row
+    let nextId = 1;
+    return {
+      saved: 0,
+      loaded: 0,
+      async saveConformal(row) {
+        this.saved++;
+        const id = row.id != null ? row.id : nextId++;
+        rows.set(id, { ...row, id });
+        return id;
+      },
+      async latestConformal(filter = {}) {
+        this.loaded++;
+        const out = [];
+        for (const r of rows.values()) {
+          if (filter.symbol  != null && r.symbol  !== filter.symbol)  continue;
+          if (filter.tf      != null && r.tf      !== filter.tf)      continue;
+          if (filter.kind    != null && r.kind    !== filter.kind)    continue;
+          if (filter.version != null && r.version !== filter.version) continue;
+          if ("regime" in filter && r.regime !== filter.regime)       continue;
+          out.push(r);
+        }
+        if (!out.length) return null;
+        out.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+        return out[0];
+      },
+      _rows: rows,
+    };
+  }
+
+  function makeVerdictEvent({ symbol = "BTCUSDT", tf = "1m", id = 1, perBar }) {
+    return {
+      id, symbol, tf,
+      anchorTime: 1_000_000,
+      usedConformal: false,
+      alpha: 0.1,
+      verdict: {
+        n: perBar.length,
+        covered: perBar.filter(p => p.covered).length,
+        coverage: perBar.filter(p => p.covered).length / perBar.length,
+        absErrorMean: perBar.reduce((s, p) => s + p.absError, 0) / perBar.length,
+        absErrorFinal: perBar[perBar.length - 1].absError,
+        perBar,
+      },
+    };
+  }
+
+  /* ── 6.a: RC accumulates, q becomes finite, ghost:calibration fires ── */
+  {
+    const bus = makeBus();
+    const store = makeStubStore();
+    const m = new Monitor.ValidationMonitor({
+      bus,
+      candleLookup: () => null,
+      store: { savePrediction: async () => 0, duePredictions: async () => [] },
+      conformalStore: store,
+      ghostConformalCapacity: 50,
+      ghostConformalAlpha: 0.1,
+      ghostPersistEvery: 100,  // big so it doesn't trigger here
+    });
+    m.start();
+
+    // First verdict: 4 bars, 3 covered, escalating errors
+    const evt = makeVerdictEvent({
+      perBar: [
+        { covered: true,  absError: 0.1, realizedClose: 100.1, realizedDir: "up" },
+        { covered: true,  absError: 0.2, realizedClose: 100.3, realizedDir: "up" },
+        { covered: false, absError: 0.5, realizedClose: 100.8, realizedDir: "up" },
+        { covered: true,  absError: 0.3, realizedClose: 100.5, realizedDir: "up" },
+      ],
+    });
+
+    const calib = await m.onGhostVerdict(evt);
+    log("onGhostVerdict returns calibration snapshot", calib && calib.symbol === "BTCUSDT");
+    log("RC was created for (symbol,tf)",
+        m.ghostRC("BTCUSDT", "1m") instanceof Conformal.RollingConformal);
+    const rc = m.ghostRC("BTCUSDT", "1m");
+    log("RC.length === 4 after 4 absErrors", rc.length === 4);
+    log("calib.pushed === 4", calib.pushed === 4);
+    log("calib.coverage === 3/4", close(calib.coverage, 0.75, 1e-12));
+    log("calib.residualMean ≈ 0.275", close(calib.residualMean, (0.1+0.2+0.5+0.3)/4, 1e-12));
+    log("calib.samples === 4", calib.samples === 4);
+    log("ghost:calibration event was emitted",
+        bus.emitted.some(([t]) => t === "ghost:calibration"));
+    log("stats.ghostVerdicts === 1", m.stats.ghostVerdicts === 1);
+    log("stats.ghostScoresPushed === 4", m.stats.ghostScoresPushed === 4);
+
+    // Second verdict feeds more scores; q should become finite once n ≥ ~19
+    // (ceil((n+1)(1-0.1)) <= n requires n >= 9 for quantile to be finite, but
+    // the full finite-sample guarantee needs a bit more — push enough).
+    for (let i = 0; i < 6; i++) {
+      const extra = makeVerdictEvent({
+        perBar: Array.from({ length: 5 }, (_, k) => ({
+          covered: true, absError: 0.2 + 0.01 * k, realizedClose: 100, realizedDir: "up",
+        })),
+      });
+      await m.onGhostVerdict(extra);
+    }
+    const q = rc.quantile();
+    log("RC.q becomes finite after enough pushes", Number.isFinite(q) && q > 0);
+    log("stats.ghostVerdicts === 7 total", m.stats.ghostVerdicts === 7);
+    log("RC.length === 34 total (4 + 6·5)", rc.length === 34);
+
+    m.stop();
+  }
+
+  /* ── 6.b: Write-through triggers at ghostPersistEvery boundary ── */
+  {
+    const bus = makeBus();
+    const store = makeStubStore();
+    const m = new Monitor.ValidationMonitor({
+      bus,
+      candleLookup: () => null,
+      store: { savePrediction: async () => 0, duePredictions: async () => [] },
+      conformalStore: store,
+      ghostPersistEvery: 5,      // small → will persist after 1st verdict of 6 bars
+      ghostVersion: "phase11-feedback-test",
+    });
+    m.start();
+
+    // Before any verdict: store untouched
+    log("store.saved === 0 initially", store.saved === 0);
+
+    // Verdict 1: 3 bars — below threshold, no persist yet
+    await m.onGhostVerdict(makeVerdictEvent({
+      symbol: "ETHUSDT", tf: "5m",
+      perBar: [
+        { covered: true, absError: 0.1, realizedClose: 1, realizedDir: "up" },
+        { covered: true, absError: 0.2, realizedClose: 1, realizedDir: "up" },
+        { covered: true, absError: 0.3, realizedClose: 1, realizedDir: "up" },
+      ],
+    }));
+    log("store.saved === 0 after 3 pushes (below threshold)", store.saved === 0);
+    log("writeCounter === 3 for ETHUSDT|5m",
+        m.ghostWriteCounter.get("ETHUSDT|5m") === 3);
+
+    // Verdict 2: 3 more bars → total=6, crosses threshold=5 → persists
+    await m.onGhostVerdict(makeVerdictEvent({
+      symbol: "ETHUSDT", tf: "5m",
+      perBar: [
+        { covered: true, absError: 0.4, realizedClose: 1, realizedDir: "up" },
+        { covered: true, absError: 0.5, realizedClose: 1, realizedDir: "up" },
+        { covered: true, absError: 0.6, realizedClose: 1, realizedDir: "up" },
+      ],
+    }));
+    log("store.saved === 1 after crossing threshold", store.saved === 1);
+    log("writeCounter reset to 0 after persist",
+        m.ghostWriteCounter.get("ETHUSDT|5m") === 0);
+    log("stats.ghostWrites === 1", m.stats.ghostWrites === 1);
+
+    // The saved row should carry the RC's payload and our version tag.
+    const savedRows = Array.from(store._rows.values());
+    log("saved row has kind 'rolling'",
+        savedRows.length === 1 && savedRows[0].kind === "rolling");
+    log("saved row carries ghostVersion",
+        savedRows[0].version === "phase11-feedback-test");
+    log("saved row has symbol+tf",
+        savedRows[0].symbol === "ETHUSDT" && savedRows[0].tf === "5m");
+    log("saved row payload is RollingConformal serialization",
+        savedRows[0].payload && savedRows[0].payload.kind === "rolling" &&
+        Array.isArray(savedRows[0].payload.buf));
+
+    // Second persist reuses same row id (write-in-place).
+    await m.onGhostVerdict(makeVerdictEvent({
+      symbol: "ETHUSDT", tf: "5m",
+      perBar: Array.from({ length: 6 }, (_, k) => ({
+        covered: true, absError: 0.1 + 0.01 * k, realizedClose: 1, realizedDir: "up",
+      })),
+    }));
+    log("store.saved === 2 after second threshold crossing", store.saved === 2);
+    log("row count in store still === 1 (write-in-place)",
+        store._rows.size === 1);
+
+    m.stop();
+  }
+
+  /* ── 6.c: Hydration on first touch (rebuild RC from prior payload) ── */
+  {
+    const bus = makeBus();
+    const store = makeStubStore();
+
+    // Pre-seed the store with a saved RC for (SOL,15m) containing 3 scores.
+    const seedRC = new Conformal.RollingConformal({ capacity: 50, alpha: 0.1 });
+    seedRC.push(0.5); seedRC.push(0.6); seedRC.push(0.7);
+    seedRC.recompute();
+    await store.saveConformal({
+      kind: "rolling",
+      symbol: "SOLUSDT", tf: "15m", regime: null,
+      version: "phase11-feedback-1",
+      alpha: seedRC.alpha, q: seedRC.q,
+      payload: seedRC.serialize(),
+      meta: {}, createdAt: Date.now(),
+    });
+
+    const m = new Monitor.ValidationMonitor({
+      bus,
+      candleLookup: () => null,
+      store: { savePrediction: async () => 0, duePredictions: async () => [] },
+      conformalStore: store,
+      ghostPersistEvery: 100,       // don't trigger re-persist inside this test
+    });
+    m.start();
+
+    // Before any verdict: RC not yet in cache
+    log("RC not cached before first touch", !m.ghostRC("SOLUSDT", "15m"));
+
+    // First verdict triggers hydration → RC should start with 3 prior samples
+    await m.onGhostVerdict(makeVerdictEvent({
+      symbol: "SOLUSDT", tf: "15m",
+      perBar: [
+        { covered: true, absError: 0.1, realizedClose: 1, realizedDir: "up" },
+      ],
+    }));
+    const hydrated = m.ghostRC("SOLUSDT", "15m");
+    log("RC hydrated on first touch", hydrated instanceof Conformal.RollingConformal);
+    log("hydrated RC carries prior samples + 1 new (length=4)",
+        hydrated.length === 4);
+    log("store.loaded === 1 (one hydration call)", store.loaded === 1);
+
+    // Subsequent verdict does NOT re-hydrate
+    await m.onGhostVerdict(makeVerdictEvent({
+      symbol: "SOLUSDT", tf: "15m",
+      perBar: [{ covered: true, absError: 0.15, realizedClose: 1, realizedDir: "up" }],
+    }));
+    log("store.loaded still === 1 after second verdict (no re-hydration)",
+        store.loaded === 1);
+
+    m.stop();
+  }
+
+  /* ── 6.d: Wired through start()/bus ("ghost:verdict" → auto-handler) ── */
+  {
+    const bus = makeBus();
+    const store = makeStubStore();
+    const m = new Monitor.ValidationMonitor({
+      bus,
+      candleLookup: () => null,
+      store: { savePrediction: async () => 0, duePredictions: async () => [] },
+      conformalStore: store,
+      ghostPersistEvery: 1000,
+    });
+    m.start();
+
+    // Emit on bus, the wired listener should call onGhostVerdict async
+    bus.emit("ghost:verdict", makeVerdictEvent({
+      symbol: "XRPUSDT", tf: "1h",
+      perBar: [
+        { covered: true,  absError: 0.05, realizedClose: 1, realizedDir: "up" },
+        { covered: false, absError: 0.15, realizedClose: 1, realizedDir: "up" },
+      ],
+    }));
+    // Give the microtask queue a chance to flush
+    await new Promise(r => setTimeout(r, 10));
+
+    log("bus-emitted ghost:verdict routes to handler",
+        m.stats.ghostVerdicts === 1);
+    log("RC present after bus wire",
+        m.ghostRC("XRPUSDT", "1h") instanceof Conformal.RollingConformal);
+    log("ghost:calibration was re-emitted on bus",
+        bus.emitted.some(([t]) => t === "ghost:calibration"));
+
+    m.stop();
+  }
+
+  /* ── 6.e: Malformed event → silent no-op, no state mutation ── */
+  {
+    const bus = makeBus();
+    const store = makeStubStore();
+    const m = new Monitor.ValidationMonitor({
+      bus,
+      candleLookup: () => null,
+      store: { savePrediction: async () => 0, duePredictions: async () => [] },
+      conformalStore: store,
+    });
+    m.start();
+    const snap = { ...m.stats };
+    await m.onGhostVerdict(null);
+    await m.onGhostVerdict({});
+    await m.onGhostVerdict({ symbol: "X", tf: "1m" });    // no verdict
+    await m.onGhostVerdict({ symbol: "X", tf: "1m", verdict: {} });  // no perBar
+    log("null event → no-op", m.stats.ghostVerdicts === snap.ghostVerdicts);
+    log("malformed events → no-op", m.stats.ghostVerdicts === snap.ghostVerdicts);
+    log("no RCs created by malformed events", m.ghostRC("X", "1m") === null);
+    m.stop();
+  }
+
+  /* ── 6.f: reset() clears ghost state ── */
+  {
+    const bus = makeBus();
+    const store = makeStubStore();
+    const m = new Monitor.ValidationMonitor({
+      bus, candleLookup: () => null,
+      store: { savePrediction: async () => 0, duePredictions: async () => [] },
+      conformalStore: store,
+    });
+    m.start();
+    await m.onGhostVerdict(makeVerdictEvent({
+      perBar: [{ covered: true, absError: 0.1, realizedClose: 1, realizedDir: "up" }],
+    }));
+    log("RC exists before reset", m.ghostRC("BTCUSDT", "1m") != null);
+    log("ghostVerdicts === 1 before reset", m.stats.ghostVerdicts === 1);
+    m.reset();
+    log("RC cleared after reset", m.ghostRC("BTCUSDT", "1m") === null);
+    log("stats.ghostVerdicts reset to 0", m.stats.ghostVerdicts === 0);
+    log("stats.ghostScoresPushed reset to 0", m.stats.ghostScoresPushed === 0);
+    log("stats.ghostWrites reset to 0", m.stats.ghostWrites === 0);
+    m.stop();
   }
 }
 

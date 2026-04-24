@@ -41,6 +41,11 @@ import {
   psi,
   levelFromPSI,
 } from "./drift.js";
+// Phase 11 — ghost-verdict feedback loop:
+// RollingConformal eats realized per-bar errors and closes the loop
+// between Phase-11 ghost forecasts and Phase-9 conformal widths.
+import { RollingConformal } from "../ml/conformal.js";
+import * as DefaultConformalStore from "../ml/conformalStore.js";
 
 const DEFAULTS = {
   graceMs: 4_000,
@@ -53,6 +58,11 @@ const DEFAULTS = {
   psiBaselineMin: 200,
   psiBins: 10,
   psiMajor: 0.25,
+  // Ghost-verdict feedback loop -----------------------------------------
+  ghostConformalCapacity: 500,
+  ghostConformalAlpha:    0.1,
+  ghostPersistEvery:      25,     // write RC → IDB every N pushed scores
+  ghostVersion:           "phase11-feedback-1",
 };
 
 /**
@@ -102,9 +112,19 @@ export class ValidationMonitor {
     this.store = opts.store || Store;
     this.bus = opts.bus;
     this.candleLookup = opts.candleLookup;
+    this.conformalStore = opts.conformalStore ?? DefaultConformalStore;
     this.opts = { ...DEFAULTS, ...opts };
     /** @type {Map<string, ReturnType<typeof makeDriftBundle>>} */
     this.drift = new Map();
+    // Ghost-verdict feedback state ----------------------------------------
+    /** @type {Map<string, RollingConformal>} keyed by `${symbol}|${tf}` */
+    this.ghostConformal = new Map();
+    /** @type {Map<string, number>} cached IDB row ids for write-in-place */
+    this.ghostRowIds = new Map();
+    /** @type {Map<string, number>} pushes since last persistence per key */
+    this.ghostWriteCounter = new Map();
+    /** @type {Map<string, Promise<void>>} coalesce concurrent hydrations */
+    this.ghostHydrations = new Map();
     this.stopped = false;
     this.unsubscribers = [];
     this.stats = {
@@ -113,6 +133,9 @@ export class ValidationMonitor {
       errors: 0,
       driftsDetected: 0,
       missing: 0,
+      ghostVerdicts: 0,
+      ghostScoresPushed: 0,
+      ghostWrites: 0,
     };
   }
 
@@ -123,14 +146,23 @@ export class ValidationMonitor {
       this.unsubscribers.push(
         this.bus.on("candle:closed", (e) => this._onCandleClosed(e)),
       );
+      // Phase-11 feedback: when a ghost's horizon fully resolves, push its
+      // realized per-bar errors into the rolling conformal window so the
+      // next forecast's band reflects actual path error, not the ATR·√h
+      // heuristic fallback.
+      this.unsubscribers.push(
+        this.bus.on("ghost:verdict", (e) => {
+          this.onGhostVerdict(e).catch((err) => {
+            try { this.bus.emit("validation:error", { error: err?.message || String(err), source: "ghost:verdict" }); } catch {}
+          });
+        }),
+      );
       // If the app visibility wakes, sweep once to catch missed windows.
-      if (typeof this.bus.on === "function") {
-        this.unsubscribers.push(
-          this.bus.on("visibility", ({ visible }) => {
-            if (visible) this.tick().catch(() => { /* swallow */ });
-          }),
-        );
-      }
+      this.unsubscribers.push(
+        this.bus.on("visibility", ({ visible }) => {
+          if (visible) this.tick().catch(() => { /* swallow */ });
+        }),
+      );
     }
     return this;
   }
@@ -365,6 +397,209 @@ export class ValidationMonitor {
   /** All bundle keys. */
   keys() { return Array.from(this.drift.keys()); }
 
+  /* ───────────── Phase 11 · Ghost-verdict feedback loop ───────────── */
+
+  /**
+   * Consume a `ghost:verdict` event (emitted by `ghostStore.resolveGhosts`
+   * when a forecast's horizon is fully resolved).  Each per-bar realized
+   * error is pushed into the per-(symbol, tf) `RollingConformal`, closing
+   * the loop between the Phase-11 projections and the Phase-9 calibrator.
+   * Coverage + |residual| also feed the existing `kind:"interval"` drift
+   * bundle so ADWIN / PH / PSI detectors fire off ghost outcomes too.
+   *
+   * Emits:
+   *   - `ghost:calibration` → `{ symbol, tf, q, samples, coverage, residualMean, … }`
+   *   - `drift:shift`       → on detector trip (source: "ghost")
+   *
+   * Idempotent & tolerant: ignores malformed events; never throws.
+   */
+  async onGhostVerdict(e) {
+    if (!e || typeof e !== "object") return null;
+    const { symbol, tf, verdict } = e;
+    if (!symbol || !tf || !verdict || !Array.isArray(verdict.perBar)) return null;
+
+    this.stats.ghostVerdicts++;
+
+    const key = `${symbol}|${tf}`;
+
+    // Lazy hydrate RC from IDB on first touch for this key.
+    if (!this.ghostConformal.has(key) && !this.ghostRowIds.has(key)) {
+      await this._hydrateGhostConformal(symbol, tf);
+    }
+    let rc = this.ghostConformal.get(key);
+    if (!rc) {
+      rc = new RollingConformal({
+        capacity: this.opts.ghostConformalCapacity,
+        alpha:    this.opts.ghostConformalAlpha,
+      });
+      this.ghostConformal.set(key, rc);
+    }
+
+    // Ghost bars are treated as interval predictions for drift purposes.
+    const { bundle } = this._bundleFor(symbol, tf, "interval");
+
+    let pushed = 0, absSum = 0, absN = 0;
+    let coveredN = 0, coveredTot = 0;
+    let tripped = null;
+
+    for (const pb of verdict.perBar) {
+      if (!pb || typeof pb !== "object") continue;
+
+      if (Number.isFinite(pb.absError) && pb.absError >= 0) {
+        rc.push(pb.absError);
+        pushed++;
+        absSum += pb.absError;
+        absN++;
+        bundle.residuals.push(pb.absError);
+        if (!tripped && bundle.phResid.push(pb.absError)) {
+          tripped = { cause: "ghost-residual-pagehinkley", detector: "PageHinkley" };
+        }
+      }
+
+      if (typeof pb.covered === "boolean") {
+        const cov = pb.covered ? 1 : 0;
+        bundle.coverage.push(cov);
+        coveredTot++;
+        if (pb.covered) coveredN++;
+        if (!tripped && bundle.adwinAcc.push(cov)) {
+          tripped = { cause: "ghost-coverage-adwin", detector: "ADWINLite" };
+        }
+      }
+    }
+
+    this.stats.ghostScoresPushed += pushed;
+
+    // Counter-based write-through: every `ghostPersistEvery` pushes we
+    // serialize the RC and write-in-place via ConformalStore.
+    if (pushed > 0) {
+      const prev = this.ghostWriteCounter.get(key) || 0;
+      const next = prev + pushed;
+      if (next >= this.opts.ghostPersistEvery) {
+        try {
+          await this._persistGhostConformal(key, symbol, tf);
+          this.ghostWriteCounter.set(key, 0);
+        } catch (err) {
+          this.ghostWriteCounter.set(key, next);  // retain, retry next time
+          try { this.bus.emit("validation:error", { error: err?.message || String(err), source: "ghost:verdict:persist" }); } catch {}
+        }
+      } else {
+        this.ghostWriteCounter.set(key, next);
+      }
+    }
+
+    const q = rc.quantile();
+    const calibration = {
+      symbol, tf,
+      key,
+      q:             Number.isFinite(q) ? q : null,
+      samples:       rc.length,
+      alpha:         rc.alpha,
+      coverage:      coveredTot ? coveredN / coveredTot : null,
+      coverageN:     coveredTot,
+      residualMean:  absN ? absSum / absN : null,
+      residualN:     absN,
+      pushed,
+      usedConformal: !!e.usedConformal,
+      alphaGhost:    Number.isFinite(e.alpha) ? e.alpha : null,
+      at:            Date.now(),
+    };
+    try { this.bus.emit("ghost:calibration", calibration); } catch {}
+
+    // PSI opportunistic check (once enough residuals have flowed in).
+    if (!tripped) {
+      const psiEv = this._maybeEmitPSI(bundle);
+      if (psiEv) tripped = psiEv;
+    }
+
+    if (tripped) {
+      this.stats.driftsDetected++;
+      const snapshot = this.kpis(symbol, tf, "interval");
+      const evt = {
+        key:  `${symbol}|${tf}|interval`,
+        symbol, tf,
+        kind: "interval",
+        ...tripped,
+        at:   Date.now(),
+        kpis: snapshot,
+        source: "ghost",
+      };
+      try { this.bus.emit("drift:shift", evt); } catch {}
+    }
+
+    return calibration;
+  }
+
+  /**
+   * Load the most-recent ghost-version RollingConformal blob from
+   * `conformalSets` and hydrate the in-memory cache.  No-op on miss or
+   * backend failure — the next `onGhostVerdict` will just start a fresh RC.
+   */
+  async _hydrateGhostConformal(symbol, tf) {
+    const key = `${symbol}|${tf}`;
+    // Coalesce concurrent hydrations for the same key.
+    if (this.ghostHydrations.has(key)) {
+      try { await this.ghostHydrations.get(key); } catch {}
+      return;
+    }
+    const promise = (async () => {
+      try {
+        if (!this.conformalStore || typeof this.conformalStore.latestConformal !== "function") return;
+        const row = await this.conformalStore.latestConformal({
+          symbol, tf,
+          kind:    "rolling",
+          regime:  null,
+          version: this.opts.ghostVersion,
+        });
+        if (!row || !row.payload) return;
+        const rc = RollingConformal.deserialize(row.payload);
+        this.ghostConformal.set(key, rc);
+        if (row.id != null) this.ghostRowIds.set(key, row.id);
+      } catch (err) {
+        try { this.bus.emit("validation:error", { error: err?.message || String(err), source: "ghost:hydrate" }); } catch {}
+      }
+    })();
+    this.ghostHydrations.set(key, promise);
+    try { await promise; } finally { this.ghostHydrations.delete(key); }
+  }
+
+  /**
+   * Write-through: serialize the cached RC for `key` to `conformalSets`,
+   * reusing the cached row id for write-in-place (avoids row accumulation
+   * across restarts).  Increments `stats.ghostWrites` on success.
+   */
+  async _persistGhostConformal(key, symbol, tf) {
+    if (!this.conformalStore || typeof this.conformalStore.saveConformal !== "function") return null;
+    const rc = this.ghostConformal.get(key);
+    if (!rc) return null;
+    const payload = rc.serialize();
+    const row = {
+      kind:    "rolling",
+      symbol, tf,
+      regime:  null,
+      version: this.opts.ghostVersion,
+      alpha:   rc.alpha,
+      q:       Number.isFinite(rc.q) ? rc.q : null,
+      payload,
+      meta:    { source: "ghost-verdict", samples: rc.length },
+    };
+    const existingId = this.ghostRowIds.get(key);
+    if (existingId != null) row.id = existingId;
+    const id = await this.conformalStore.saveConformal(row);
+    if (id != null) this.ghostRowIds.set(key, id);
+    this.stats.ghostWrites++;
+    return id ?? null;
+  }
+
+  /**
+   * Introspection: return the live RollingConformal for (symbol, tf), or
+   * null.  Used by the UI to read the current q / coverage.
+   */
+  ghostRC(symbol, tf) {
+    return this.ghostConformal.get(`${symbol}|${tf}`) || null;
+  }
+
+  /* ───────────── candle hook ───────────── */
+
   /** Internal: drive a tick from a candle-closed event (if filterable). */
   async _onCandleClosed(e) {
     if (this.stopped) return;
@@ -379,14 +614,21 @@ export class ValidationMonitor {
     }
   }
 
-  /** Reset all drift state (stats + detectors). */
+  /** Reset all drift state (stats + detectors + ghost caches). */
   reset() {
     this.drift.clear();
+    this.ghostConformal.clear();
+    this.ghostRowIds.clear();
+    this.ghostWriteCounter.clear();
+    this.ghostHydrations.clear();
     this.stats.submitted = 0;
     this.stats.validated = 0;
     this.stats.errors = 0;
     this.stats.missing = 0;
     this.stats.driftsDetected = 0;
+    this.stats.ghostVerdicts = 0;
+    this.stats.ghostScoresPushed = 0;
+    this.stats.ghostWrites = 0;
     return this;
   }
 }
