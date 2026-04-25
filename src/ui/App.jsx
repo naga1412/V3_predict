@@ -352,7 +352,38 @@ function useExpectedMove(ta, orch) {
  *
  * Returns null until a TA snapshot + orchestration are available.
  */
-function useGhostCandles(ta, orch, candles, { nBars = 5, alpha = 0.1, symbol, tf } = {}) {
+/**
+ * Map the most-recent candlestick patterns (last ≤ 3 bars) into a single
+ * bias score in [-1, +1].  Bullish patterns push positive, bearish push
+ * negative.  Doji and ambiguous patterns contribute 0.
+ *
+ * The decay across recency-bars matches the ghost forecast's λ=0.18 so
+ * an old pattern doesn't dominate fresh price action.
+ */
+function derivePatternBias(ta) {
+  if (!ta || !Array.isArray(ta.patterns) || ta.patterns.length === 0) return 0;
+  const bullSet = new Set(["hammer", "bullEngulf", "bullHarami", "morningStar", "invHammer"]);
+  const bearSet = new Set(["bearEngulf", "bearHarami", "eveningStar"]);
+  // Walk backwards through the last 3 hits.
+  let score = 0;
+  let weight = 0;
+  const tail = ta.patterns.slice(-3).reverse();
+  for (let r = 0; r < tail.length; r++) {
+    const decay = Math.exp(-0.18 * r);
+    const names = (tail[r] && Array.isArray(tail[r].patterns)) ? tail[r].patterns : [];
+    for (const name of names) {
+      if (bullSet.has(name))      { score += decay;   weight += decay; }
+      else if (bearSet.has(name)) { score -= decay;   weight += decay; }
+      // doji etc → ignore
+    }
+  }
+  if (weight <= 0) return 0;
+  // Average across all sampled patterns; keep bounded to [-1,+1].
+  const v = score / weight;
+  return Math.max(-1, Math.min(1, v));
+}
+
+function useGhostCandles(ta, orch, candles, { nBars = 25, alpha = 0.1, symbol, tf, patternBias = 0 } = {}) {
   const [conformal, setConformal] = useState(null);
 
   // Try to hydrate a previously-calibrated regressor from IDB (fire-and-forget).
@@ -384,12 +415,13 @@ function useGhostCandles(ta, orch, candles, { nBars = 5, alpha = 0.1, symbol, tf
         nBars, alpha,
         conformal,
         candles,
+        patternBias,
       });
     } catch (err) {
       console.warn("[ui] ghost candles failed", err);
       return null;
     }
-  }, [ta, orch, conformal, candles, nBars, alpha]);
+  }, [ta, orch, conformal, candles, nBars, alpha, patternBias]);
 
   // Side-effect: persist each forecast + emit on the bus.  Keyed on
   // anchorTime so a forecast is only stored once per bar-open (subsequent
@@ -2155,12 +2187,12 @@ function FeatureDrawer({ ta }) {
   );
 }
 
-function SignalSidebar({ orch, expected, ghost, ta, candles, regime, symbol }) {
+function SignalSidebar({ orch, expected, ghost, ta, candles, regime, symbol, ghostNBars, setGhostNBars }) {
   return (
     <aside className="sidebar" aria-label="signal-sidebar">
       <TradeSignalCard orch={orch} expected={expected} regime={regime} ta={ta} />
       <HybridDecisionCard orch={orch} ta={ta} />
-      <GhostCandleCard ghost={ghost} ta={ta} />
+      <GhostCandleCard ghost={ghost} ta={ta} nBars={ghostNBars} setNBars={setGhostNBars} />
       <TradeSetupCard orch={orch} expected={expected} ta={ta} />
       <NextCandleCard orch={orch} expected={expected} ta={ta} />
       <MasterBiasCard orch={orch} />
@@ -2180,11 +2212,41 @@ function SignalSidebar({ orch, expected, ghost, ta, candles, regime, symbol }) {
 }
 
 /* ── Ghost candles (Phase 11) — forward-projected OHLC path with ±conformal band */
-function GhostCandleCard({ ghost, ta }) {
-  if (!ghost || !Array.isArray(ghost.bars) || !ghost.bars.length) return null;
+const GHOST_NBAR_OPTIONS = [5, 10, 25, 50];
+
+function GhostCandleCard({ ghost, ta, nBars, setNBars }) {
+  // Even when no forecast (cold start), still render the horizon picker so
+  // the user can configure horizon before data flows.
   const gc = window.__MNP__?.GhostCandles;
-  const summary = gc?.summarizeForecast?.(ghost);
-  if (!summary) return null;
+  const summary = ghost && Array.isArray(ghost.bars) && ghost.bars.length
+    ? gc?.summarizeForecast?.(ghost)
+    : null;
+  if (!summary && (nBars == null || setNBars == null)) return null;
+  const horizonPicker = (typeof setNBars === "function" && Number.isFinite(nBars)) ? (
+    <div style={{ display: "flex", gap: 4, marginTop: 8, fontSize: 10 }}>
+      <span style={{ color: "var(--fg-dim)", alignSelf: "center", marginRight: 4, textTransform: "uppercase", letterSpacing: 1 }}>Horizon</span>
+      {GHOST_NBAR_OPTIONS.map((n) => (
+        <button
+          key={n}
+          type="button"
+          className={"chip-toggle " + (nBars === n ? "on" : "")}
+          style={{ fontSize: 10, padding: "3px 8px" }}
+          onClick={() => setNBars(n)}
+          aria-pressed={nBars === n}>
+          {n}
+        </button>
+      ))}
+    </div>
+  ) : null;
+  if (!summary) {
+    return (
+      <div className="card card-glass">
+        <h3>Ghost Candles <span className="badge">warmup</span></h3>
+        <div style={{ color: "var(--fg-dim)", fontSize: 12 }}>Awaiting orchestration + ATR.</div>
+        {horizonPicker}
+      </div>
+    );
+  }
   const dirTone = summary.direction > 0 ? "bull" : summary.direction < 0 ? "bear" : "flat";
   const dirLabel = summary.direction > 0 ? "LONG" : summary.direction < 0 ? "SHORT" : "FLAT";
   const badgeClass = "badge " + (dirTone === "bull" ? "bull" : dirTone === "bear" ? "bear" : "");
@@ -2254,6 +2316,20 @@ function GhostCandleCard({ ghost, ta }) {
           <div className="v">{ghost.usedConformal ? `CP ${Math.round((1 - ghost.alpha) * 100)}%` : "ATR√h"}</div>
         </div>
       </div>
+      {Number.isFinite(ghost.firstBarBoost) && Math.abs(ghost.firstBarBoost - 1) > 1e-6 && (
+        <div style={{ marginTop: 8, padding: 6, background: "rgba(179,136,255,.08)", border: "1px solid rgba(179,136,255,.25)", borderRadius: 4, fontSize: 11 }}>
+          {ghost.firstBarBoost > 1 ? "Pattern boost · " : "Pattern dampen · "}
+          <b style={{ color: ghost.firstBarBoost > 1 ? "var(--bull)" : "var(--bear)" }}>
+            ×{ghost.firstBarBoost.toFixed(2)}
+          </b>
+          {Number.isFinite(ghost.patternBias) && (
+            <span style={{ color: "var(--fg-dim)", marginLeft: 6 }}>
+              (bias {fmtSigned(ghost.patternBias, 2)})
+            </span>
+          )}
+        </div>
+      )}
+      {horizonPicker}
     </div>
   );
 }
@@ -2628,7 +2704,15 @@ function App() {
     if (!feed.forming || feed.forming.t <= feed.candles[feed.candles.length - 1].t) return feed.candles;
     return [...feed.candles, feed.forming];
   }, [feed.candles, feed.forming]);
-  const ghost = useGhostCandles(ta, orch, ghostAnchorCandles, { nBars: 5, alpha: 0.1, symbol, tf });
+  // Ghost horizon — user-selectable in the GhostCandleCard.
+  const [ghostNBars, setGhostNBars] = useState(25);
+  // Recent candlestick-pattern bias (last ≤ 3 bars).  Returns a number
+  // in [-1, +1]; magnitude scales the first-bar pattern boost.
+  const recentPatternBias = useMemo(() => derivePatternBias(ta), [ta]);
+  const ghost = useGhostCandles(ta, orch, ghostAnchorCandles, {
+    nBars: ghostNBars, alpha: 0.1, symbol, tf,
+    patternBias: recentPatternBias,
+  });
   useGhostResolver(symbol, tf, feed.candles);
 
   // ── Validation signal (Phase 10)
@@ -2681,7 +2765,7 @@ function App() {
               expected={expected} subplots={subplots}
               ghost={ghost}
             />
-            <SignalSidebar orch={orch} expected={expected} ghost={ghost} ta={ta} candles={feed.candles} regime={ta?.regime?.label} symbol={symbol} />
+            <SignalSidebar orch={orch} expected={expected} ghost={ghost} ta={ta} candles={feed.candles} regime={ta?.regime?.label} symbol={symbol} ghostNBars={ghostNBars} setGhostNBars={setGhostNBars} />
           </>
         )}
         {tab === "scanner" && (
@@ -2692,7 +2776,7 @@ function App() {
         {tab === "chat" && (
           <>
             <AIChatPane orch={orch} expected={expected} ta={ta} symbol={symbol} tf={tf} />
-            <SignalSidebar orch={orch} expected={expected} ghost={ghost} ta={ta} candles={feed.candles} regime={ta?.regime?.label} symbol={symbol} />
+            <SignalSidebar orch={orch} expected={expected} ghost={ghost} ta={ta} candles={feed.candles} regime={ta?.regime?.label} symbol={symbol} ghostNBars={ghostNBars} setGhostNBars={setGhostNBars} />
           </>
         )}
         {tab === "system" && (

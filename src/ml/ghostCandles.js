@@ -99,13 +99,18 @@ export function lastCandleTime(candles) {
  * @param {object} ta   TAEngine snapshot (needs ta.close[] and ta.atr14[])
  * @param {object} orch Orchestrator output (uses rawScore / probability / confidence)
  * @param {object} [opts]
- * @param {number} [opts.nBars=5]     how many ghost bars to project
+ * @param {number} [opts.nBars=25]    how many ghost bars to project (capped at 64)
  * @param {number} [opts.alpha=0.1]   target miscoverage (0.1 → 90% interval)
  * @param {object} [opts.conformal]   optional SplitConformalRegressor instance
  *                                    (must expose .interval(yhat) → {lo, hi})
  * @param {Array}  [opts.candles]     bar history (used for tfSec + anchor time)
  * @param {number} [opts.lambda=0.18] drift decay per step (exp(-λ·i))
  * @param {number} [opts.bandK=1.25]  fallback uncertainty = bandK * ATR * sqrt(i+1)
+ * @param {number} [opts.patternBias] recent candlestick-pattern bias in [-1,+1]
+ *                                    (>0 = bullish, <0 = bearish, |.| = strength).
+ *                                    Boosts/dampens the FIRST ghost bar's drift
+ *                                    when sign matches/conflicts with the
+ *                                    orchestrator direction.  Capped at ±0.5.
  * @returns {GhostForecast|null}
  */
 export function predictGhostCandles(ta, orch, opts = {}) {
@@ -121,12 +126,13 @@ export function predictGhostCandles(ta, orch, opts = {}) {
   if (!Number.isFinite(atr) || atr <= 0) return null;
 
   const {
-    nBars = 5,
+    nBars = 25,
     alpha = 0.1,
     conformal = null,
     candles = null,
     lambda = 0.18,
     bandK = 1.25,
+    patternBias = 0,
   } = opts;
 
   // Prefer the provided candle array's last close so that (anchorTime,
@@ -140,10 +146,26 @@ export function predictGhostCandles(ta, orch, opts = {}) {
   }
   if (!Number.isFinite(lastClose)) return null;
 
-  const n = Math.max(1, Math.min(32, Math.floor(nBars)));
+  const n = Math.max(1, Math.min(64, Math.floor(nBars)));
   const bias = Math.max(-1, Math.min(1, orch?.rawScore ?? (orch?.probability != null ? (orch.probability * 2 - 1) : 0)));
   const direction = bias > 1e-6 ? +1 : bias < -1e-6 ? -1 : 0;
   const confidence = Number.isFinite(orch?.confidence) ? orch.confidence : Math.abs(bias);
+
+  // Pattern injection: scale the FIRST ghost bar's drift if a recent
+  // candlestick pattern aligns or conflicts with the orchestrator bias.
+  // - Aligned (same sign):  drift_0 *= (1 + 0.5·|patternBias|)
+  // - Conflicting:           drift_0 *= max(0.4, 1 − 0.5·|patternBias|)
+  // - No pattern (0) or no direction: pass-through.
+  // Subsequent bars are NOT amplified — patterns lose predictive power
+  // beyond the next bar.
+  const pBias = Math.max(-1, Math.min(1, Number.isFinite(patternBias) ? patternBias : 0));
+  let firstBarBoost = 1;
+  if (direction !== 0 && Math.abs(pBias) > 1e-6) {
+    const aligned = (Math.sign(pBias) === direction);
+    firstBarBoost = aligned
+      ? 1 + 0.5 * Math.abs(pBias)
+      : Math.max(0.4, 1 - 0.5 * Math.abs(pBias));
+  }
 
   // Infer TF + anchor from candle array if provided; else fall back to 60 s / now.
   const tfSec = inferTfSeconds(candles || []);
@@ -157,9 +179,11 @@ export function predictGhostCandles(ta, orch, opts = {}) {
   const bars = [];
   let prevClose = lastClose;
   for (let i = 0; i < n; i++) {
-    // Per-step drift: |bias| * ATR, shrinking with horizon
+    // Per-step drift: |bias| * ATR, shrinking with horizon.  First bar
+    // can be amplified/dampened by `firstBarBoost` (pattern injection).
     const decay = Math.exp(-lambda * i);
-    const stepMag = Math.abs(bias) * atr * decay;
+    const localBoost = i === 0 ? firstBarBoost : 1;
+    const stepMag = Math.abs(bias) * atr * decay * localBoost;
     const c = prevClose + direction * stepMag;
     const o = prevClose;
     const body = 0.45 * atr * decay;
@@ -200,6 +224,8 @@ export function predictGhostCandles(ta, orch, opts = {}) {
     usedConformal: hasConformal,
     alpha,
     lambda,
+    patternBias: pBias,
+    firstBarBoost,
   };
 }
 

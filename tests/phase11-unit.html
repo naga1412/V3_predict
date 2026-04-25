@@ -50,16 +50,27 @@ python -m http.server 3000
 
 <div id="out">running…</div>
 
-<!-- Static-import shim: modules linked at module-graph time; result stashed
-     on window.__p11 for the runner block below. -->
+<!-- Dynamic-import shim with cache-bust ?v= so the browser HTTP cache and
+     a previous SW cache cannot shadow freshly-edited modules during dev.
+     We use dynamic import() rather than static <script type="module"> for
+     this reason: static specifiers don't accept the cache-busting query
+     to be appended at runtime. -->
 <script type="module">
-  import * as Schema      from "../src/data/schema.js";
-  import * as IDB         from "../src/data/idb.js";
-  import * as Conformal   from "../src/ml/conformal.js";
-  import * as Ghost       from "../src/ml/ghostCandles.js";
-  import * as GhostStore  from "../src/ml/ghostStore.js";
-  import * as Monitor     from "../src/validation/monitor.js";
-  window.__p11 = { Schema, IDB, Conformal, Ghost, GhostStore, Monitor, ok: true };
+  const V = "phase11.2-" + Date.now();
+  const U = (p) => new URL(`${p}?v=${V}`, location.href).href;
+  try {
+    const [Schema, IDB, Conformal, Ghost, GhostStore, Monitor] = await Promise.all([
+      import(U("../src/data/schema.js")),
+      import(U("../src/data/idb.js")),
+      import(U("../src/ml/conformal.js")),
+      import(U("../src/ml/ghostCandles.js")),
+      import(U("../src/ml/ghostStore.js")),
+      import(U("../src/validation/monitor.js")),
+    ]);
+    window.__p11 = { Schema, IDB, Conformal, Ghost, GhostStore, Monitor, ok: true };
+  } catch (err) {
+    window.__p11 = { ok: false, err };
+  }
   window.dispatchEvent(new CustomEvent("p11-ready"));
 </script>
 
@@ -664,7 +675,7 @@ group("Fixture 6 · ValidationMonitor.onGhostVerdict → RollingConformal feedba
     const calib = await m.onGhostVerdict(evt);
     log("onGhostVerdict returns calibration snapshot", calib && calib.symbol === "BTCUSDT");
     log("RC was created for (symbol,tf)",
-        m.ghostRC("BTCUSDT", "1m") instanceof Conformal.RollingConformal);
+        !!m.ghostRC("BTCUSDT", "1m") && typeof m.ghostRC("BTCUSDT", "1m").push === "function");
     const rc = m.ghostRC("BTCUSDT", "1m");
     log("RC.length === 4 after 4 absErrors", rc.length === 4);
     log("calib.pushed === 4", calib.pushed === 4);
@@ -803,7 +814,7 @@ group("Fixture 6 · ValidationMonitor.onGhostVerdict → RollingConformal feedba
       ],
     }));
     const hydrated = m.ghostRC("SOLUSDT", "15m");
-    log("RC hydrated on first touch", hydrated instanceof Conformal.RollingConformal);
+    log("RC hydrated on first touch", !!hydrated && typeof hydrated.push === "function" && typeof hydrated.quantile === "function");
     log("hydrated RC carries prior samples + 1 new (length=4)",
         hydrated.length === 4);
     log("store.loaded === 1 (one hydration call)", store.loaded === 1);
@@ -846,7 +857,7 @@ group("Fixture 6 · ValidationMonitor.onGhostVerdict → RollingConformal feedba
     log("bus-emitted ghost:verdict routes to handler",
         m.stats.ghostVerdicts === 1);
     log("RC present after bus wire",
-        m.ghostRC("XRPUSDT", "1h") instanceof Conformal.RollingConformal);
+        !!m.ghostRC("XRPUSDT", "1h") && typeof m.ghostRC("XRPUSDT", "1h").push === "function");
     log("ghost:calibration was re-emitted on bus",
         bus.emitted.some(([t]) => t === "ghost:calibration"));
 
@@ -896,6 +907,119 @@ group("Fixture 6 · ValidationMonitor.onGhostVerdict → RollingConformal feedba
     log("stats.ghostScoresPushed reset to 0", m.stats.ghostScoresPushed === 0);
     log("stats.ghostWrites reset to 0", m.stats.ghostWrites === 0);
     m.stop();
+  }
+}
+
+/* ════════════════════════════════════ Fixture 7 — horizon cap (50) + pattern injection ════════════════════════════════════ */
+group("Fixture 7 · v2-scale horizon (cap 64) + pattern-bias first-bar boost/dampen");
+{
+  const ta    = makeTA({ close: [99, 100], atr: 1 });
+  const orch  = makeOrch({ rawScore: 0.4, confidence: 0.7 });        // bull bias
+  const cands = makeCandles({ n: 2, start: 99, step: 1, tfSec: 60 });
+
+  /* ── 7.a: nBars=50 is allowed (was capped at 32 before this step) ── */
+  {
+    const f = Ghost.predictGhostCandles(ta, orch, { nBars: 50, candles: cands });
+    log("nBars=50 produces 50 bars (cap raised to 64)",
+        f && Array.isArray(f.bars) && f.bars.length === 50);
+    // 64 caps to 64
+    const f2 = Ghost.predictGhostCandles(ta, orch, { nBars: 100, candles: cands });
+    log("nBars=100 clamped to 64", f2 && f2.bars.length === 64);
+    // Default is now 25
+    const f3 = Ghost.predictGhostCandles(ta, orch, { candles: cands });
+    log("default nBars === 25", f3 && f3.bars.length === 25);
+  }
+
+  /* ── 7.b: pattern-aligned (same sign as bias) → first bar boosted ── */
+  {
+    const fNo = Ghost.predictGhostCandles(ta, orch, { nBars: 5, candles: cands });
+    const fAligned = Ghost.predictGhostCandles(ta, orch, {
+      nBars: 5, candles: cands, patternBias: 0.8,   // bull pattern, bull bias
+    });
+    log("aligned: firstBarBoost > 1", fAligned.firstBarBoost > 1);
+    log("aligned: firstBarBoost === 1 + 0.5·0.8 = 1.4",
+        close(fAligned.firstBarBoost, 1.4, 1e-9));
+    // First bar drift should be 1.4× larger
+    const driftNo      = fNo.bars[0].c - fNo.anchorClose;
+    const driftAligned = fAligned.bars[0].c - fAligned.anchorClose;
+    log("aligned: drift_0 ≈ 1.4·baseline drift_0",
+        close(driftAligned, driftNo * 1.4, 1e-9));
+    // Bar 1 (i=1) should NOT be boosted — only bar 0 changes
+    const drift1No      = fNo.bars[1].c - fNo.bars[0].c;
+    const drift1Aligned = fAligned.bars[1].c - fAligned.bars[0].c;
+    log("aligned: bar 1 unaffected by pattern boost",
+        close(drift1Aligned, drift1No, 1e-9));
+    log("forecast carries patternBias=0.8 in output",
+        close(fAligned.patternBias, 0.8, 1e-12));
+  }
+
+  /* ── 7.c: pattern-conflicting (opposite sign) → first bar dampened ── */
+  {
+    const fNo = Ghost.predictGhostCandles(ta, orch, { nBars: 4, candles: cands });
+    const fOpposed = Ghost.predictGhostCandles(ta, orch, {
+      nBars: 4, candles: cands, patternBias: -0.8,   // bear pattern, bull bias
+    });
+    log("conflicting: firstBarBoost < 1", fOpposed.firstBarBoost < 1);
+    log("conflicting: firstBarBoost === max(0.4, 1 - 0.5·0.8) = 0.6",
+        close(fOpposed.firstBarBoost, 0.6, 1e-9));
+    const driftNo      = fNo.bars[0].c - fNo.anchorClose;
+    const driftOpposed = fOpposed.bars[0].c - fOpposed.anchorClose;
+    log("conflicting: drift_0 ≈ 0.6·baseline drift_0",
+        close(driftOpposed, driftNo * 0.6, 1e-9));
+    // Direction should still be the same (we only scale magnitude)
+    log("conflicting: direction unchanged",
+        fOpposed.direction === fNo.direction && fNo.direction === 1);
+  }
+
+  /* ── 7.d: dampen floor — never below 0.4× (strong opposing pattern) ── */
+  {
+    const f = Ghost.predictGhostCandles(ta, orch, {
+      nBars: 3, candles: cands, patternBias: -1,  // max-strength conflict
+    });
+    log("max conflict floors at 0.5 (1 - 0.5·1 = 0.5, > floor 0.4)",
+        close(f.firstBarBoost, 0.5, 1e-9));
+  }
+
+  /* ── 7.e: zero/null patternBias is a no-op ── */
+  {
+    const fNo  = Ghost.predictGhostCandles(ta, orch, { nBars: 3, candles: cands });
+    const fZero = Ghost.predictGhostCandles(ta, orch, {
+      nBars: 3, candles: cands, patternBias: 0,
+    });
+    log("patternBias=0: firstBarBoost === 1", fZero.firstBarBoost === 1);
+    log("patternBias=0: drift identical to no-pattern path",
+        close(fZero.bars[0].c, fNo.bars[0].c, 1e-12));
+    // Non-finite is also a no-op
+    const fNaN = Ghost.predictGhostCandles(ta, orch, {
+      nBars: 3, candles: cands, patternBias: NaN,
+    });
+    log("patternBias=NaN: treated as 0 (no boost)", fNaN.firstBarBoost === 1);
+  }
+
+  /* ── 7.f: flat orchestrator bias (direction=0) → no pattern effect ── */
+  {
+    const flatOrch = makeOrch({ rawScore: 0, confidence: 0.5 });
+    const f = Ghost.predictGhostCandles(makeTA({ close: [100, 100], atr: 1 }), flatOrch, {
+      nBars: 3, candles: cands, patternBias: 0.9,
+    });
+    log("direction=0: firstBarBoost === 1 (no pattern path)",
+        f.firstBarBoost === 1);
+  }
+
+  /* ── 7.g: bear bias × bear pattern → boosted DOWN, not up ── */
+  {
+    const bearOrch = makeOrch({ rawScore: -0.5, confidence: 0.7 });
+    const bearTa   = makeTA({ close: [101, 100], atr: 1 });
+    const fNo      = Ghost.predictGhostCandles(bearTa, bearOrch, { nBars: 3, candles: cands });
+    const fAligned = Ghost.predictGhostCandles(bearTa, bearOrch, {
+      nBars: 3, candles: cands, patternBias: -0.6,  // bear pattern + bear bias
+    });
+    log("bear+bear: aligned, firstBarBoost === 1.3",
+        close(fAligned.firstBarBoost, 1.3, 1e-9));
+    const driftNo      = fNo.bars[0].c - fNo.anchorClose;        // negative
+    const driftAligned = fAligned.bars[0].c - fAligned.anchorClose;
+    log("bear+bear: aligned drift more negative",
+        driftAligned < driftNo && driftAligned < 0);
   }
 }
 
