@@ -67,6 +67,9 @@ import * as GhostCandles from "../ml/ghostCandles.js";
 import * as GhostStore   from "../ml/ghostStore.js";
 // M3 step 5 — Enhanced volume profile (VAH/VAL/POC/HVN/LVN/TPO)
 import * as VolumeProfile from "../ta/profile/volumeProfileEnhanced.js";
+// M3 step 6 — Trendlines + chart patterns
+import * as Trendlines    from "../ta/structure/trendlines.js";
+import * as ChartPatterns from "../ta/patterns/chartPatterns.js";
 // Phase 10 — Auto-validation + drift monitor
 import * as PredictionStore from "../validation/predictionStore.js";
 import * as Validator from "../validation/validator.js";
@@ -144,13 +147,16 @@ export async function boot() {
     GhostStore,
     // M3 step 5
     VolumeProfile,
+    // M3 step 6
+    Trendlines,
+    ChartPatterns,
     // Phase 10
     PredictionStore,
     Validator,
     Drift,
     ValidationMonitor,
     createDefaultMonitor,
-    version: "3.0.0-m3.5",
+    version: "3.0.0-m3.6",
   };
 
   // Degrade decisions ------------------------------------------------------

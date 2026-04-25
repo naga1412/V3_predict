@@ -249,7 +249,7 @@ group("meta · CISD module shape");
 
 group("registry · CISD registered as 13th module");
 {
-  log("registry length === 13", Registry.MODULES.length === 13);
+  log("registry length >= 13 (CISD landed)", Registry.MODULES.length >= 13);
   log("cisd is in MODULES_BY_ID", !!Registry.MODULES_BY_ID.cisd);
   log("cisd is in listModules()",
     Registry.listModules().some(m => m.id === "cisd"));

@@ -377,7 +377,7 @@ group("module: sessionCalendar");
 group("registry");
 {
   log("MODULES is an array", Array.isArray(Registry.MODULES));
-  log("MODULES has 13 entries (12 baseline + CISD)", Registry.MODULES.length === 13);
+  log("MODULES has 15 entries (12 baseline + CISD + Trendline + ChartPatterns)", Registry.MODULES.length === 15);
 
   const ids = Registry.MODULES.map(m => m.meta.id);
   const uniqueIds = new Set(ids);
@@ -392,7 +392,7 @@ group("registry");
   log("getModule('nonexistent') returns null", Registry.getModule("nonexistent") === null);
 
   const list = Registry.listModules();
-  log("listModules returns array of meta copies", Array.isArray(list) && list.length === 13 && list[0].id);
+  log("listModules returns array of meta copies", Array.isArray(list) && list.length === 15 && list[0].id);
 
   // meta freezes
   const m0 = Registry.MODULES[0];
@@ -405,7 +405,7 @@ group("orchestrator");
 {
   const r = Orchestrator.runModules(taUp);
   log("result has signals array", Array.isArray(r.signals));
-  log("signals length = 13 (12 baseline + CISD)", r.signals.length === 13);
+  log("signals length = 15 (13 + Trendline + ChartPatterns)", r.signals.length === 15);
   log("rawScore in [-1,+1]", r.rawScore >= -1 && r.rawScore <= 1);
   log("probability in [0,1]", r.probability >= 0 && r.probability <= 1);
   log("uptrend → probability > 0.5", r.probability > 0.5);
@@ -423,7 +423,7 @@ group("orchestrator");
 
   // exclude filter
   const r3 = Orchestrator.runModules(taUp, { exclude: ["session-calendar"] });
-  log("exclude-filter removes a module", r3.signals.length === 12);
+  log("exclude-filter removes a module", r3.signals.length === 14);
 
   // weights override
   const r4 = Orchestrator.runModules(taUp, { weights: { "trend-follow": 10 } });
@@ -448,7 +448,7 @@ group("orchestrator");
   // all 13 signals should still be produced (with clamped shape).
   const pathTA = { close: undefined, ema20: undefined, bb_20_2: null };
   const rErr = Orchestrator.runModules(pathTA);
-  log("pathological TA returns all 13 signals", rErr.signals.length === 13);
+  log("pathological TA returns all 15 signals", rErr.signals.length === 15);
   log("pathological run yields finite rawScore", Number.isFinite(rErr.rawScore));
   log("pathological run yields probability in [0,1]",
     rErr.probability >= 0 && rErr.probability <= 1);

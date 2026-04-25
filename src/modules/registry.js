@@ -22,6 +22,9 @@ import * as liquidity from "./liquidity.js";
 import * as premiumDiscount from "./premiumDiscount.js";
 import * as sessionCalendar from "./sessionCalendar.js";
 import * as cisd from "./cisd.js";
+// M3 step 6 — geometric structure
+import * as trendline from "./trendline.js";
+import * as chartPatterns from "./chartPatterns.js";
 
 export const MODULES = Object.freeze([
   trendFollow,
@@ -37,6 +40,8 @@ export const MODULES = Object.freeze([
   premiumDiscount,
   sessionCalendar,
   cisd,
+  trendline,
+  chartPatterns,
 ]);
 
 export const MODULES_BY_ID = Object.freeze(

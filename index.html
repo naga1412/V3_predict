@@ -66,7 +66,7 @@
 <!-- The ?v= query busts the browser's ES-module graph cache when we change  -->
 <!-- the data-layer surface exposed on window.__MNP__.                         -->
 <script type="module">
-  const V = "m3.5-1";
+  const V = "m3.6-1";
   // Pick the first non-data: URL as the resolution base.
   function findBase() {
     for (const u of [window.location?.href, document.baseURI, import.meta.url]) {
@@ -90,21 +90,18 @@
   });
 </script>
 
-<!-- App (Babel-transpiled JSX; in production we will precompile via SW cache).
-     Inject the babel <script> dynamically: append ?v=… on http(s) so the
-     browser HTTP cache + SW shell cache don't shadow fresh edits, but skip
-     the query on file:// (Chrome rejects query strings on filesystem URLs). -->
+<!-- App (Babel-transpiled JSX).  Two variants for file:// vs http(s):
+     · file:// ignores query strings, so use the bare path.
+     · http(s) needs ?v=… so the browser HTTP cache + a previously-cached
+       SW shell entry can't shadow fresh edits.  Babel-standalone only
+       processes <script type="text/babel"> tags that are present on
+       DOMContentLoaded — DON'T inject this dynamically. -->
 <script>
-(function(){
-  var s = document.createElement("script");
-  s.type = "text/babel";
-  s.setAttribute("data-type",   "module");
-  s.setAttribute("data-presets","env,react");
-  var isFile = location.protocol === "file:";
-  s.src = isFile ? "./src/ui/App.jsx"
-                 : "./src/ui/App.jsx?v=m3.5-1";
-  document.body.appendChild(s);
-})();
+  if (location.protocol === "file:") {
+    document.write('<script type="text/babel" data-type="module" data-presets="env,react" src="./src/ui/App.jsx"><\/script>');
+  } else {
+    document.write('<script type="text/babel" data-type="module" data-presets="env,react" src="./src/ui/App.jsx?v=m3.6-2"><\/script>');
+  }
 </script>
 
 </body>

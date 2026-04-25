@@ -1,0 +1,373 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>MNP · M3 step 6 — Trendlines + Chart Patterns unit tests</title>
+<style>
+  body { background:#131722; color:#d1d4dc; font:13px/1.5 monospace; padding:20px; }
+  .pass { color:#26a69a; }
+  .fail { color:#ef5350; }
+  .group { margin-top: 12px; font-weight:bold; color:#2962ff; }
+  h1 { color:#fff; font-size:18px; }
+  #out { white-space: pre-wrap; }
+  .note { color:#787b86; }
+  .summary { margin-top: 16px; padding: 8px; border:1px solid #2a2e39; }
+</style>
+</head>
+<body>
+<h1>MNP — M3 step 6 · Trendlines + Chart Patterns</h1>
+
+<script>
+  if (location.protocol === "file:") {
+    document.addEventListener("DOMContentLoaded", () => {
+      document.body.innerHTML = `
+        <h1 style="color:#fff">phase23 test harness</h1>
+        <div style="background:#3a1d1d;border:1px solid #ef5350;padding:16px;margin-top:16px;border-radius:4px">
+          <div style="color:#ef5350;font-weight:bold">Run on http://localhost (not file://)</div>
+          <pre style="background:#1a1e2a;padding:10px;margin-top:10px;color:#26a69a">cd v3 && python -m http.server 3131</pre>
+        </div>`;
+    });
+    throw new Error("file:// origin");
+  }
+</script>
+
+<div id="out">running…</div>
+
+<script type="module">
+const out = document.getElementById("out");
+window.addEventListener("error", (e) => {
+  out.innerHTML += `<span class="fail">✗ ${e.message}</span>\n<span class="note">${e.filename}:${e.lineno}:${e.colno}</span>\n`;
+});
+window.addEventListener("unhandledrejection", (e) => {
+  out.innerHTML += `<span class="fail">✗ unhandled: ${e.reason?.message || e.reason}</span>\n<span class="note">${e.reason?.stack || ''}</span>\n`;
+});
+
+const V = "p23-" + Date.now();
+const U = (p) => new URL(`${p}?v=${V}`, location.href).href;
+
+const TL = await import(U("../src/ta/structure/trendlines.js"));
+const CP = await import(U("../src/ta/patterns/chartPatterns.js"));
+const TLMod = await import(U("../src/modules/trendline.js"));
+const CPMod = await import(U("../src/modules/chartPatterns.js"));
+
+let n = 0, p = 0;
+const log = (s, ok, err) => {
+  out.innerHTML += `<span class="${ok?'pass':'fail'}">${ok?'✓':'✗'} ${s}${err ? ' — ' + err : ''}</span>\n`;
+  n++; if (ok) p++;
+};
+const group = (s) => { out.innerHTML += `\n<span class="group">[${s}]</span>\n`; };
+const close = (a, b, eps=1e-7) => Math.abs(a - b) <= eps;
+
+/* ─── Synthetic candle helpers ─── */
+function makeCandle(t, o, h, l, c, v=1) {
+  return { t, time: Math.floor(t/1000), o, h, l, c, v };
+}
+/** Build a noisy linear path: closes follow y = m*x + b + noise. */
+function linearCandles(n, m, b, noiseAmp=0.0, tStart=0, dt=60_000) {
+  const cs = [];
+  let lastClose = b;
+  for (let i = 0; i < n; i++) {
+    const target = m * i + b + (noiseAmp ? (Math.sin(i * 0.7) * noiseAmp) : 0);
+    const c = target;
+    const o = lastClose;
+    const h = Math.max(o, c) + 0.05;
+    const l = Math.min(o, c) - 0.05;
+    cs.push(makeCandle(tStart + i * dt, o, h, l, c, 1));
+    lastClose = c;
+  }
+  return cs;
+}
+
+/* ════════════ leastSquares ════════════ */
+group("leastSquares · math");
+{
+  const f1 = TL.leastSquares([{x:0,y:0},{x:1,y:1},{x:2,y:2},{x:3,y:3}]);
+  log("perfect line · slope === 1",     close(f1.slope, 1));
+  log("perfect line · intercept === 0", close(f1.intercept, 0));
+  log("perfect line · r² === 1",        close(f1.r2, 1));
+
+  const f2 = TL.leastSquares([{x:0,y:1},{x:1,y:3},{x:2,y:5}]);
+  log("y = 2x+1 · slope === 2",     close(f2.slope, 2));
+  log("y = 2x+1 · intercept === 1", close(f2.intercept, 1));
+
+  const f3 = TL.leastSquares([{x:0,y:1},{x:1,y:1.1},{x:2,y:0.9},{x:3,y:1.05}]);
+  log("flat data · slope ≈ 0", Math.abs(f3.slope) < 0.05);
+  log("flat data · low r²",     f3.r2 < 0.5);
+
+  // Empty / degenerate
+  log("empty input → r² 0",     TL.leastSquares([]).r2 === 0);
+  log("single point → r² 0",    TL.leastSquares([{x:0,y:0}]).r2 === 0);
+  log("vertical line (sxx=0) → slope 0",
+      TL.leastSquares([{x:5,y:1},{x:5,y:2},{x:5,y:3}]).slope === 0);
+}
+
+/* ════════════ touchPoints ════════════ */
+group("touchPoints · within tolerance");
+{
+  const line = { slope: 1, intercept: 0 };
+  const pts = [
+    { x: 0, y: 0 },
+    { x: 1, y: 1.1 },
+    { x: 2, y: 1.9 },
+    { x: 3, y: 4 },     // far away
+    { x: 4, y: 4 },
+  ];
+  const within = TL.touchPoints(line, pts, 0.2);
+  // y=0 (dist 0), y=1.1 (dist 0.1), y=1.9 (dist 0.1), y=4 (dist 1, OUT), y=4 at x=4 (dist 0)
+  log("within 0.2 returns 4 points", within.length === 4);
+  const all = TL.touchPoints(line, pts, 5);
+  log("within 5 returns all 5",      all.length === 5);
+  log("non-finite line → []",        TL.touchPoints({slope: NaN, intercept: 0}, pts, 0.5).length === 0);
+}
+
+/* ════════════ detectTrendlines · ascending channel ════════════ */
+group("detectTrendlines · ascending parallel channel");
+{
+  // Build 60 candles where lows track y=0.05x and highs track y=0.05x+5
+  const cs = [];
+  for (let i = 0; i < 60; i++) {
+    const trend = 0.05 * i;
+    const phase = i % 6;        // creates clean swing tops/bottoms every 6 bars
+    let mid;
+    if (phase === 0) mid = trend + 5.0;        // top
+    else if (phase === 3) mid = trend + 0.0;  // bottom
+    else mid = trend + (phase < 3 ? 4 - phase : phase - 3);
+    cs.push(makeCandle(i*60_000, mid - 0.05, mid + 0.2, mid - 0.2, mid + 0.05, 1));
+  }
+  const tl = TL.detectTrendlines(cs, { atr: 1, lookback: 8 });
+  log("upper trendline produced",     !!tl.upper);
+  log("lower trendline produced",     !!tl.lower);
+  log("upper slope > 0 (ascending)",  tl.upper && tl.upper.slope > 0);
+  log("lower slope > 0 (ascending)",  tl.lower && tl.lower.slope > 0);
+  log("upper r² high (>= 0.85)",      tl.upper && tl.upper.r2 >= 0.85);
+  log("lower r² high (>= 0.85)",      tl.lower && tl.lower.r2 >= 0.85);
+  log("touches >= 4 on upper",        tl.upper && tl.upper.touches >= 4);
+  log("score = r² × min(touches/4,1)",
+      tl.upper && close(tl.upper.score, tl.upper.r2 * Math.min(1, tl.upper.touches / 4), 1e-9));
+  log("channel.parallel === true",    tl.channel.parallel === true);
+  log("channel.widthATR finite + > 0", Number.isFinite(tl.channel.widthATR) && tl.channel.widthATR > 0);
+  log("meta.lastBarIdx === n-1",      tl.meta.lastBarIdx === cs.length - 1);
+}
+
+/* ════════════ detectTrendlines · breakout ════════════ */
+group("detectTrendlines · breakout");
+{
+  // Build a flat-top range, then a strong upside breakout in the last bar.
+  const cs = [];
+  for (let i = 0; i < 30; i++) {
+    const phase = i % 6;
+    let mid;
+    if (phase === 0) mid = 100;
+    else if (phase === 3) mid = 96;
+    else mid = phase < 3 ? 99 : 97;
+    cs.push(makeCandle(i*60_000, mid, mid + 0.2, mid - 0.2, mid, 1));
+  }
+  // Inject a clear upside break: last candle closes 3 ATRs (= 3) above 100 (the upper line).
+  cs.push(makeCandle(30*60_000, 100, 103.5, 99.9, 103, 1));
+  const tl = TL.detectTrendlines(cs, { atr: 1, lookback: 8, breakoutATR: 0.5 });
+  log("breakout fired", !!tl.lastBreakout);
+  log("breakout side === 'up'", tl.lastBreakout?.side === "up");
+  log("breakout strength clamped to [0,1]",
+      tl.lastBreakout?.strength >= 0 && tl.lastBreakout?.strength <= 1);
+  log("breakout distATR > 0", tl.lastBreakout?.distATR > 0);
+
+  // No-break case: last close stays inside the range
+  const cs2 = cs.slice(0, -1);
+  cs2.push(makeCandle(30*60_000, 99, 100.3, 98.5, 99, 1));
+  const tl2 = TL.detectTrendlines(cs2, { atr: 1, lookback: 8 });
+  log("no breakout when close stays inside", tl2.lastBreakout === null);
+}
+
+/* ════════════ positionInChannel ════════════ */
+group("positionInChannel");
+{
+  const upper = { slope: 0, intercept: 110 };
+  const lower = { slope: 0, intercept: 100 };
+  const tl = { upper, lower };
+  log("midline → 0",     close(TL.positionInChannel(tl, 50, 105), 0));
+  log("upper line → +1", close(TL.positionInChannel(tl, 50, 110), 1));
+  log("lower line → -1", close(TL.positionInChannel(tl, 50, 100), -1));
+  log("missing line → NaN", Number.isNaN(TL.positionInChannel({upper}, 0, 105)));
+}
+
+/* ════════════ trendline orchestrator ════════════ */
+group("trendline module · evaluate");
+{
+  // Strong ascending channel + breakout → bullish signal
+  const cs = [];
+  for (let i = 0; i < 60; i++) {
+    const trend = 0.08 * i;
+    const phase = i % 6;
+    let mid;
+    if (phase === 0) mid = trend + 5;
+    else if (phase === 3) mid = trend + 0;
+    else mid = trend + (phase < 3 ? 4 - phase : phase - 3);
+    cs.push(makeCandle(i*60_000, mid, mid + 0.2, mid - 0.2, mid, 1));
+  }
+  const tl = TL.detectTrendlines(cs, { atr: 1, lookback: 8 });
+  // Build a TA-shaped object that the module expects
+  const ta = {
+    close: cs.map(c => c.c),
+    atr14: cs.map(_ => 1),
+    trendlines: tl,
+  };
+  const sig = TLMod.evaluate(ta);
+  log("signal in [-1, +1]",      sig.signal >= -1 && sig.signal <= 1);
+  log("confidence in [0, 1]",    sig.confidence >= 0 && sig.confidence <= 1);
+  log("signal positive (bull channel)", sig.signal > 0);
+  log("reasons array non-empty", Array.isArray(sig.reasons) && sig.reasons.length > 0);
+  log("payload carries trendline", sig.payload?.trendline === tl);
+
+  // No trendline → neutral
+  const empty = TLMod.evaluate({ close: [], atr14: [], trendlines: null });
+  log("no TL → neutral", empty.signal === 0 && empty.confidence === 0);
+}
+
+/* ════════════ chartPatterns · Head & Shoulders ════════════ */
+group("chartPatterns · Head & Shoulders");
+{
+  // Synthetic H&S: high(100) - low(95) - high(110, head) - low(95) - high(100)
+  // Each pivot needs 2 surrounding bars for findPivots(left=2,right=2).
+  // Build by walking a narrow path and inserting peaks/troughs at known spots.
+  const cs = [];
+  function pushFlat(price, n) {
+    for (let i = 0; i < n; i++) cs.push(makeCandle(cs.length*60_000, price, price+0.05, price-0.05, price, 1));
+  }
+  function pushPeak(peak) {
+    cs.push(makeCandle(cs.length*60_000, 95, peak, 94.5, peak - 0.05, 1));
+  }
+  function pushTrough(trough) {
+    cs.push(makeCandle(cs.length*60_000, 100, 100.5, trough, 100 + 0.05, 1));
+  }
+  // Need: lead-in flat → leftShoulder → trough → head → trough → rightShoulder → break
+  pushFlat(98, 4);
+  pushPeak(100);    // leftShoulder
+  pushFlat(98, 3);
+  pushTrough(95);   // trough
+  pushFlat(98, 3);
+  pushPeak(110);    // head
+  pushFlat(98, 3);
+  pushTrough(95);   // trough
+  pushFlat(98, 3);
+  pushPeak(100);    // rightShoulder
+  pushFlat(98, 3);
+  // Final break: close below neckline (~95)
+  cs.push(makeCandle(cs.length*60_000, 95, 95.1, 92, 92.5, 1));
+  pushFlat(92, 2);
+
+  const cp = CP.detectChartPatterns(cs, { atr: 1, pivots: { left: 2, right: 2 } });
+  const hs = cp.patterns.find(p => p.name === "Head & Shoulders");
+  log("H&S detected",                !!hs);
+  log("H&S bias === bearish",        hs?.bias === "bearish");
+  log("H&S confidence finite > 0",   Number.isFinite(hs?.confidence) && hs.confidence > 0);
+  log("H&S has 5 anchor points",     Array.isArray(hs?.anchorPoints) && hs.anchorPoints.length === 5);
+  log("H&S target lower than head",  Number.isFinite(hs?.targetPrice) && hs.targetPrice < hs.invalidationPrice);
+  log("H&S broken === true",         hs?.broken === true);
+}
+
+/* ════════════ chartPatterns · Double Top ════════════
+   We need 2 swing-highs at the same price, separated by a trough.
+   findPivots(left=2,right=2) picks index i as a swing-high when
+   high[i] > all of high[i-2..i-1] AND high[i] >= all of high[i+1..i+2].
+   Use FLAT bars (h=99) for filler, PEAK (h=105) at the desired index,
+   and TROUGH (l=92, h=99 — same as filler so it's NOT a swing-high). */
+group("chartPatterns · Double Top");
+{
+  const cs = [];
+  function pushFlat(price, n) {
+    for (let i = 0; i < n; i++) cs.push(makeCandle(cs.length*60_000, price, price+0.5, price-0.5, price, 1));
+  }
+  function pushPeak(peak) {
+    // High clearly above the flat fillers (h=99.5), so this becomes a swing-high.
+    cs.push(makeCandle(cs.length*60_000, 99, peak, 98.5, peak - 0.1, 1));
+  }
+  function pushTroughLow(trough) {
+    // Low clearly below the flat fillers (l=98.5), but high stays at filler level
+    // so this doesn't accidentally become a swing-HIGH.
+    cs.push(makeCandle(cs.length*60_000, 99, 99.5, trough, 99, 1));
+  }
+  pushFlat(99, 4);
+  pushPeak(105);          // peak A (idx ~4)
+  pushFlat(99, 3);
+  pushTroughLow(92);      // trough (idx ~8)
+  pushFlat(99, 3);
+  pushPeak(105);          // peak B (idx ~12)
+  pushFlat(99, 3);
+  cs.push(makeCandle(cs.length*60_000, 99, 99.5, 91, 91.5, 1));    // break neckline (close < trough - 0.1·ATR)
+  pushFlat(91.5, 2);
+
+  const cp = CP.detectChartPatterns(cs, { atr: 1, pivots: { left: 2, right: 2 } });
+  const dt = cp.patterns.find(p => p.name === "Double Top");
+  log("Double Top detected",          !!dt);
+  log("Double Top bias === bearish",  dt?.bias === "bearish");
+  log("Double Top has 3 anchors",     dt?.anchorPoints?.length === 3);
+  log("Double Top broken === true",   dt?.broken === true);
+}
+
+/* ════════════ chartPatterns · Double Bottom ════════════ */
+group("chartPatterns · Double Bottom");
+{
+  const cs = [];
+  function pushFlat(price, n) {
+    for (let i = 0; i < n; i++) cs.push(makeCandle(cs.length*60_000, price, price+0.5, price-0.5, price, 1));
+  }
+  function pushPeakHigh(peak) {
+    // High clearly above filler (h=99.5) → swing-high
+    cs.push(makeCandle(cs.length*60_000, 99, peak, 98.5, peak - 0.1, 1));
+  }
+  function pushTrough(trough) {
+    // Low clearly below filler (l=98.5) → swing-low; high stays AT filler
+    // level so this doesn't accidentally register as a swing-high.
+    cs.push(makeCandle(cs.length*60_000, 99, 99.5, trough, 99, 1));
+  }
+  pushFlat(99, 4);
+  pushTrough(92);     // trough A
+  pushFlat(99, 3);
+  pushPeakHigh(105);  // peak between (the future neckline)
+  pushFlat(99, 3);
+  pushTrough(92);     // trough B (same level)
+  pushFlat(99, 3);
+  cs.push(makeCandle(cs.length*60_000, 99, 110, 99, 109, 1));   // break neckline up
+  pushFlat(109, 2);
+
+  const cp = CP.detectChartPatterns(cs, { atr: 1, pivots: { left: 2, right: 2 } });
+  const db = cp.patterns.find(p => p.name === "Double Bottom");
+  log("Double Bottom detected",          !!db);
+  log("Double Bottom bias === bullish",  db?.bias === "bullish");
+  log("Double Bottom broken === true",   db?.broken === true);
+  log("Double Bottom target > neckline", Number.isFinite(db?.targetPrice) && db.targetPrice > db.necklinePrice);
+}
+
+/* ════════════ chartPatterns · degenerate ════════════ */
+group("chartPatterns · degenerate inputs");
+{
+  log("null candles → empty",   CP.detectChartPatterns(null).patterns.length === 0);
+  log("0 candles → empty",      CP.detectChartPatterns([]).patterns.length === 0);
+  log("3 candles → empty",      CP.detectChartPatterns(linearCandles(3, 1, 100)).patterns.length === 0);
+  log("summarize null → null",  CP.summarizeChartPattern(null) === null);
+}
+
+/* ════════════ chartPatterns module · evaluate ════════════ */
+group("chartPatterns module · evaluate");
+{
+  const fakeTa = { chartPatterns: { last: { name: "Inverse Head & Shoulders", bias: "bullish", confidence: 0.85, broken: true, targetPrice: 110, invalidationPrice: 90 }, patterns: [{}] } };
+  const sig = CPMod.evaluate(fakeTa);
+  log("bullish broken pattern → positive signal", sig.signal > 0);
+  log("confidence === pattern.confidence",       close(sig.confidence, 0.85));
+  log("reasons mention pattern name",
+      sig.reasons.some(r => /Inverse Head & Shoulders/.test(r)));
+
+  const lowConf = { chartPatterns: { last: { name: "x", bias: "bullish", confidence: 0.2, broken: false }, patterns: [] } };
+  const sigLow = CPMod.evaluate(lowConf);
+  log("low-conf pattern → neutral", sigLow.signal === 0 && sigLow.confidence === 0);
+
+  const noPattern = CPMod.evaluate({});
+  log("no chartPatterns key → neutral", noPattern.signal === 0);
+}
+
+/* ════════════ Summary ════════════ */
+out.innerHTML += `\n<div class="summary ${p===n?'pass':'fail'}">Ran ${n} tests — ${p} passed, ${n-p} failed.</div>`;
+document.title = `MNP p23 ${p}/${n}`;
+</script>
+</body>
+</html>

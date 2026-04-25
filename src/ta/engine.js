@@ -33,6 +33,9 @@ import { detectFVG } from "./structure/fvg.js";
 import { detectOrderBlocks } from "./structure/orderBlocks.js";
 import { detectLiquidity } from "./structure/liquidity.js";
 import { premiumDiscount } from "./structure/premiumDiscount.js";
+// M3 step 6 — trendlines + chart patterns
+import { detectTrendlines } from "./structure/trendlines.js";
+import { detectChartPatterns } from "./patterns/chartPatterns.js";
 import { tagSessions, sessionStats } from "./structure/sessions.js";
 import { clusterLevels } from "./levels/supportResistance.js";
 import { lastFinite } from "./math.js";
@@ -69,6 +72,9 @@ const DEFAULT_STRUCTURE = {
   sessions:        true,
   // Phase 6 additions
   regime:          true,
+  // M3 step 6 — trendlines + chart patterns
+  trendlines:      { lookback: 8, toleranceATR: 0.5, breakoutATR: 0.5 },
+  chartPatterns:   true,
 };
 
 export const TAEngine = {
@@ -157,6 +163,22 @@ export const TAEngine = {
 
     // ─── Patterns ──────────────────────────────────────────────────
     if (patterns !== false) out.patterns = detectPatterns(candles);
+
+    // ─── Trendlines + chart patterns (M3 step 6) ───────────────────
+    if (structure.trendlines !== false) {
+      out.trendlines = detectTrendlines(candles, {
+        atr: atrLast,
+        pivots: structure.pivots || {},
+        ...(typeof structure.trendlines === "object" ? structure.trendlines : {}),
+      });
+    }
+    if (structure.chartPatterns !== false) {
+      out.chartPatterns = detectChartPatterns(candles, {
+        atr: atrLast,
+        pivots: structure.pivots || {},
+        ...(typeof structure.chartPatterns === "object" ? structure.chartPatterns : {}),
+      });
+    }
 
     // ─── Regime (Phase 6) ─────────────────────────────────────────
     if (structure.regime !== false) {

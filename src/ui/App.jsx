@@ -170,15 +170,17 @@ const SUBPLOT_CATALOG = [
 ];
 
 const STRUCTURE_CATALOG = [
-  { id: "bos",        label: "BOS / CHoCH",   tone: "warn"   },
-  { id: "fvg",        label: "FVG",           tone: "accent" },
-  { id: "ob",         label: "Order Blocks",  tone: "accent" },
-  { id: "liq",        label: "Liquidity",     tone: "bull"   },
-  { id: "sr",         label: "S/R",           tone: "accent" },
-  { id: "pdh",        label: "PDH / PDL",     tone: "warn"   },
-  { id: "pd",         label: "Premium/Disc.", tone: "accent" },
-  { id: "ghost",      label: "Ghost candle",  tone: "accent" },
-  { id: "volProfile", label: "Volume Profile",tone: "warn"   },
+  { id: "bos",        label: "BOS / CHoCH",    tone: "warn"   },
+  { id: "fvg",        label: "FVG",            tone: "accent" },
+  { id: "ob",         label: "Order Blocks",   tone: "accent" },
+  { id: "liq",        label: "Liquidity",      tone: "bull"   },
+  { id: "sr",         label: "S/R",            tone: "accent" },
+  { id: "pdh",        label: "PDH / PDL",      tone: "warn"   },
+  { id: "pd",         label: "Premium/Disc.",  tone: "accent" },
+  { id: "ghost",      label: "Ghost candle",   tone: "accent" },
+  { id: "volProfile", label: "Volume Profile", tone: "warn"   },
+  { id: "trendlines", label: "Trendlines",     tone: "accent" },
+  { id: "patterns",   label: "Patterns",       tone: "warn"   },
 ];
 
 const MODULE_META = {
@@ -195,6 +197,8 @@ const MODULE_META = {
   "premium-discount": { emoji: "💎", label: "Premium/Disc."   },
   "session-calendar": { emoji: "🕐", label: "Session / Cal."  },
   "cisd":             { emoji: "🧬", label: "CISD"            },
+  "trendline":        { emoji: "📐", label: "Trendlines"      },
+  "chart-patterns":   { emoji: "🔱", label: "Chart Patterns"  },
 };
 
 /* ╔══════════════════════════════════════════════════════════════════╗
@@ -696,6 +700,143 @@ function IndicatorRail({ indicators, setIndicators, structure, setStructure, sub
 }
 
 /* ╔══════════════════════════════════════════════════════════════════╗
+   ║  Trendline + Chart-pattern overlay (M3 step 6)                   ║
+   ║  Renders fitted trendlines + the latest detected chart pattern   ║
+   ║  as SVG primitives anchored to the chart's price scale.          ║
+   ║  Pure overlay — pulls ta.trendlines + ta.chartPatterns straight  ║
+   ║  from the TA snapshot.                                           ║
+   ╚══════════════════════════════════════════════════════════════════╝ */
+function TrendlinePatternOverlay({ chartRef, seriesRef, dims, ta, candles, showTrendlines, showPatterns }) {
+  if (!chartRef?.current || !seriesRef?.current?.candle) return null;
+  if (!ta || ta.empty) return null;
+  if (!Array.isArray(candles) || candles.length === 0) return null;
+
+  const series = seriesRef.current.candle;
+  const chart  = chartRef.current;
+  const ts = chart.timeScale?.();
+
+  const priceToY = (price) => {
+    try { return series.priceToCoordinate(price); } catch { return null; }
+  };
+  // Time scale uses UTC seconds (per LWC); our candles store ms in `t`.
+  const barIdxToX = (i) => {
+    if (i < 0 || i >= candles.length) return null;
+    const c = candles[i];
+    const tSec = Number.isFinite(c?.time) ? c.time : Math.floor(c.t / 1000);
+    try { return ts?.timeToCoordinate?.(tSec); } catch { return null; }
+  };
+
+  // ── Trendlines ────────────────────────────────────────────────
+  const tl = ta.trendlines;
+  const renderLine = (line, color) => {
+    if (!line) return null;
+    // Span from the first anchor pivot's bar idx to the LAST candle index
+    // so the line projects all the way to the right edge.
+    const startIdx = Math.max(0, line.points[0]?.i ?? 0);
+    const endIdx   = candles.length - 1;
+    const yStart   = priceToY(line.slope * startIdx + line.intercept);
+    const yEnd     = priceToY(line.slope * endIdx   + line.intercept);
+    const xStart   = barIdxToX(startIdx);
+    const xEnd     = barIdxToX(endIdx);
+    if (!Number.isFinite(yStart) || !Number.isFinite(yEnd) || !Number.isFinite(xStart) || !Number.isFinite(xEnd)) return null;
+    return (
+      <g>
+        <line x1={xStart} y1={yStart} x2={xEnd} y2={yEnd}
+              stroke={color} strokeWidth="1.4" strokeDasharray="6 4" />
+        {line.touchPoints?.map((p, j) => {
+          const cx = barIdxToX(p.i);
+          const cy = priceToY(p.p);
+          if (!Number.isFinite(cx) || !Number.isFinite(cy)) return null;
+          return <circle key={j} cx={cx} cy={cy} r="3" fill={color} fillOpacity="0.7" stroke="white" strokeWidth="0.5" />;
+        })}
+      </g>
+    );
+  };
+
+  // ── Chart pattern (latest only) ───────────────────────────────
+  const cp = ta.chartPatterns?.last;
+  let patternG = null;
+  if (showPatterns && cp && Array.isArray(cp.anchorPoints) && cp.anchorPoints.length >= 2) {
+    const tone = cp.bias === "bullish" ? "#26a69a"
+               : cp.bias === "bearish" ? "#ef5350"
+               : "#9aa0ab";
+    const pts = cp.anchorPoints.map((a) => {
+      const x = barIdxToX(a.i);
+      const y = priceToY(a.p);
+      return Number.isFinite(x) && Number.isFinite(y) ? `${x.toFixed(1)},${y.toFixed(1)}` : null;
+    }).filter(Boolean).join(" ");
+    const necklineY = Number.isFinite(cp.necklinePrice) ? priceToY(cp.necklinePrice) : null;
+    const targetY   = Number.isFinite(cp.targetPrice)   ? priceToY(cp.targetPrice)   : null;
+    const invalidY  = Number.isFinite(cp.invalidationPrice) ? priceToY(cp.invalidationPrice) : null;
+    patternG = (
+      <g>
+        {pts && <polyline points={pts} fill="none" stroke={tone} strokeWidth="1.6" />}
+        {cp.anchorPoints.map((a, i) => {
+          const cx = barIdxToX(a.i);
+          const cy = priceToY(a.p);
+          if (!Number.isFinite(cx) || !Number.isFinite(cy)) return null;
+          return <circle key={i} cx={cx} cy={cy} r="3.5" fill={tone} stroke="white" strokeWidth="0.7" />;
+        })}
+        {Number.isFinite(necklineY) && (
+          <line x1={0} x2={dims.w - 56} y1={necklineY} y2={necklineY}
+                stroke="rgba(255,255,255,.45)" strokeWidth="1" strokeDasharray="2 4" />
+        )}
+        {Number.isFinite(targetY) && (
+          <line x1={0} x2={dims.w - 56} y1={targetY} y2={targetY}
+                stroke="rgba(38,166,154,.55)" strokeWidth="1" strokeDasharray="6 4" />
+        )}
+        {Number.isFinite(invalidY) && (
+          <line x1={0} x2={dims.w - 56} y1={invalidY} y2={invalidY}
+                stroke="rgba(239,83,80,.55)" strokeWidth="1" strokeDasharray="6 4" />
+        )}
+        {/* Label */}
+        {cp.anchorPoints[0] && (() => {
+          const x = barIdxToX(cp.anchorPoints[0].i);
+          const y = priceToY(cp.anchorPoints[0].p);
+          if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+          return (
+            <text x={x + 4} y={y - 6} fill={tone} fontSize="10" fontFamily="ui-monospace, monospace">
+              {cp.name}{cp.broken ? " ✓" : ""}
+            </text>
+          );
+        })()}
+      </g>
+    );
+  }
+
+  // ── Render only when we actually have something to show ──────
+  const haveTL = showTrendlines && tl && (tl.upper || tl.lower);
+  const havePT = !!patternG;
+  if (!haveTL && !havePT) return null;
+
+  return (
+    <svg
+      width={dims.w} height={dims.h}
+      style={{ position: "absolute", inset: 0, pointerEvents: "none", zIndex: 2 }}
+      aria-hidden="true">
+      {haveTL && tl.upper && renderLine(tl.upper, "rgba(239,83,80,.85)")}
+      {haveTL && tl.lower && renderLine(tl.lower, "rgba(38,166,154,.85)")}
+      {havePT && patternG}
+      {haveTL && tl.lastBreakout && (() => {
+        const x = barIdxToX(tl.lastBreakout.atBar);
+        const y = priceToY(candles[tl.lastBreakout.atBar]?.c);
+        if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+        const arrowColor = tl.lastBreakout.side === "up" ? "#26a69a" : "#ef5350";
+        const dy = tl.lastBreakout.side === "up" ? -10 : 10;
+        return (
+          <g>
+            <circle cx={x} cy={y} r="4" fill={arrowColor} stroke="white" strokeWidth="1" />
+            <text x={x + 6} y={y + dy} fill={arrowColor} fontSize="10" fontFamily="ui-monospace, monospace">
+              breakout {tl.lastBreakout.side.toUpperCase()}
+            </text>
+          </g>
+        );
+      })()}
+    </svg>
+  );
+}
+
+/* ╔══════════════════════════════════════════════════════════════════╗
    ║  Volume Profile overlay (M3 step 5)                              ║
    ║  Horizontal volume-at-price histogram pinned to the chart's      ║
    ║  right edge.  Subscribes to vp:updated events and uses the       ║
@@ -1192,6 +1333,17 @@ function ChartPane({ symbol, tf, candles, forming, ta, indicators, structure, ex
             chartRef={chartRef}
             seriesRef={seriesRef}
             dims={dims}
+          />
+        )}
+        {(structure?.trendlines || structure?.patterns) && (
+          <TrendlinePatternOverlay
+            chartRef={chartRef}
+            seriesRef={seriesRef}
+            dims={dims}
+            ta={ta}
+            candles={candles}
+            showTrendlines={!!structure?.trendlines}
+            showPatterns={!!structure?.patterns}
           />
         )}
       </div>
@@ -1736,6 +1888,90 @@ function KeyLevelsCard({ ta }) {
 }
 
 /* ── Volume Profile — bucket volume by price, horizontal bars */
+/* ── Chart-pattern card (M3 step 6) ──
+   Shows the current detected geometric pattern (H&S, double/triple
+   tops/bottoms, triangles).  Bias chip + confidence badge + measured-
+   move target + invalidation level + a tiny SVG of the anchor points. */
+function ChartPatternCard({ ta }) {
+  const cp = ta?.chartPatterns;
+  if (!cp || !cp.last) {
+    return (
+      <div className="card">
+        <h3>Chart Pattern <span className="badge">none</span></h3>
+        <div style={{ color: "var(--fg-dim)", fontSize: 12 }}>
+          No geometric pattern in last 30 bars.
+        </div>
+      </div>
+    );
+  }
+  const p = cp.last;
+  const tone = p.bias === "bullish" ? "bull" : p.bias === "bearish" ? "bear" : "flat";
+  const confLabel = p.confidence >= 0.75 ? "HIGH"
+                  : p.confidence >= 0.45 ? "MED"
+                  : "LOW";
+  // Mini SVG of anchor points (relative coordinates).
+  const anchors = Array.isArray(p.anchorPoints) ? p.anchorPoints : [];
+  const W = 180, H = 56;
+  let svg = null;
+  if (anchors.length >= 2) {
+    const xs = anchors.map(a => a.i);
+    const ys = anchors.map(a => a.p);
+    const xLo = Math.min(...xs), xHi = Math.max(...xs);
+    const yLo = Math.min(...ys), yHi = Math.max(...ys);
+    const xR = Math.max(1e-9, xHi - xLo);
+    const yR = Math.max(1e-9, yHi - yLo);
+    const px = (x) => 4 + ((x - xLo) / xR) * (W - 8);
+    const py = (y) => H - 4 - ((y - yLo) / yR) * (H - 8);
+    const pts = anchors.map(a => `${px(a.i).toFixed(1)},${py(a.p).toFixed(1)}`).join(" ");
+    const stroke = tone === "bull" ? "#26a69a" : tone === "bear" ? "#ef5350" : "#9aa0ab";
+    svg = (
+      <svg width={W} height={H} aria-hidden="true" style={{ display: "block", margin: "4px 0 6px" }}>
+        <polyline points={pts} fill="none" stroke={stroke} strokeWidth="1.5" />
+        {anchors.map((a, i) => (
+          <circle key={i} cx={px(a.i)} cy={py(a.p)} r="2.5" fill={stroke} />
+        ))}
+      </svg>
+    );
+  }
+  return (
+    <div className="card">
+      <h3>Chart Pattern <span className={"badge " + tone}>{p.bias.toUpperCase()}</span></h3>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 4 }}>
+        <span style={{ fontWeight: "bold" }}>{p.name}</span>
+        <span className={"badge " + (p.confidence >= 0.75 ? "bull" : p.confidence >= 0.45 ? "" : "fg-dim")}>
+          {confLabel} {fmtPct(p.confidence, 0)}
+        </span>
+      </div>
+      {svg}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
+        <div className="dl-cell">
+          <div className="k">Target</div>
+          <div className="v">{Number.isFinite(p.targetPrice) ? fmt(p.targetPrice) : "—"}</div>
+        </div>
+        <div className="dl-cell">
+          <div className="k">Invalidation</div>
+          <div className="v">{Number.isFinite(p.invalidationPrice) ? fmt(p.invalidationPrice) : "—"}</div>
+        </div>
+        <div className="dl-cell">
+          <div className="k">Status</div>
+          <div className="v" style={{ color: p.broken ? "var(--bull)" : "var(--fg-dim)" }}>
+            {p.broken ? "confirmed" : "forming"}
+          </div>
+        </div>
+        <div className="dl-cell">
+          <div className="k">Age</div>
+          <div className="v">{Number.isFinite(p.ageBars) ? `${p.ageBars} bars` : "—"}</div>
+        </div>
+      </div>
+      {Array.isArray(cp.patterns) && cp.patterns.length > 1 && (
+        <div style={{ fontSize: 10, color: "var(--fg-dim)", marginTop: 6 }}>
+          + {cp.patterns.length - 1} other candidate{cp.patterns.length === 2 ? "" : "s"}
+        </div>
+      )}
+    </div>
+  );
+}
+
 const VP_BUCKET_OPTIONS   = [12, 24, 48, 96];
 const VP_LOOKBACK_OPTIONS = [50, 100, 200, 500];
 
@@ -2174,6 +2410,9 @@ function SummaryTableCard({ ta, orch, expected, candles }) {
   const bb = ta.bb_20_2 || ta.bb;
   const bbUp = bb?.up?.[bb.up.length - 1];
   const bbLo = bb?.lo?.[bb.lo.length - 1];
+  const cp = ta.chartPatterns?.last;
+  const cpLabel = cp ? `${cp.name} · ${cp.bias.slice(0,4)}${cp.broken ? " ✓" : ""}` : "—";
+  const cpTone  = cp ? (cp.bias === "bullish" ? "bull" : cp.bias === "bearish" ? "bear" : null) : null;
   const rows = [
     ["Price",     fmt(last)],
     ["Trend",     ta.trend],
@@ -2188,10 +2427,11 @@ function SummaryTableCard({ ta, orch, expected, candles }) {
     ["BB Upper",  fmt(bbUp)],
     ["BB Lower",  fmt(bbLo)],
     ["PDH / PDL", pdhpdl ? `${fmt(pdhpdl.pdh)} / ${fmt(pdhpdl.pdl)}` : "—"],
+    ["Chart Pattern", cpLabel, cpTone],
   ];
   return (
     <div className="card">
-      <h3>Summary Table <span className="badge">13</span></h3>
+      <h3>Summary Table <span className="badge">{rows.length}</span></h3>
       <table className="summary-table">
         <tbody>
           {rows.map(([k, v, tone], i) => (
@@ -2390,6 +2630,7 @@ function SignalSidebar({ orch, expected, ghost, ta, candles, regime, symbol, gho
       {symbol && <HTFBiasGridCard symbol={symbol} />}
       <ContextCard ta={ta} candles={candles} />
       <PatternCard ta={ta} />
+      <ChartPatternCard ta={ta} />
       <KeyLevelsCard ta={ta} />
       <VolumeProfileCard ta={ta} />
       <LiquidationHeatmapCard ta={ta} />
@@ -2852,6 +3093,8 @@ function App() {
   const [structure, setStructure] = useState({
     bos: true, fvg: true, ob: true, liq: true, sr: true, pdh: true, pd: false, ghost: true,
     volProfile: false,
+    trendlines: true,
+    patterns: true,
   });
   const announce = useAnnouncer();
   const net  = useBus("net", { online: navigator.onLine });
