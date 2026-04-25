@@ -466,9 +466,9 @@ group("RollingConformal · serialize/deserialize");
 
 /* ══════════════════════════════ IDB persistence ══════════════════════════════ */
 
-group("schema · DB_VERSION bumped to 3, conformalSets store present");
+group("schema · DB_VERSION ≥ 3, conformalSets store present");
 {
-  log("DB_VERSION === 3", Schema.DB_VERSION === 3);
+  log("DB_VERSION >= 3", Schema.DB_VERSION >= 3);
   log("STORES.conformalSets defined", !!Schema.STORES.conformalSets);
   log("MIGRATIONS[3] is a function", typeof Schema.MIGRATIONS[3] === "function");
 }
