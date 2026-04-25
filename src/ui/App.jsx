@@ -1988,6 +1988,173 @@ function SummaryTableCard({ ta, orch, expected, candles }) {
   );
 }
 
+/* ── Feature Explorer (U5, M3 closeout) ──
+   Live feature vector for the latest bar with a raw / z-scored toggle.
+   Pulls features.js + normalize.js via the window.__MNP__ surface so
+   we don't need an `import` at the JSX top-level (Babel-standalone +
+   blob URL).  Buckets columns by category for at-a-glance scanning;
+   highlights extreme z-scores (|z|>2). */
+const FEATURE_GROUPS = [
+  ["Returns / candle",    ["ret_1","ret_5","ret_20","log_range","body_frac","upper_wick_frac","lower_wick_frac"]],
+  ["Moving averages",     ["d_ema20","d_ema50","d_ema200","ema20_slope"]],
+  ["Oscillators",         ["rsi14","macd_hist_rel","stoch_k","stoch_d"]],
+  ["Bands / volatility",  ["bb_pos","bb_width_rel","atr_rel","adx14","plusDI_minusDI"]],
+  ["Volume",              ["vol_rel","obv_slope","cmf20","roc10"]],
+  ["Structure (SMC)",     ["trend_up","trend_dn","break_recent","fvg_open_rel","ob_open_rel","zone_premium","zone_discount"]],
+  ["Sessions",            ["sess_asia","sess_london","sess_ny_am","sess_ny_pm"]],
+  ["Meta",                ["time_of_day","day_of_week"]],
+];
+
+function FeatureDrawer({ ta }) {
+  const [mode, setMode] = useState("raw");        // "raw" | "z"
+  const [open, setOpen] = useState(true);
+
+  const fb = window.__MNP__?.Features;
+  const norm = window.__MNP__?.Normalize;
+
+  const data = useMemo(() => {
+    if (!fb || !ta || ta.empty) return null;
+    let fm;
+    try { fm = fb.buildFeatureMatrix(ta, { warmup: 50 }); }
+    catch { return null; }
+    if (!fm || fm.n === 0) return null;
+    // Last valid row — fall back to last row if all flagged invalid.
+    let idx = fm.n - 1;
+    while (idx >= 0 && !fm.valid[idx]) idx--;
+    if (idx < 0) idx = fm.n - 1;
+    const raw = fb.rowAt(fm, idx);
+
+    let stats = null, z = null;
+    if (norm) {
+      try { stats = norm.fitZScore(fm.matrix, fm.d, null, fm.valid); }
+      catch { stats = null; }
+      if (stats) {
+        z = raw.map((v, k) => (v - stats.mean[k]) / (stats.std[k] || 1));
+      }
+    }
+    const byName = Object.create(null);
+    for (let k = 0; k < fm.names.length; k++) {
+      byName[fm.names[k]] = { raw: raw[k], z: z ? z[k] : null };
+    }
+    return { byName, idx, n: fm.n, d: fm.d, t: fm.t[idx], hasZ: !!z };
+  }, [ta, fb, norm]);
+
+  if (!fb) {
+    return (
+      <div className="card">
+        <h3>Feature Explorer <span className="badge">offline</span></h3>
+        <div style={{ color: "var(--fg-dim)", fontSize: 12 }}>
+          ml/features.js not yet loaded.
+        </div>
+      </div>
+    );
+  }
+  if (!data) {
+    return (
+      <div className="card">
+        <h3>Feature Explorer <span className="badge">warmup</span></h3>
+        <div style={{ color: "var(--fg-dim)", fontSize: 12 }}>
+          Need ≥ 50 bars of TA history for a valid feature row.
+        </div>
+      </div>
+    );
+  }
+
+  // Choose what to display + how to colour.
+  const show = mode === "z" && data.hasZ ? "z" : "raw";
+  const valFor = (name) => {
+    const cell = data.byName[name];
+    if (!cell) return { txt: "—", tone: "" };
+    const v = show === "z" ? cell.z : cell.raw;
+    if (!Number.isFinite(v)) return { txt: "—", tone: "" };
+    if (show === "z") {
+      const a = Math.abs(v);
+      const tone = a > 2 ? (v > 0 ? "bull" : "bear")
+                 : a > 1 ? (v > 0 ? "soft-bull" : "soft-bear")
+                 : "";
+      return { txt: (v >= 0 ? "+" : "") + v.toFixed(2), tone };
+    }
+    // raw
+    const txt = Math.abs(v) >= 1
+      ? Number(v).toFixed(2)
+      : v.toFixed(3);
+    return { txt, tone: "" };
+  };
+
+  const toneColor = (t) => (
+    t === "bull"      ? "var(--bull)" :
+    t === "bear"      ? "var(--bear)" :
+    t === "soft-bull" ? "rgba(38,166,154,.7)" :
+    t === "soft-bear" ? "rgba(239,83,80,.7)"  :
+                        "var(--fg)"
+  );
+
+  return (
+    <div className="card">
+      <h3>
+        Feature Explorer
+        <span className="badge">{data.d}d · row {data.idx + 1}/{data.n}</span>
+      </h3>
+
+      <div style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 8 }}>
+        <button
+          type="button"
+          className={"chip-toggle " + (show === "raw" ? "on" : "")}
+          style={{ fontSize: 10, padding: "3px 8px" }}
+          onClick={() => setMode("raw")}>
+          raw
+        </button>
+        <button
+          type="button"
+          className={"chip-toggle " + (show === "z" ? "on" : "") + (data.hasZ ? "" : " disabled")}
+          style={{ fontSize: 10, padding: "3px 8px", opacity: data.hasZ ? 1 : 0.4, cursor: data.hasZ ? "pointer" : "not-allowed" }}
+          onClick={() => data.hasZ && setMode("z")}
+          aria-disabled={!data.hasZ}
+          title={data.hasZ ? "z-score normalised against this matrix" : "need more history for z-score"}>
+          z-score
+        </button>
+        <button
+          type="button"
+          className="chip-toggle"
+          style={{ fontSize: 10, padding: "3px 8px", marginLeft: "auto" }}
+          onClick={() => setOpen((o) => !o)}>
+          {open ? "collapse" : "expand"}
+        </button>
+      </div>
+
+      {open && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {FEATURE_GROUPS.map(([label, names]) => (
+            <div key={label}>
+              <div style={{ fontSize: 10, color: "var(--fg-dim)", textTransform: "uppercase", letterSpacing: 1, marginBottom: 4 }}>
+                {label}
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr auto", rowGap: 2, columnGap: 8 }}>
+                {names.filter((n) => data.byName[n] != null).map((n) => {
+                  const { txt, tone } = valFor(n);
+                  return (
+                    <React.Fragment key={n}>
+                      <div style={{ fontSize: 11, color: "var(--fg-dim)", fontFamily: "var(--font-mono)" }}>{n}</div>
+                      <div style={{ fontSize: 11, fontFamily: "var(--font-mono)", color: toneColor(tone), textAlign: "right" }}>
+                        {txt}
+                      </div>
+                    </React.Fragment>
+                  );
+                })}
+              </div>
+            </div>
+          ))}
+          {show === "z" && (
+            <div style={{ fontSize: 10, color: "var(--fg-dim)", marginTop: 4 }}>
+              z-score · |z|&gt;1 highlighted, |z|&gt;2 saturated · stats fitted on {data.n} rows
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function SignalSidebar({ orch, expected, ghost, ta, candles, regime, symbol }) {
   return (
     <aside className="sidebar" aria-label="signal-sidebar">
@@ -2007,6 +2174,7 @@ function SignalSidebar({ orch, expected, ghost, ta, candles, regime, symbol }) {
       <LiquidationHeatmapCard ta={ta} />
       <SummaryTableCard ta={ta} orch={orch} expected={expected} candles={candles} />
       <ModuleBreakdownCard orch={orch} />
+      <FeatureDrawer ta={ta} />
     </aside>
   );
 }
