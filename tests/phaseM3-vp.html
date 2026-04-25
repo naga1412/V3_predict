@@ -1,0 +1,243 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>MNP · M3 — Volume Profile (enhanced) unit tests</title>
+<style>
+  body { background:#131722; color:#d1d4dc; font:13px/1.5 monospace; padding:20px; }
+  .pass { color:#26a69a; }
+  .fail { color:#ef5350; }
+  .group { margin-top: 12px; font-weight:bold; color:#2962ff; }
+  h1 { color:#fff; font-size:18px; }
+  #out { white-space: pre-wrap; }
+  .note { color:#787b86; }
+  .summary { margin-top: 16px; padding: 8px; border:1px solid #2a2e39; }
+</style>
+</head>
+<body>
+<h1>MNP — M3 · Volume Profile (enhanced): VAH/VAL/POC/HVN/LVN/TPO</h1>
+
+<script>
+  if (location.protocol === "file:") {
+    document.addEventListener("DOMContentLoaded", () => {
+      document.body.innerHTML = `
+        <h1 style="color:#fff">MNP — M3 VP test harness</h1>
+        <div style="background:#3a1d1d;border:1px solid #ef5350;padding:16px;margin-top:16px;border-radius:4px">
+          <div style="color:#ef5350;font-weight:bold">Run on http://localhost (not file://)</div>
+          <pre style="background:#1a1e2a;padding:10px;margin-top:10px;color:#26a69a">cd v3 && python -m http.server 3131</pre>
+        </div>`;
+    });
+    throw new Error("file:// origin");
+  }
+</script>
+
+<div id="out">running…</div>
+
+<script type="module">
+const out = document.getElementById("out");
+window.addEventListener("error", (e) => {
+  out.innerHTML += `<span class="fail">✗ ${e.message}</span>\n<span class="note">${e.filename}:${e.lineno}:${e.colno}</span>\n`;
+});
+window.addEventListener("unhandledrejection", (e) => {
+  out.innerHTML += `<span class="fail">✗ unhandled: ${e.reason?.message || e.reason}</span>\n<span class="note">${e.reason?.stack || ''}</span>\n`;
+});
+
+const V = "m3-vp-" + Date.now();
+const U = (p) => new URL(`${p}?v=${V}`, location.href).href;
+
+const VP = await import(U("../src/ta/profile/volumeProfileEnhanced.js"));
+
+let n = 0, p = 0;
+const log = (s, ok, err) => {
+  out.innerHTML += `<span class="${ok?'pass':'fail'}">${ok?'✓':'✗'} ${s}${err ? ' — ' + err : ''}</span>\n`;
+  n++; if (ok) p++;
+};
+const group = (s) => { out.innerHTML += `\n<span class="group">[${s}]</span>\n`; };
+const close = (a, b, eps=1e-9) => Math.abs(a - b) <= eps;
+
+/* ─── Helpers ─── */
+function makeCandles(arr) {
+  // arr: [{ o, h, l, c, v }]
+  return arr.map((row, i) => ({ ...row, t: i * 60_000, time: i * 60 }));
+}
+
+/* ════════════ tpoLetter ════════════ */
+group("tpoLetter (spreadsheet glyph)");
+{
+  log("0 → A",   VP.tpoLetter(0)  === "A");
+  log("25 → Z",  VP.tpoLetter(25) === "Z");
+  log("26 → AA", VP.tpoLetter(26) === "AA");
+  log("27 → AB", VP.tpoLetter(27) === "AB");
+  log("51 → AZ", VP.tpoLetter(51) === "AZ");
+  log("52 → BA", VP.tpoLetter(52) === "BA");
+  log("negative → ''", VP.tpoLetter(-1) === "");
+  log("non-int → ''",  VP.tpoLetter(1.5) === "");
+}
+
+/* ════════════ bucketIndex ════════════ */
+group("bucketIndex");
+{
+  // [100, 110] / 10 buckets → step=1: 100→0, 100.5→0, 101→1, 109.99→9, 110→9
+  log("low edge → 0", VP.bucketIndex(100, 100, 110, 10) === 0);
+  log("100.5 → 0",    VP.bucketIndex(100.5, 100, 110, 10) === 0);
+  log("101 → 1",      VP.bucketIndex(101, 100, 110, 10) === 1);
+  log("109.99 → 9",   VP.bucketIndex(109.99, 100, 110, 10) === 9);
+  log("110 (upper edge) → 9 (clamp)", VP.bucketIndex(110, 100, 110, 10) === 9);
+  log("out-of-range below → -1",  VP.bucketIndex(99, 100, 110, 10) === -1);
+  log("NaN → -1",                  VP.bucketIndex(NaN, 100, 110, 10) === -1);
+  log("hi <= lo → -1",             VP.bucketIndex(100, 110, 100, 10) === -1);
+}
+
+/* ════════════ valueArea greedy expansion ════════════ */
+group("valueArea (70 % VA)");
+{
+  // 5 buckets, simple distribution — POC at 2, monotonic falloff.
+  const rows = [
+    { idx: 0, vol: 5  },
+    { idx: 1, vol: 15 },
+    { idx: 2, vol: 50 },     // POC
+    { idx: 3, vol: 20 },
+    { idx: 4, vol: 10 },
+  ];
+  const r = VP.valueArea(rows, 2, { valueAreaPct: 0.7 });
+  log("vahIdx >= valIdx", r.vahIdx >= r.valIdx);
+  log("VA contains POC", r.valIdx <= 2 && r.vahIdx >= 2);
+  log("VA hits >= 70 %", r.areaPct >= 0.7);
+
+  // total = 100; need 70.  POC=50; expand to whichever side has more.
+  // above (3)=20, below (1)=15  → pick above first → acc=70 → done.
+  log("expansion picks higher-vol side first (above wins)",
+      r.vahIdx === 3 && r.valIdx === 2 && close(r.areaPct, 0.7, 1e-9));
+
+  // Empty rows
+  const empty = VP.valueArea([], 0);
+  log("empty rows → vahIdx=-1", empty.vahIdx === -1);
+
+  // POC out of range
+  const oob = VP.valueArea(rows, 99);
+  log("oob POC → vahIdx=-1", oob.vahIdx === -1);
+
+  // All-zero volume → still terminates
+  const zero = VP.valueArea([{vol:0},{vol:0},{vol:0}], 1);
+  log("all-zero → no expansion (zero acc)", zero.accumulatedVolume === 0);
+}
+
+/* ════════════ computeVolumeProfile — happy path ════════════ */
+group("computeVolumeProfile · synthetic");
+{
+  // 100 candles, mostly clustered around price 100 with tail above & below.
+  const cs = [];
+  for (let i = 0; i < 100; i++) {
+    let mid;
+    if (i < 70) mid = 100;            // 70 %: cluster
+    else if (i < 85) mid = 105;
+    else            mid = 95;
+    cs.push({ o: mid - 0.3, h: mid + 0.5, l: mid - 0.5, c: mid + 0.2, v: 1 });
+  }
+  const candles = makeCandles(cs);
+  const vp = VP.computeVolumeProfile(candles, { buckets: 24, lookback: 100 });
+  log("returns bundle", vp != null);
+  log("rows.length === buckets", vp.rows.length === 24);
+  log("totalVolume === sum(rows)",
+      close(vp.totalVolume, vp.rows.reduce((s, r) => s + r.vol, 0), 1e-9));
+
+  // Cluster price ~100 → POC should sit on a bucket containing 100
+  const pocRow = vp.rows[vp.pocIdx];
+  log("POC bucket contains 100", pocRow.lo <= 100 && pocRow.hi >= 100);
+  log("POC has the largest volume",
+      vp.rows.every(r => r.vol <= pocRow.vol));
+
+  log("vahPrice >= valPrice", vp.vahPrice >= vp.valPrice);
+  log("valueArea covers >= 70 %", vp.valueAreaPct >= 0.7);
+  log("isPOC flag set on POC bucket", pocRow.isPOC === true);
+  log("POC is inside [VAL, VAH]",
+      vp.pocIdx >= vp.valIdx && vp.pocIdx <= vp.vahIdx);
+  log("inValueArea flags consistent",
+      vp.rows.filter(r => r.inValueArea).length === (vp.vahIdx - vp.valIdx + 1));
+
+  // Buckets receive TPO letters
+  const totalTpos = vp.rows.reduce((s, r) => s + r.tpo.length, 0);
+  log("TPO letters cover all 100 candles", totalTpos === 100);
+  log("first TPO letter A appears", vp.rows.some(r => r.tpo.includes("A")));
+
+  // HVN / LVN — at least the POC area should be HVN (way above median)
+  log("at least 1 HVN flagged", vp.hvnCount >= 1);
+
+  // Up/down split
+  log("rows have up + dn shares",
+      vp.rows.every(r => r.up + r.dn <= r.vol + 1e-9));
+}
+
+/* ════════════ buckets clamp + lookback subset ════════════ */
+group("bucket clamp + lookback window");
+{
+  // Non-flat candles so the bucket grid is valid.
+  const cs = [];
+  for (let i = 0; i < 50; i++) cs.push({ o: 100 + i * 0.1, h: 100 + i * 0.1 + 0.5, l: 100 + i * 0.1 - 0.5, c: 100 + i * 0.1 + 0.2, v: 1 });
+  const cands = makeCandles(cs);
+  // Buckets clamped to [4, 256]
+  const tooFew  = VP.computeVolumeProfile(cands, { buckets: 1 });
+  log("buckets clamped to 4 minimum", !!tooFew && tooFew.buckets === 4);
+  const tooMany = VP.computeVolumeProfile(cands, { buckets: 9999 });
+  log("buckets clamped to 256 maximum", !!tooMany && tooMany.buckets === 256);
+
+  // Lookback subset
+  const lb = VP.computeVolumeProfile(cands, { buckets: 12, lookback: 10 });
+  log("lookback uses last N bars only", !!lb && lb.lookback === 10);
+}
+
+/* ════════════ session-anchored ════════════ */
+group("session-anchored mode");
+{
+  const cs = [];
+  for (let i = 0; i < 100; i++) cs.push({ o: 100 + i * 0.1, h: 100 + i * 0.1 + 0.5, l: 100 + i * 0.1 - 0.5, c: 100 + i * 0.1 + 0.2, v: 1 });
+  const cands = makeCandles(cs);
+  // Session begins at t = 50 * 60_000 → only candles from index 50 onward.
+  const vp = VP.computeVolumeProfile(cands, {
+    buckets: 24, lookback: 200,
+    sessionAnchored: true,
+    sessionStartT: 50 * 60_000,
+  });
+  log("only post-session candles included", vp.lookback === 50);
+  log("window meta carries sessionAnchored=true", vp.window.sessionAnchored === true);
+  log("window.sessionStartT preserved", vp.window.sessionStartT === 50 * 60_000);
+}
+
+/* ════════════ degenerate inputs ════════════ */
+group("degenerate inputs");
+{
+  log("null → null",      VP.computeVolumeProfile(null) === null);
+  log("0 candles → null", VP.computeVolumeProfile([]) === null);
+  log("1 candle → null",  VP.computeVolumeProfile(makeCandles([{o:1,h:1,l:1,c:1,v:1}])) === null);
+  // Flat price → hi === lo → null (no bucket grid possible)
+  const flat = makeCandles(Array.from({ length: 10 }, () => ({ o: 100, h: 100, l: 100, c: 100, v: 1 })));
+  log("flat price (hi===lo) → null", VP.computeVolumeProfile(flat) === null);
+  // Mixed-shape candles (open/high/low/close keys instead of o/h/l/c)
+  const verbose = [
+    { open: 100, high: 101, low:  99, close: 100.5, volume: 1, t: 0 },
+    { open: 100, high: 102, low:  99, close: 101,   volume: 1, t: 60_000 },
+    { open: 101, high: 103, low: 100, close: 102,   volume: 1, t: 120_000 },
+  ];
+  const vv = VP.computeVolumeProfile(verbose);
+  log("accepts open/high/low/close key shape", !!vv && vv.totalVolume === 3);
+}
+
+/* ════════════ summarizeProfile ════════════ */
+group("summarizeProfile");
+{
+  const cs = [];
+  for (let i = 0; i < 30; i++) cs.push({ o: 100, h: 101, l: 99, c: 100.5, v: 1 });
+  const vp = VP.computeVolumeProfile(makeCandles(cs), { buckets: 12 });
+  const s = VP.summarizeProfile(vp);
+  log("summary has POC",  Number.isFinite(s.poc));
+  log("summary has VAH/VAL", Number.isFinite(s.vah) && Number.isFinite(s.val));
+  log("summary.bars matches lookback", s.bars === vp.lookback);
+  log("null bundle → null", VP.summarizeProfile(null) === null);
+}
+
+/* ════════════ summary ════════════ */
+out.innerHTML += `\n<div class="summary ${p===n?'pass':'fail'}">Ran ${n} tests — ${p} passed, ${n-p} failed.</div>`;
+document.title = `MNP m3-vp ${p}/${n}`;
+</script>
+</body>
+</html>

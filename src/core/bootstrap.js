@@ -65,6 +65,8 @@ import * as ConformalStore from "../ml/conformalStore.js";
 // Phase 11 — Ghost candles (conformal forward projection) + persistence
 import * as GhostCandles from "../ml/ghostCandles.js";
 import * as GhostStore   from "../ml/ghostStore.js";
+// M3 step 5 — Enhanced volume profile (VAH/VAL/POC/HVN/LVN/TPO)
+import * as VolumeProfile from "../ta/profile/volumeProfileEnhanced.js";
 // Phase 10 — Auto-validation + drift monitor
 import * as PredictionStore from "../validation/predictionStore.js";
 import * as Validator from "../validation/validator.js";
@@ -140,13 +142,15 @@ export async function boot() {
     // Phase 11
     GhostCandles,
     GhostStore,
+    // M3 step 5
+    VolumeProfile,
     // Phase 10
     PredictionStore,
     Validator,
     Drift,
     ValidationMonitor,
     createDefaultMonitor,
-    version: "3.0.0-phase11.1",
+    version: "3.0.0-m3.5",
   };
 
   // Degrade decisions ------------------------------------------------------

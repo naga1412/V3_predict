@@ -8,7 +8,7 @@
  * Scenarios covered: cold-load perf, offline shell (#39), SW update flow (#62)
  */
 
-const SW_VERSION = "mnp-v3-phase11.2-1";
+const SW_VERSION = "mnp-v3-m3.5-1";
 const SHELL_CACHE = `${SW_VERSION}-shell`;
 const CDN_CACHE   = `${SW_VERSION}-cdn`;
 
@@ -108,6 +108,8 @@ const SHELL = [
   // phase 11 — ghost candles (conformal forward projection) + persistence
   "./src/ml/ghostCandles.js",
   "./src/ml/ghostStore.js",
+  // m3 step 5 — enhanced volume profile
+  "./src/ta/profile/volumeProfileEnhanced.js",
   // phase 10 — auto-validation + drift monitor
   "./src/validation/predictionStore.js",
   "./src/validation/validator.js",

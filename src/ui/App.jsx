@@ -170,14 +170,15 @@ const SUBPLOT_CATALOG = [
 ];
 
 const STRUCTURE_CATALOG = [
-  { id: "bos",   label: "BOS / CHoCH",   tone: "warn" },
-  { id: "fvg",   label: "FVG",           tone: "accent" },
-  { id: "ob",    label: "Order Blocks",  tone: "accent" },
-  { id: "liq",   label: "Liquidity",     tone: "bull"   },
-  { id: "sr",    label: "S/R",           tone: "accent" },
-  { id: "pdh",   label: "PDH / PDL",     tone: "warn"   },
-  { id: "pd",    label: "Premium/Disc.", tone: "accent" },
-  { id: "ghost", label: "Ghost candle",  tone: "accent" },
+  { id: "bos",        label: "BOS / CHoCH",   tone: "warn"   },
+  { id: "fvg",        label: "FVG",           tone: "accent" },
+  { id: "ob",         label: "Order Blocks",  tone: "accent" },
+  { id: "liq",        label: "Liquidity",     tone: "bull"   },
+  { id: "sr",         label: "S/R",           tone: "accent" },
+  { id: "pdh",        label: "PDH / PDL",     tone: "warn"   },
+  { id: "pd",         label: "Premium/Disc.", tone: "accent" },
+  { id: "ghost",      label: "Ghost candle",  tone: "accent" },
+  { id: "volProfile", label: "Volume Profile",tone: "warn"   },
 ];
 
 const MODULE_META = {
@@ -695,6 +696,97 @@ function IndicatorRail({ indicators, setIndicators, structure, setStructure, sub
 }
 
 /* ╔══════════════════════════════════════════════════════════════════╗
+   ║  Volume Profile overlay (M3 step 5)                              ║
+   ║  Horizontal volume-at-price histogram pinned to the chart's      ║
+   ║  right edge.  Subscribes to vp:updated events and uses the       ║
+   ║  candle series' priceToCoordinate to align each bucket to the    ║
+   ║  correct y-pixel.  Pure SVG so it composes with WebGL chart.     ║
+   ╚══════════════════════════════════════════════════════════════════╝ */
+
+function VolumeProfileOverlay({ chartRef, seriesRef, dims }) {
+  const [bundle, setBundle] = useState(null);
+
+  // Listen for vp:updated from the sidebar card.
+  useEffect(() => {
+    const bus = window.__MNP__?.EventBus;
+    if (!bus) return;
+    const off = bus.on?.("vp:updated", (e) => { if (e?.bundle) setBundle(e.bundle); });
+    return () => { try { off?.(); } catch {} };
+  }, []);
+
+  if (!bundle || !chartRef?.current || !seriesRef?.current?.candle) return null;
+
+  // Width of the histogram band — % of chart width, max 240 px.
+  const W = Math.min(220, Math.max(80, Math.round(dims.w * 0.22)));
+  // Left/right inset to avoid colliding with the price-axis labels.
+  const RIGHT_INSET = 56;
+  const x0 = Math.max(0, dims.w - RIGHT_INSET - W);   // left edge of bars
+  const xEnd = Math.max(x0 + 1, dims.w - RIGHT_INSET); // right edge (anchor)
+
+  const series = seriesRef.current.candle;
+  let coord;
+  try { coord = (price) => series.priceToCoordinate(price); }
+  catch { return null; }
+
+  const maxV = bundle.rows.reduce((m, r) => r.vol > m ? r.vol : m, 0) || 1;
+
+  // Bucket strip height — derive from row count + chart height.
+  const strip = Math.max(2, Math.floor((dims.h * 0.9) / bundle.rows.length));
+
+  return (
+    <svg
+      width={dims.w}
+      height={dims.h}
+      style={{ position: "absolute", inset: 0, pointerEvents: "none", zIndex: 2 }}
+      aria-hidden="true">
+      {/* faded backdrop behind histogram so bars read against the chart */}
+      <rect x={x0} y={0} width={W} height={dims.h} fill="rgba(19,23,34,.35)" />
+      {bundle.rows.map((r) => {
+        const yMid = coord(r.mid);
+        if (!Number.isFinite(yMid)) return null;
+        const w = (r.vol / maxV) * W;
+        if (!Number.isFinite(w) || w <= 0) return null;
+        const upPct = r.vol > 0 ? r.up / r.vol : 0;
+        const wUp = w * upPct;
+        const wDn = w - wUp;
+        const y = yMid - strip / 2;
+        const barX = xEnd - w;
+        return (
+          <g key={r.idx}>
+            {/* down portion (closer to anchor edge) */}
+            <rect x={xEnd - wDn} y={y} width={wDn} height={Math.max(1, strip - 1)} fill="rgba(239,83,80,.55)" />
+            {/* up portion */}
+            <rect x={barX}      y={y} width={wUp} height={Math.max(1, strip - 1)} fill="rgba(38,166,154,.55)" />
+            {/* POC frame */}
+            {r.isPOC && (
+              <rect x={barX - 1} y={y - 1} width={w + 2} height={Math.max(2, strip + 1)}
+                    fill="none" stroke="rgba(255,176,32,.95)" strokeWidth="1" />
+            )}
+          </g>
+        );
+      })}
+      {/* VAH / VAL guide lines (dashed, full chart width) */}
+      {Number.isFinite(bundle.vahPrice) && Number.isFinite(coord(bundle.vahPrice)) && (
+        <line x1={0} x2={dims.w - RIGHT_INSET} y1={coord(bundle.vahPrice)} y2={coord(bundle.vahPrice)}
+              stroke="rgba(41,98,255,.55)" strokeWidth="1" strokeDasharray="3 3" />
+      )}
+      {Number.isFinite(bundle.valPrice) && Number.isFinite(coord(bundle.valPrice)) && (
+        <line x1={0} x2={dims.w - RIGHT_INSET} y1={coord(bundle.valPrice)} y2={coord(bundle.valPrice)}
+              stroke="rgba(41,98,255,.55)" strokeWidth="1" strokeDasharray="3 3" />
+      )}
+      {Number.isFinite(bundle.pocPrice) && Number.isFinite(coord(bundle.pocPrice)) && (
+        <line x1={0} x2={dims.w - RIGHT_INSET} y1={coord(bundle.pocPrice)} y2={coord(bundle.pocPrice)}
+              stroke="rgba(255,176,32,.65)" strokeWidth="1" />
+      )}
+      {/* Labels, top-right of the band */}
+      <text x={x0 + 6} y={12} fill="#9aa0ab" fontSize="10" fontFamily="ui-monospace, monospace">
+        VP · {bundle.buckets}c · {bundle.lookback}b
+      </text>
+    </svg>
+  );
+}
+
+/* ╔══════════════════════════════════════════════════════════════════╗
    ║  Chart pane — lightweight-charts + overlay layer                 ║
    ╚══════════════════════════════════════════════════════════════════╝ */
 
@@ -1095,6 +1187,13 @@ function ChartPane({ symbol, tf, candles, forming, ta, indicators, structure, ex
       <div className="chart-canvas" ref={containerRef}>
         <div className="chart-watermark">{symbol} · {tf}</div>
         {!candles?.length && <div className="chart-empty">loading history…</div>}
+        {structure?.volProfile && (
+          <VolumeProfileOverlay
+            chartRef={chartRef}
+            seriesRef={seriesRef}
+            dims={dims}
+          />
+        )}
       </div>
       {activeSubplots.length > 0 && (
         <div className="subplot-stack">
@@ -1637,58 +1736,148 @@ function KeyLevelsCard({ ta }) {
 }
 
 /* ── Volume Profile — bucket volume by price, horizontal bars */
+const VP_BUCKET_OPTIONS   = [12, 24, 48, 96];
+const VP_LOOKBACK_OPTIONS = [50, 100, 200, 500];
+
 function VolumeProfileCard({ ta }) {
-  if (!ta || ta.empty || !ta.t?.length) return null;
-  const buckets = 24;
-  const tail = Math.min(ta.t.length, 200);
-  const start = ta.t.length - tail;
-  let lo = +Infinity, hi = -Infinity;
-  for (let i = start; i < ta.t.length; i++) {
-    if (ta.low[i]  < lo) lo = ta.low[i];
-    if (ta.high[i] > hi) hi = ta.high[i];
+  const [buckets,  setBuckets]  = useState(24);
+  const [lookback, setLookback] = useState(200);
+
+  // Build a lightweight candle array view from the TA snapshot.
+  const candles = useMemo(() => {
+    if (!ta || ta.empty || !ta.t?.length) return null;
+    const n = ta.t.length;
+    const out = new Array(n);
+    for (let i = 0; i < n; i++) {
+      out[i] = { t: ta.t[i], o: ta.open[i], h: ta.high[i], l: ta.low[i], c: ta.close[i], v: ta.volume[i] };
+    }
+    return out;
+  }, [ta]);
+
+  const VP = window.__MNP__?.VolumeProfile;
+  const bundle = useMemo(() => {
+    if (!VP || !candles) return null;
+    try { return VP.computeVolumeProfile(candles, { buckets, lookback }); }
+    catch (err) { console.warn("[ui] VP compute failed", err); return null; }
+  }, [VP, candles, buckets, lookback]);
+
+  // Emit `vp:updated` (and a paired `vp:vah-val` snapshot) whenever the
+  // bundle changes so other surfaces (e.g. the chart overlay, scanner,
+  // AI chat) can subscribe without re-computing.
+  useEffect(() => {
+    const bus = window.__MNP__?.EventBus;
+    if (!bus || !bundle) return;
+    try {
+      bus.emit("vp:updated", { bundle, buckets, lookback });
+      bus.emit("vp:vah-val", { poc: bundle.pocPrice, vah: bundle.vahPrice, val: bundle.valPrice });
+    } catch { /* swallow listener errors */ }
+  }, [bundle, buckets, lookback]);
+
+  const picker = (label, value, options, setValue) => (
+    <div style={{ display: "flex", gap: 4, alignItems: "center", fontSize: 10 }}>
+      <span style={{ color: "var(--fg-dim)", marginRight: 4, textTransform: "uppercase", letterSpacing: 1 }}>{label}</span>
+      {options.map((n) => (
+        <button
+          key={n}
+          type="button"
+          className={"chip-toggle " + (value === n ? "on" : "")}
+          style={{ fontSize: 10, padding: "3px 8px" }}
+          onClick={() => setValue(n)}
+          aria-pressed={value === n}>
+          {n}
+        </button>
+      ))}
+    </div>
+  );
+
+  if (!bundle) {
+    return (
+      <div className="card">
+        <h3>Volume Profile <span className="badge">warmup</span></h3>
+        <div style={{ color: "var(--fg-dim)", fontSize: 12, marginBottom: 8 }}>
+          Need price-bucketable history (≥ 2 bars with non-flat range).
+        </div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          {picker("Buckets",  buckets,  VP_BUCKET_OPTIONS,   setBuckets)}
+          {picker("Lookback", lookback, VP_LOOKBACK_OPTIONS, setLookback)}
+        </div>
+      </div>
+    );
   }
-  if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) return null;
-  const step = (hi - lo) / buckets;
-  const rows = Array.from({ length: buckets }, (_, i) => ({
-    lo: lo + step * i, hi: lo + step * (i + 1), vol: 0, up: 0, dn: 0,
-  }));
-  for (let i = start; i < ta.t.length; i++) {
-    const tp = (ta.high[i] + ta.low[i] + ta.close[i]) / 3;
-    const idx = Math.min(buckets - 1, Math.max(0, Math.floor((tp - lo) / step)));
-    const vol = +ta.volume[i] || 0;
-    rows[idx].vol += vol;
-    if (ta.close[i] >= ta.open[i]) rows[idx].up += vol; else rows[idx].dn += vol;
-  }
-  const maxV = rows.reduce((m, r) => r.vol > m ? r.vol : m, 0) || 1;
-  const pocIdx = rows.reduce((mi, r, i, arr) => r.vol > arr[mi].vol ? i : mi, 0);
-  const last = ta.close[ta.close.length - 1];
+
+  const last  = ta?.close?.[ta.close.length - 1];
+  const maxV  = bundle.rows.reduce((m, r) => r.vol > m ? r.vol : m, 0) || 1;
+
   return (
     <div className="card">
       <h3>Volume Profile
-        <span className="badge">{tail} bars</span>
+        <span className="badge">{bundle.lookback}b · {bundle.buckets}c</span>
       </h3>
+
+      {/* KPI strip — POC / VAH / VAL */}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6, marginBottom: 8 }}>
+        <div className="dl-cell"><div className="k">POC</div><div className="v" style={{ color: "var(--warn)" }}>{fmt(bundle.pocPrice)}</div></div>
+        <div className="dl-cell"><div className="k">VAH</div><div className="v">{fmt(bundle.vahPrice)}</div></div>
+        <div className="dl-cell"><div className="k">VAL</div><div className="v">{fmt(bundle.valPrice)}</div></div>
+      </div>
+
       <div style={{ display: "flex", flexDirection: "column-reverse", gap: 1, fontSize: 10, fontFamily: "var(--font-mono)" }}>
-        {rows.map((r, i) => {
-          const mid = (r.lo + r.hi) / 2;
+        {bundle.rows.map((r) => {
           const w = (r.vol / maxV) * 100;
           const upPct = r.vol > 0 ? (r.up / r.vol) * 100 : 0;
-          const isPOC = i === pocIdx;
-          const near  = last >= r.lo && last < r.hi;
+          const near  = Number.isFinite(last) && last >= r.lo && last < r.hi;
+          const tag = r.isPOC ? "POC"
+                    : r.isVAH ? "VAH"
+                    : r.isVAL ? "VAL"
+                    : r.density === "HVN" ? "HVN"
+                    : r.density === "LVN" ? "LVN"
+                    : "";
+          const tagColor = r.isPOC ? "var(--warn)"
+                         : r.isVAH || r.isVAL ? "var(--accent)"
+                         : r.density === "HVN" ? "var(--bull)"
+                         : r.density === "LVN" ? "var(--fg-dim)"
+                         : "var(--fg-dim)";
+          // Visual: shaded background for value-area rows, framed border for POC,
+          // dashed top/bottom for VAH/VAL.
+          const rowBg = r.inValueArea ? "rgba(41,98,255,.05)" : "transparent";
+          const border =
+            r.isPOC ? "1px solid var(--warn)"
+            : r.isVAH ? "1px dashed var(--accent)"
+            : r.isVAL ? "1px dashed var(--accent)"
+            : "none";
           return (
-            <div key={i} style={{ display: "grid", gridTemplateColumns: "54px 1fr 38px", alignItems: "center", gap: 4, opacity: isPOC ? 1 : .82 }}>
+            <div
+              key={r.idx}
+              style={{
+                display: "grid",
+                gridTemplateColumns: "54px 1fr 38px",
+                alignItems: "center",
+                gap: 4,
+                opacity: r.inValueArea ? 1 : 0.78,
+                background: rowBg,
+                paddingRight: 2,
+              }}>
               <span style={{ color: near ? "var(--accent)" : "var(--fg-dim)", fontSize: 9 }}>
-                {fmt(mid, mid > 1000 ? 0 : 2)}
+                {fmt(r.mid, r.mid > 1000 ? 0 : 2)}
               </span>
-              <div style={{ position: "relative", height: 10, background: "var(--bg)", borderRadius: 2, overflow: "hidden", border: isPOC ? "1px solid var(--warn)" : "none" }}>
+              <div style={{ position: "relative", height: 10, background: "var(--bg)", borderRadius: 2, overflow: "hidden", border }}>
                 <span style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: `${w * upPct / 100}%`, background: "rgba(38,166,154,.55)" }} />
                 <span style={{ position: "absolute", left: `${w * upPct / 100}%`, top: 0, bottom: 0, width: `${w * (100 - upPct) / 100}%`, background: "rgba(239,83,80,.55)" }} />
               </div>
-              <span style={{ color: isPOC ? "var(--warn)" : "var(--fg-dim)", textAlign: "right", fontSize: 9 }}>
-                {isPOC ? "POC" : (w > 40 ? "HVN" : w < 10 ? "LVN" : "")}
+              <span style={{ color: tagColor, textAlign: "right", fontSize: 9, fontWeight: r.isPOC ? "bold" : "normal" }}>
+                {tag}
               </span>
             </div>
           );
         })}
+      </div>
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 10, paddingTop: 8, borderTop: "1px dashed var(--border)" }}>
+        {picker("Buckets",  buckets,  VP_BUCKET_OPTIONS,   setBuckets)}
+        {picker("Lookback", lookback, VP_LOOKBACK_OPTIONS, setLookback)}
+      </div>
+      <div style={{ fontSize: 10, color: "var(--fg-dim)", marginTop: 6 }}>
+        VA {Math.round(bundle.valueAreaPct * 100)} % · HVN {bundle.hvnCount} · LVN {bundle.lvnCount}
       </div>
     </div>
   );
@@ -2662,6 +2851,7 @@ function App() {
   });
   const [structure, setStructure] = useState({
     bos: true, fvg: true, ob: true, liq: true, sr: true, pdh: true, pd: false, ghost: true,
+    volProfile: false,
   });
   const announce = useAnnouncer();
   const net  = useBus("net", { online: navigator.onLine });
