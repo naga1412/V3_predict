@@ -775,6 +775,7 @@ function TopBar({ tab, setTab, symbol, setSymbol, tf, setTf, net, skew, status, 
       <nav className="tabnav" aria-label="primary">
         <button className={"tab-btn" + (tab === "chart" ? " active" : "")} onClick={() => setTab("chart")}>Chart</button>
         <button className={"tab-btn" + (tab === "scanner" ? " active" : "")} onClick={() => setTab("scanner")}>Scanner</button>
+        <button className={"tab-btn" + (tab === "news" ? " active" : "")} onClick={() => setTab("news")}>News</button>
         <button className={"tab-btn" + (tab === "chat" ? " active" : "")} onClick={() => setTab("chat")}>AI Chat</button>
         <button className={"tab-btn" + (tab === "system" ? " active" : "")} onClick={() => setTab("system")}>
           System <span className="chip">{window.__MNP__?.caps?.privateMode ? "PRIV" : "OK"}</span>
@@ -3001,6 +3002,238 @@ function KpiStrip({ bootstrapCount, gaps, orch, ta, validation, sysEvents }) {
 }
 
 /* ╔══════════════════════════════════════════════════════════════════╗
+   ║  News tab (M4a) — sentiment wall + filters                       ║
+   ║  Pulls from window.__MNP__.NewsManager which auto-refreshes       ║
+   ║  every 10 min.  Renders a category tab strip, an impact filter,  ║
+   ║  optional symbol filter, and a list of items — each with         ║
+   ║  sentiment chip, category chip, age, and sentiment-bar tinted    ║
+   ║  on the side (green/red gradient).                               ║
+   ╚══════════════════════════════════════════════════════════════════╝ */
+
+const NEWS_TYPES = [
+  ["all",        "All",        ""],
+  ["FED",        "FED",        "warn"],
+  ["WAR",        "War",        "bear"],
+  ["CRYPTO REG", "Crypto Reg", "warn"],
+  ["MACRO",      "Macro",      "accent"],
+  ["EARNINGS",   "Earnings",   "accent"],
+  ["CRYPTO MKT", "Crypto",     "bull"],
+  ["STOCK MKT",  "Stocks",     "accent"],
+  ["EU MKT",     "EU",         ""],
+  ["GENERAL",    "Other",      ""],
+];
+
+function timeAgo(t) {
+  if (!Number.isFinite(t)) return "";
+  const d = Date.now() - t;
+  if (d < 60_000) return "just now";
+  if (d < 60 * 60_000) return `${Math.floor(d / 60_000)}m ago`;
+  if (d < 24 * 60 * 60_000) return `${Math.floor(d / (60 * 60_000))}h ago`;
+  return `${Math.floor(d / (24 * 60 * 60_000))}d ago`;
+}
+
+function NewsPane({ symbol }) {
+  const [type,        setType]        = useState("all");
+  const [minImpact,   setMinImpact]   = useState(0);
+  const [filterSymbol,setFilterSymbol]= useState("");
+  const [items,       setItems]       = useState([]);
+  const [refreshing,  setRefreshing]  = useState(false);
+  const [err,         setErr]         = useState(null);
+
+  // Subscribe to NewsManager updates.
+  useEffect(() => {
+    const NM = window.__MNP__?.NewsManager;
+    if (!NM?.subscribe) return;
+    const off = NM.subscribe((rows) => setItems(rows.slice(0, 200)));
+    setItems(NM.list?.({ limit: 200 }) || []);
+    return () => { try { off?.(); } catch {} };
+  }, []);
+
+  useEffect(() => {
+    const bus = window.__MNP__?.EventBus;
+    if (!bus?.on) return;
+    const offErr = bus.on("news:error", (e) => setErr(e?.error || "fetch failed"));
+    const offBatch = bus.on("news:batch", () => setErr(null));
+    return () => { try { offErr?.(); offBatch?.(); } catch {} };
+  }, []);
+
+  const filtered = useMemo(() => {
+    return items.filter((it) => {
+      if (type !== "all" && it.classification?.primary !== type) return false;
+      if (minImpact > 0 && (it.classification?.impact || 0) < minImpact) return false;
+      if (filterSymbol) {
+        const s = filterSymbol.toUpperCase();
+        if (!Array.isArray(it.symbols) || !it.symbols.includes(s)) return false;
+      }
+      return true;
+    });
+  }, [items, type, minImpact, filterSymbol]);
+
+  const tally = useMemo(() => {
+    const out = { all: items.length };
+    for (const it of items) {
+      const k = it.classification?.primary || "GENERAL";
+      out[k] = (out[k] || 0) + 1;
+    }
+    return out;
+  }, [items]);
+
+  const refresh = async () => {
+    const NM = window.__MNP__?.NewsManager;
+    if (!NM?.refresh) return;
+    setRefreshing(true);
+    try { await NM.refresh({ force: true }); }
+    catch (e) { setErr(e?.message || String(e)); }
+    finally { setRefreshing(false); }
+  };
+
+  return (
+    <div style={{ padding: 16, display: "flex", flexDirection: "column", gap: 12, maxWidth: 1100, margin: "0 auto" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <div>
+          <h2 style={{ margin: 0, fontSize: 18, color: "var(--fg)" }}>News & Sentiment</h2>
+          <div style={{ fontSize: 11, color: "var(--fg-dim)", marginTop: 4 }}>
+            {items.length} items · auto-refresh 10m · sentiment + 8-cat taxonomy
+            {err ? ` · err: ${err}` : ""}
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+          <button
+            type="button"
+            className="chip-toggle"
+            style={{ fontSize: 11, padding: "4px 10px", opacity: refreshing ? 0.5 : 1 }}
+            disabled={refreshing}
+            onClick={refresh}>
+            {refreshing ? "fetching…" : "refresh now"}
+          </button>
+        </div>
+      </div>
+
+      {/* Category tabs */}
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+        {NEWS_TYPES.map(([k, label, tone]) => (
+          <button
+            key={k}
+            type="button"
+            className={"chip-toggle " + (type === k ? "on " + (tone || "") : "")}
+            style={{ fontSize: 10, padding: "3px 8px" }}
+            onClick={() => setType(k)}
+            aria-pressed={type === k}>
+            {label}
+            <span style={{ marginLeft: 4, color: "var(--fg-dim)" }}>{tally[k] ?? 0}</span>
+          </button>
+        ))}
+      </div>
+
+      {/* Impact + symbol row */}
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 12, fontSize: 11, alignItems: "center" }}>
+        <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+          <span style={{ color: "var(--fg-dim)" }}>Min impact</span>
+          {[0, 0.35, 0.65].map((v) => (
+            <button
+              key={v}
+              type="button"
+              className={"chip-toggle " + (minImpact === v ? "on warn" : "")}
+              style={{ fontSize: 10, padding: "3px 8px" }}
+              onClick={() => setMinImpact(v)}>
+              {v === 0 ? "any" : v === 0.35 ? "med" : "high"}
+            </button>
+          ))}
+        </div>
+        <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+          <span style={{ color: "var(--fg-dim)" }}>Symbol</span>
+          <input
+            type="search"
+            placeholder="e.g. BTC"
+            value={filterSymbol}
+            onChange={(e) => setFilterSymbol(e.target.value)}
+            style={{
+              padding: "3px 8px", fontSize: 11, fontFamily: "inherit",
+              background: "var(--bg)", color: "var(--fg)",
+              border: "1px solid var(--border)", borderRadius: 3,
+              width: 100,
+            }}
+          />
+          <button type="button" className="chip-toggle" style={{ fontSize: 10, padding: "3px 8px" }}
+                  onClick={() => setFilterSymbol(symbol?.replace(/USDT$/, "").replace(/:.*/, "") || "")}>
+            track current
+          </button>
+        </div>
+      </div>
+
+      {/* List */}
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        {filtered.length === 0 ? (
+          <div style={{ color: "var(--fg-dim)", fontSize: 12, padding: 24, textAlign: "center" }}>
+            {items.length === 0 ? "Loading first batch — RSS proxy can take a few seconds…" : "No matches for the current filter."}
+          </div>
+        ) : filtered.map((it) => {
+          const sent = it.sentiment?.compound || 0;
+          const sentColor = sent >  0.2 ? "var(--bull)"
+                          : sent < -0.2 ? "var(--bear)"
+                          : "var(--fg-dim)";
+          const sentLabel = it.sentiment?.label || "neutral";
+          const cat = it.classification?.primary || "GENERAL";
+          const catTone = NEWS_TYPES.find(([k]) => k === cat)?.[2] || "";
+          const impact = it.classification?.impact || 0;
+          return (
+            <a
+              key={it.guid}
+              href={it.link || "#"}
+              target="_blank" rel="noopener noreferrer"
+              style={{
+                display: "grid",
+                gridTemplateColumns: "4px 1fr auto",
+                gap: 10,
+                padding: 10,
+                textDecoration: "none",
+                color: "var(--fg)",
+                background: "var(--bg-elev-1, #1a1e2a)",
+                border: "1px solid var(--border, #2a2e39)",
+                borderRadius: 4,
+              }}>
+              {/* sentiment bar (left edge) */}
+              <span style={{
+                background: sentColor,
+                width: 4, borderRadius: 2,
+                opacity: 0.5 + 0.5 * Math.min(1, Math.abs(sent)),
+              }} />
+              <div style={{ minWidth: 0, display: "flex", flexDirection: "column", gap: 4 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                  <span style={{ fontWeight: "bold", fontSize: 13, lineHeight: 1.3 }}>{it.title}</span>
+                </div>
+                <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap", fontSize: 10 }}>
+                  <span className={"chip-toggle on " + catTone} style={{ fontSize: 9, padding: "1px 6px" }}>{cat}</span>
+                  <span style={{ color: sentColor, fontWeight: "bold" }}>
+                    {sentLabel.toUpperCase()} {sent >= 0 ? "+" : ""}{sent.toFixed(2)}
+                  </span>
+                  {it.classification?.highImpact && (
+                    <span className="chip-toggle on warn" style={{ fontSize: 9, padding: "1px 6px" }}>HIGH-IMPACT</span>
+                  )}
+                  <span style={{ color: "var(--fg-dim)" }}>· {it.source || "—"}</span>
+                  <span style={{ color: "var(--fg-dim)" }}>· {timeAgo(it.pubDate)}</span>
+                  {Array.isArray(it.symbols) && it.symbols.slice(0, 4).map((s) => (
+                    <span key={s} style={{ color: "var(--fg-dim)", fontFamily: "var(--font-mono)" }}>${s}</span>
+                  ))}
+                </div>
+                {it.summary && (
+                  <div style={{ fontSize: 11, color: "var(--fg-dim)", lineHeight: 1.4, overflow: "hidden", textOverflow: "ellipsis", display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical" }}>
+                    {it.summary}
+                  </div>
+                )}
+              </div>
+              <div style={{ alignSelf: "center", fontSize: 9, color: "var(--fg-dim)", textAlign: "right", minWidth: 32 }}>
+                {impact > 0 ? `${Math.round(impact * 100)}%` : ""}
+              </div>
+            </a>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/* ╔══════════════════════════════════════════════════════════════════╗
    ║  Scanner tab                                                     ║
    ╚══════════════════════════════════════════════════════════════════╝ */
 
@@ -3362,6 +3595,11 @@ function App() {
         {tab === "scanner" && (
           <div style={{ gridColumn: "1 / -1", overflow: "auto" }}>
             <ScannerPane tf={tf} />
+          </div>
+        )}
+        {tab === "news" && (
+          <div style={{ gridColumn: "1 / -1", overflow: "auto" }}>
+            <NewsPane symbol={symbol} />
           </div>
         )}
         {tab === "chat" && (

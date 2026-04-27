@@ -1,0 +1,299 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>MNP · M4a — News + sentiment + categories unit tests</title>
+<style>
+  body { background:#131722; color:#d1d4dc; font:13px/1.5 monospace; padding:20px; }
+  .pass { color:#26a69a; }
+  .fail { color:#ef5350; }
+  .group { margin-top: 12px; font-weight:bold; color:#2962ff; }
+  h1 { color:#fff; font-size:18px; }
+  #out { white-space: pre-wrap; }
+  .note { color:#787b86; }
+  .summary { margin-top: 16px; padding: 8px; border:1px solid #2a2e39; }
+</style>
+</head>
+<body>
+<h1>MNP — M4a · News + sentiment + categories</h1>
+
+<script>
+  if (location.protocol === "file:") {
+    document.addEventListener("DOMContentLoaded", () => {
+      document.body.innerHTML = `
+        <h1 style="color:#fff">phase M4a test harness</h1>
+        <div style="background:#3a1d1d;border:1px solid #ef5350;padding:16px;margin-top:16px;border-radius:4px">
+          <div style="color:#ef5350;font-weight:bold">Run on http://localhost (not file://)</div>
+          <pre style="background:#1a1e2a;padding:10px;margin-top:10px;color:#26a69a">cd v3 && python -m http.server 3131</pre>
+        </div>`;
+    });
+    throw new Error("file:// origin");
+  }
+</script>
+
+<div id="out">running…</div>
+
+<script type="module">
+const out = document.getElementById("out");
+window.addEventListener("error", (e) => {
+  out.innerHTML += `<span class="fail">✗ ${e.message}</span>\n<span class="note">${e.filename}:${e.lineno}:${e.colno}</span>\n`;
+});
+window.addEventListener("unhandledrejection", (e) => {
+  out.innerHTML += `<span class="fail">✗ unhandled: ${e.reason?.message || e.reason}</span>\n<span class="note">${e.reason?.stack || ''}</span>\n`;
+});
+
+const V = "m4a-" + Date.now();
+const U = (p) => new URL(`${p}?v=${V}`, location.href).href;
+
+const Sentiment = await import(U("../src/news/sentiment.js"));
+const Cats      = await import(U("../src/news/categories.js"));
+const RSS       = await import(U("../src/news/rss.js"));
+
+let n = 0, p = 0;
+const log = (s, ok, err) => {
+  out.innerHTML += `<span class="${ok?'pass':'fail'}">${ok?'✓':'✗'} ${s}${err ? ' — ' + err : ''}</span>\n`;
+  n++; if (ok) p++;
+};
+const group = (s) => { out.innerHTML += `\n<span class="group">[${s}]</span>\n`; };
+const close = (a, b, eps=1e-7) => Math.abs(a - b) <= eps;
+
+/* ════════════ Sentiment ════════════ */
+group("Sentiment · cleanHeadline + extractSymbols");
+{
+  log("strips HTML tags", Sentiment.cleanHeadline("<p>BTC <b>rallies</b></p>") === "BTC rallies");
+  log("decodes &amp; &lt; &gt;", Sentiment.cleanHeadline("AT&amp;T jumps") === "AT&T jumps");
+  log("collapses whitespace", Sentiment.cleanHeadline("  hello   world  ") === "hello world");
+  log("non-string → empty", Sentiment.cleanHeadline(null) === "");
+
+  const syms = Sentiment.extractSymbols("BTC and ETH rally; $AAPL hits ATH but US economy soft");
+  log("extracts BTC + ETH + AAPL", syms.includes("BTC") && syms.includes("ETH") && syms.includes("AAPL"));
+  log("skips false-positive 'US' / 'AT'", !syms.includes("US") && !syms.includes("AT"));
+}
+
+group("Sentiment · score");
+{
+  const r1 = Sentiment.score("Bitcoin rallies to all-time high as inflows surge");
+  log("bullish headline → label=bullish",  r1.label === "bullish");
+  log("bullish compound > 0.2",            r1.compound > 0.2);
+  log("bullish has hits[]",                Array.isArray(r1.hits) && r1.hits.length > 0);
+
+  const r2 = Sentiment.score("Crypto market crashes as SEC sues Binance, halts trading");
+  log("bearish headline → label=bearish",  r2.label === "bearish");
+  log("bearish compound < -0.2",           r2.compound < -0.2);
+
+  const r3 = Sentiment.score("Bitcoin price unchanged in quiet trading");
+  log("neutral headline → label=neutral",  r3.label === "neutral");
+
+  // Negation flips polarity
+  const rNeg = Sentiment.score("BTC fails to rally");
+  log("negation: 'fails to rally' → bearish", rNeg.compound < 0);
+
+  // Intensifier amplifies
+  const rAmp1 = Sentiment.score("BTC surges");
+  const rAmp2 = Sentiment.score("BTC massively surges");
+  log("intensifier amplifies score", Math.abs(rAmp2.compound) > Math.abs(rAmp1.compound));
+
+  // Bigram: "all-time high" is bullish even isolated
+  const rBg = Sentiment.score("Stock posts all-time high");
+  log("bigram 'all-time high' → bullish", rBg.compound > 0);
+
+  // Empty / null
+  log("empty → 0",       Sentiment.score("").compound === 0);
+  log("null → neutral",  Sentiment.score(null).label === "neutral");
+}
+
+group("Sentiment · scoreItem (title + summary blend)");
+{
+  const r = Sentiment.scoreItem({
+    title:   "Bitcoin rallies to record high",
+    summary: "Strong inflows continue as institutions add",
+  });
+  log("title-led blend produces bullish", r.label === "bullish");
+  log("compound is finite + in [-1,+1]",  Number.isFinite(r.compound) && Math.abs(r.compound) <= 1);
+
+  // Title bearish, summary bullish — title wins (70/30 weight)
+  const rMix = Sentiment.scoreItem({
+    title:   "Bitcoin crashes 15%",
+    summary: "Some traders see opportunity to buy the dip and rally",
+  });
+  log("title-bearish + summary-bullish → bearish (title weight)", rMix.compound < 0);
+}
+
+/* ════════════ Categories ════════════ */
+group("Categories · classify");
+{
+  const r1 = Cats.classify({ title: "Fed signals rate cut in December", source: "Reuters" });
+  log("FED keyword detected", r1.matched.includes("FED"));
+  log("FED is primary",       r1.primary === "FED");
+
+  const r2 = Cats.classify({ title: "SEC sues Coinbase over staking program", source: "CoinDesk" });
+  log("CRYPTO REG matched", r2.matched.includes("CRYPTO REG"));
+  log("CRYPTO REG is primary",  r2.primary === "CRYPTO REG");
+
+  const r3 = Cats.classify({ title: "Russian missile strike kills 12 in Kyiv", source: "BBC" });
+  log("WAR matched", r3.matched.includes("WAR"));
+  log("WAR is highImpact",  r3.highImpact === true);
+
+  const r4 = Cats.classify({ title: "Apple beats earnings estimates with iPhone strong" });
+  log("EARNINGS matched", r4.matched.includes("EARNINGS"));
+
+  const r5 = Cats.classify({ title: "CPI report shows inflation easing" });
+  log("MACRO matched", r5.matched.includes("MACRO"));
+
+  const r6 = Cats.classify({ title: "Bitcoin liquidations top $500M after sudden plunge" });
+  log("CRYPTO MKT matched", r6.matched.includes("CRYPTO MKT"));
+
+  const r7 = Cats.classify({ title: "S&P 500 closes at record high" });
+  log("STOCK MKT matched", r7.matched.includes("STOCK MKT"));
+
+  const r8 = Cats.classify({ title: "FTSE 100 rallies on banking earnings" });
+  log("EU MKT matched", r8.matched.includes("EU MKT"));
+
+  const r9 = Cats.classify({ title: "Local town fair this weekend" });
+  log("no-match → primary=GENERAL", r9.primary === "GENERAL");
+}
+
+group("Categories · impact + priority");
+{
+  const r = Cats.classify({
+    title:   "BREAKING: SEC sues Binance for fraud, freezes assets",
+    summary: "Multiple violations alleged",
+    source:  "Reuters",
+  });
+  log("multi-cat HIGH impact",        r.highImpact === true);
+  log("impact >= 0.65",                r.impact >= 0.65);
+  log("primary = CRYPTO REG (priority)", r.primary === "CRYPTO REG");
+
+  // Source prior: same headline, different sources
+  const a = Cats.classify({ title: "Fed cuts rates", source: "Reuters" });
+  const b = Cats.classify({ title: "Fed cuts rates", source: "Random Blog" });
+  log("Reuters source prior >= Random Blog", a.impact >= b.impact);
+}
+
+group("Categories · tally");
+{
+  const items = [
+    { classification: { primary: "FED", highImpact: true }  },
+    { classification: { primary: "FED", highImpact: false } },
+    { classification: { primary: "WAR", highImpact: true }  },
+    { classification: { primary: "GENERAL", highImpact: false } },
+  ];
+  const t = Cats.tally(items);
+  log("tally.total === 4",        t.total === 4);
+  log("tally.byCat.FED === 2",     t.byCat.FED === 2);
+  log("tally.highImpact === 2",   t.highImpact === 2);
+}
+
+/* ════════════ RSS · parseRssXml ════════════ */
+group("RSS · parseRssXml (RSS 2.0)");
+{
+  const xml = `<?xml version="1.0"?>
+  <rss version="2.0">
+    <channel>
+      <item>
+        <title>Bitcoin rallies to ATH</title>
+        <link>https://example.com/btc-ath</link>
+        <description>BTC hits new high as inflows surge</description>
+        <pubDate>Mon, 27 Apr 2026 12:00:00 GMT</pubDate>
+        <guid>btc-ath-2026</guid>
+      </item>
+      <item>
+        <title>Fed cuts rates</title>
+        <link>https://example.com/fed</link>
+        <description>FOMC signals dovish pivot</description>
+        <pubDate>Sun, 26 Apr 2026 18:00:00 GMT</pubDate>
+        <guid>fed-cut-2026</guid>
+      </item>
+    </channel>
+  </rss>`;
+  const items = RSS.parseRssXml(xml);
+  log("parses 2 items",                    items.length === 2);
+  log("first item has title",              items[0].title === "Bitcoin rallies to ATH");
+  log("first item has guid",               items[0].guid === "btc-ath-2026");
+  log("first item has link",               items[0].link === "https://example.com/btc-ath");
+  log("pubDate parsed to ms",              Number.isFinite(items[0].pubDate) && items[0].pubDate > 0);
+}
+
+group("RSS · parseRssXml (Atom 1.0)");
+{
+  const atom = `<?xml version="1.0"?>
+  <feed xmlns="http://www.w3.org/2005/Atom">
+    <entry>
+      <title>Apple Q1 Earnings</title>
+      <link href="https://example.com/aapl-q1"/>
+      <summary>Apple beats expectations</summary>
+      <published>2026-04-27T10:00:00Z</published>
+      <id>aapl-q1-2026</id>
+    </entry>
+  </feed>`;
+  const items = RSS.parseRssXml(atom);
+  log("parses Atom entry",  items.length === 1);
+  log("Atom title parsed",  items[0].title === "Apple Q1 Earnings");
+  log("Atom link href parsed", items[0].link === "https://example.com/aapl-q1");
+  log("Atom id parsed",     items[0].guid === "aapl-q1-2026");
+}
+
+group("RSS · parseRssXml degenerates");
+{
+  log("empty string → []",  RSS.parseRssXml("").length === 0);
+  log("null → []",          RSS.parseRssXml(null).length === 0);
+  log("malformed → []",     RSS.parseRssXml("<not-xml").length === 0);
+  log("no items → []",      RSS.parseRssXml("<rss><channel></channel></rss>").length === 0);
+  log("item without title is skipped",
+      RSS.parseRssXml("<rss><channel><item><link>x</link></item></channel></rss>").length === 0);
+}
+
+group("RSS · SOURCES registry");
+{
+  log("SOURCES is a non-empty array", Array.isArray(RSS.SOURCES) && RSS.SOURCES.length > 0);
+  log("every source has id+name+url",
+      RSS.SOURCES.every(s => s.id && s.name && /^https?:\/\//.test(s.url)));
+  log("includes coindesk", RSS.SOURCES.some(s => s.id === "coindesk"));
+  log("includes reuters",  RSS.SOURCES.some(s => /reuters/.test(s.id)));
+}
+
+/* ════════════ NewsManager · annotation pipeline ════════════ */
+group("NewsManager · annotation");
+{
+  // Late-import to avoid IDB side-effects on module load
+  const NM = await import(U("../src/news/newsManager.js"));
+  NM._resetForTests();
+
+  const item = NM._ingestForTests({
+    title: "Bitcoin rallies to all-time high as Fed signals rate cut",
+    summary: "BTC inflows surge",
+    source: "Reuters",
+    sourceId: "reuters-business",
+    link: "https://example.com/x",
+    pubDate: Date.now() - 5 * 60_000,
+  });
+  log("ingested item returned", !!item && item.title);
+  log("sentiment is bullish", item.sentiment.label === "bullish");
+  log("classification has primary", typeof item.classification.primary === "string");
+  log("symbols extracted (BTC)", Array.isArray(item.symbols) && item.symbols.includes("BTC"));
+  log("focus carried (if provided)",   Array.isArray(item.focus));
+
+  // list filters
+  const allList    = NM.list({ limit: 50 });
+  log("list returns ingested item", allList.length >= 1 && allList[0].guid === item.guid);
+  const fedList    = NM.list({ type: "FED" });
+  log("type filter respects classification", fedList.every(i => i.classification.primary === "FED"));
+  const symList    = NM.list({ symbol: "BTC" });
+  log("symbol filter returns matching items", symList.every(i => i.symbols.includes("BTC")));
+  const noneList   = NM.list({ symbol: "ZZZZZ" });
+  log("filter on missing symbol → empty", noneList.length === 0);
+
+  // macroTally
+  const t = NM.macroTally();
+  log("macroTally.total >= 1", t.total >= 1);
+
+  NM._resetForTests();
+  log("reset clears items", NM.list().length === 0);
+}
+
+/* ════════════ Summary ════════════ */
+out.innerHTML += `\n<div class="summary ${p===n?'pass':'fail'}">Ran ${n} tests — ${p} passed, ${n-p} failed.</div>`;
+document.title = `MNP m4a ${p}/${n}`;
+</script>
+</body>
+</html>

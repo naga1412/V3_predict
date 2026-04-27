@@ -73,6 +73,11 @@ import * as ChartPatterns from "../ta/patterns/chartPatterns.js";
 // M3.5 — Multi-asset universe + dynamic Binance crypto loader
 import * as Universe        from "../data/universe.js";
 import { fetchCryptoUniverse } from "../data/cryptoUniverse.js";
+// M4a — News + sentiment + macro categorisation
+import * as Sentiment   from "../news/sentiment.js";
+import * as NewsCats    from "../news/categories.js";
+import * as RSS         from "../news/rss.js";
+import * as NewsManager from "../news/newsManager.js";
 // Phase 10 — Auto-validation + drift monitor
 import * as PredictionStore from "../validation/predictionStore.js";
 import * as Validator from "../validation/validator.js";
@@ -156,13 +161,18 @@ export async function boot() {
     // M3.5
     Universe,
     fetchCryptoUniverse,
+    // M4a
+    Sentiment,
+    NewsCats,
+    RSS,
+    NewsManager,
     // Phase 10
     PredictionStore,
     Validator,
     Drift,
     ValidationMonitor,
     createDefaultMonitor,
-    version: "3.0.0-m3.5x",
+    version: "3.0.0-m4a",
   };
 
   // Degrade decisions ------------------------------------------------------
@@ -239,6 +249,13 @@ export async function boot() {
 
   log("bootstrap complete", sum);
   EventBus.emit("boot:complete", { caps, summary: sum });
+
+  // M4a — Kick off the news manager.  Hydrates from IDB on first call,
+  // schedules a fetch ~4 s after start (so it doesn't compete with the
+  // splash → React mount path), then auto-refreshes every 10 minutes.
+  NewsManager.start({ intervalMs: 10 * 60 * 1000 }).catch((err) => {
+    log("news:start failed", err?.message || err);
+  });
 
   // M3.5 — Kick off dynamic crypto universe load in the background.
   // Doesn't block the splash; emits `universe:ready` when the merge

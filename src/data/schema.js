@@ -13,7 +13,7 @@
  */
 
 export const DB_NAME    = "mnp";
-export const DB_VERSION = 4;
+export const DB_VERSION = 5;
 
 export const STORES = {
   // Time-series (OHLCV)
@@ -133,6 +133,22 @@ export const STORES = {
       { name: "by_createdAt",   keyPath: "createdAt" },
     ],
   },
+
+  // M4a (DB v5): news headlines + sentiment + categorisation.  Row shape:
+  //   { guid, source, sourceId, link, title, summary, pubDate, fetchedAt,
+  //     sentiment: {compound,label,pos,neg},
+  //     classification: {primary, matched, impact, highImpact},
+  //     symbols: [...], focus: [...], region }
+  news: {
+    keyPath: "guid",
+    autoIncrement: false,
+    indexes: [
+      { name: "by_pubDate",       keyPath: "pubDate" },
+      { name: "by_source",        keyPath: "sourceId" },
+      { name: "by_primary",       keyPath: "classification.primary" },
+      { name: "by_highImpact",    keyPath: "classification.highImpact" },
+    ],
+  },
 };
 
 /**
@@ -181,6 +197,18 @@ export const MIGRATIONS = {
     if (db.objectStoreNames.contains("ghosts")) return;
     const def = STORES.ghosts;
     const store = db.createObjectStore("ghosts", {
+      keyPath: def.keyPath,
+      autoIncrement: def.autoIncrement || false,
+    });
+    (def.indexes || []).forEach(({ name: iname, keyPath, unique = false, multiEntry = false }) => {
+      store.createIndex(iname, keyPath, { unique, multiEntry });
+    });
+  },
+  // M4a: added `news` store for headlines + sentiment + categorisation.
+  5: (db /*: IDBDatabase */) => {
+    if (db.objectStoreNames.contains("news")) return;
+    const def = STORES.news;
+    const store = db.createObjectStore("news", {
       keyPath: def.keyPath,
       autoIncrement: def.autoIncrement || false,
     });
