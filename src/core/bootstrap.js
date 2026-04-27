@@ -70,6 +70,9 @@ import * as VolumeProfile from "../ta/profile/volumeProfileEnhanced.js";
 // M3 step 6 — Trendlines + chart patterns
 import * as Trendlines    from "../ta/structure/trendlines.js";
 import * as ChartPatterns from "../ta/patterns/chartPatterns.js";
+// M3.5 — Multi-asset universe + dynamic Binance crypto loader
+import * as Universe        from "../data/universe.js";
+import { fetchCryptoUniverse } from "../data/cryptoUniverse.js";
 // Phase 10 — Auto-validation + drift monitor
 import * as PredictionStore from "../validation/predictionStore.js";
 import * as Validator from "../validation/validator.js";
@@ -150,13 +153,16 @@ export async function boot() {
     // M3 step 6
     Trendlines,
     ChartPatterns,
+    // M3.5
+    Universe,
+    fetchCryptoUniverse,
     // Phase 10
     PredictionStore,
     Validator,
     Drift,
     ValidationMonitor,
     createDefaultMonitor,
-    version: "3.0.0-m3.6",
+    version: "3.0.0-m3.5x",
   };
 
   // Degrade decisions ------------------------------------------------------
@@ -233,6 +239,19 @@ export async function boot() {
 
   log("bootstrap complete", sum);
   EventBus.emit("boot:complete", { caps, summary: sum });
+
+  // M3.5 — Kick off dynamic crypto universe load in the background.
+  // Doesn't block the splash; emits `universe:ready` when the merge
+  // completes (or `universe:error` if both endpoints fail).  The seed
+  // universe (~1k stocks/ETFs/forex/commodities/indices) is already
+  // live; this adds Binance's full ~3k spot+futures list.
+  fetchCryptoUniverse().then((res) => {
+    log("universe:crypto loaded", res);
+    EventBus.emit("universe:ready", { count: res.count, sources: res.sources, fromCache: res.fromCache });
+  }).catch((err) => {
+    log("universe:crypto failed", err?.message || err);
+    EventBus.emit("universe:error", { error: err?.message || String(err) });
+  });
 }
 
 async function registerServiceWorker(caps) {

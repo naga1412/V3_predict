@@ -603,6 +603,166 @@ function BiasTrack({ value }) {
    ║  Top bar + tab nav                                               ║
    ╚══════════════════════════════════════════════════════════════════╝ */
 
+/* ── M3.5 SymbolPicker · type-tabbed search-modal ──
+   Replaces the original 8-symbol <select>.  Reads the live universe
+   registry (which the dynamic Binance loader populates after boot)
+   and exposes 7 asset-class tabs:
+     all · crypto · stock · etf · forex · commodity · index
+   Type-ahead filter searches symbol id + name + region + currency.
+   Each row gets a typed badge.  Tab counts update live as the
+   crypto loader merges the full ~3000-symbol Binance list. */
+const TYPE_LABELS = {
+  all: "All", crypto: "Crypto", stock: "Stocks", etf: "ETFs",
+  forex: "Forex", commodity: "Comm.", index: "Indices",
+};
+const TYPE_TONE = {
+  crypto: "bull", stock: "accent", etf: "warn",
+  forex: "accent", commodity: "warn", index: "fg-dim",
+};
+
+function SymbolPicker({ symbol, setSymbol }) {
+  const [open, setOpen]     = useState(false);
+  const [type, setType]     = useState("all");
+  const [query, setQuery]   = useState("");
+  const [tick, setTick]     = useState(0);            // bump on universe:ready
+  const popRef              = useRef(null);
+  const inputRef            = useRef(null);
+
+  // Subscribe to dynamic-universe updates so tab counts repopulate.
+  useEffect(() => {
+    const U = window.__MNP__?.Universe;
+    if (!U?.onUniverseChange) return;
+    const off = U.onUniverseChange(() => setTick((n) => n + 1));
+    return () => { try { off?.(); } catch {} };
+  }, []);
+
+  // Close on outside click / Escape.
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e) => {
+      if (popRef.current && !popRef.current.contains(e.target)) setOpen(false);
+    };
+    const onKey = (e) => { if (e.key === "Escape") setOpen(false); };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    setTimeout(() => inputRef.current?.focus(), 50);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  const U = window.__MNP__?.Universe;
+  const typeCounts = useMemo(() => U?.counts ? U.counts() : { all: 0 }, [U, tick]);
+  const matches    = useMemo(() => {
+    if (!U?.searchUniverse) return [];
+    return U.searchUniverse(query, type, 200);
+  }, [U, query, type, tick, open]);
+
+  const meta = U?.getSymbol ? U.getSymbol(symbol) : null;
+  const tone = meta?.type ? TYPE_TONE[meta.type] || "" : "";
+
+  return (
+    <div style={{ position: "relative" }}>
+      <button
+        type="button"
+        className="sel"
+        onClick={() => setOpen((o) => !o)}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        style={{ display: "inline-flex", alignItems: "center", gap: 6, minWidth: 140 }}
+        title={meta ? `${meta.name} · ${meta.type}` : symbol}>
+        <span style={{ fontWeight: "bold" }}>{symbol}</span>
+        {meta?.type && (
+          <span className={"chip-toggle on " + tone} style={{ fontSize: 9, padding: "1px 5px" }}>
+            {TYPE_LABELS[meta.type] || meta.type}
+          </span>
+        )}
+        <span style={{ marginLeft: "auto", color: "var(--fg-dim)", fontSize: 11 }}>▾</span>
+      </button>
+
+      {open && (
+        <div
+          ref={popRef}
+          role="listbox"
+          aria-label="Symbol picker"
+          style={{
+            position: "absolute", top: "100%", right: 0, zIndex: 50,
+            width: 360, marginTop: 4,
+            background: "var(--bg-elev-2, #1a1e2a)",
+            border: "1px solid var(--border, #2a2e39)",
+            borderRadius: 6, boxShadow: "0 8px 24px rgba(0,0,0,.55)",
+            display: "flex", flexDirection: "column", maxHeight: 480,
+          }}>
+          {/* Type tabs */}
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 4, padding: 8, borderBottom: "1px solid var(--border,#2a2e39)" }}>
+            {Object.entries(TYPE_LABELS).map(([t, label]) => (
+              <button
+                key={t}
+                type="button"
+                className={"chip-toggle " + (t === type ? "on " + (TYPE_TONE[t] || "") : "")}
+                style={{ fontSize: 10, padding: "3px 8px" }}
+                onClick={() => setType(t)}
+                aria-pressed={t === type}>
+                {label} <span style={{ color: "var(--fg-dim)", marginLeft: 4 }}>{typeCounts[t] ?? 0}</span>
+              </button>
+            ))}
+          </div>
+          {/* Search */}
+          <div style={{ padding: 8, borderBottom: "1px solid var(--border,#2a2e39)" }}>
+            <input
+              ref={inputRef}
+              type="search"
+              placeholder={`Search ${typeCounts[type] ?? 0} ${TYPE_LABELS[type] || ""}…`}
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              style={{
+                width: "100%", boxSizing: "border-box", padding: "6px 8px",
+                fontSize: 12, fontFamily: "inherit",
+                background: "var(--bg, #131722)", color: "var(--fg, #d1d4dc)",
+                border: "1px solid var(--border, #2a2e39)", borderRadius: 4,
+              }}
+            />
+          </div>
+          {/* Result list */}
+          <div style={{ flex: "1 1 auto", overflowY: "auto", padding: 4 }}>
+            {matches.length === 0 ? (
+              <div style={{ color: "var(--fg-dim)", fontSize: 12, padding: 16, textAlign: "center" }}>
+                No matches — try clearing the filter or another type.
+              </div>
+            ) : matches.map((e) => (
+              <button
+                key={`${e.exchange || "_"}:${e.id}`}
+                type="button"
+                className={symbol === e.id ? "chip-toggle on" : "chip-toggle"}
+                style={{
+                  display: "grid", gridTemplateColumns: "auto 1fr auto", gap: 8,
+                  width: "100%", padding: "5px 8px", marginBottom: 1,
+                  fontSize: 11, textAlign: "left", border: "none",
+                  background: symbol === e.id ? "rgba(41,98,255,.12)" : "transparent",
+                  color: "var(--fg)", cursor: "pointer", borderRadius: 3,
+                }}
+                onClick={() => { setSymbol(e.id); setOpen(false); }}>
+                <span style={{ fontFamily: "var(--font-mono, monospace)", fontWeight: "bold" }}>{e.id}</span>
+                <span style={{ color: "var(--fg-dim)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {e.name}{e.region ? ` · ${e.region}` : ""}{e.currency ? ` · ${e.currency}` : ""}
+                </span>
+                <span className={"chip-toggle on " + (TYPE_TONE[e.type] || "")} style={{ fontSize: 9, padding: "1px 5px" }}>
+                  {TYPE_LABELS[e.type] || e.type}
+                </span>
+              </button>
+            ))}
+          </div>
+          {/* Footer */}
+          <div style={{ fontSize: 10, color: "var(--fg-dim)", padding: "6px 8px", borderTop: "1px solid var(--border,#2a2e39)" }}>
+            {typeCounts.all} symbols · {Object.entries(typeCounts).filter(([k]) => k !== "all").map(([k, n]) => `${TYPE_LABELS[k] || k} ${n}`).join(" · ")}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function TopBar({ tab, setTab, symbol, setSymbol, tf, setTf, net, skew, status, exchange }) {
   return (
     <header className="topbar" role="banner">
@@ -623,9 +783,7 @@ function TopBar({ tab, setTab, symbol, setSymbol, tf, setTf, net, skew, status, 
 
       <span className="spacer-flex" />
 
-      <select className="sel" value={symbol} onChange={(e) => setSymbol(e.target.value)} aria-label="Symbol">
-        {SYMBOLS.map(s => <option key={s}>{s}</option>)}
-      </select>
+      <SymbolPicker symbol={symbol} setSymbol={setSymbol} />
 
       <div className="tf-group" role="group" aria-label="timeframe">
         {TFS.map(t => (

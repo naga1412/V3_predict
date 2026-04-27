@@ -24,7 +24,8 @@ import { CandleBuffer } from "./candleBuffer.js";
 import { ensureRecent, getStored } from "./gapFiller.js";
 import { runFeedLeader } from "./leaderElection.js";
 import { putMany } from "./idb.js";
-import { chain as exchangeChain, getExchange } from "./exchanges/index.js";
+import { chain as exchangeChain, nonCryptoChain, getExchange } from "./exchanges/index.js";
+import { getSymbol } from "./universe.js";
 import * as ClockSkew from "./clockSkew.js";
 
 const DEFAULT_LOOKBACK = {
@@ -40,10 +41,27 @@ const DEFAULT_LOOKBACK = {
 export class FeedManager {
   constructor({ symbol, tf, preferredExchange = "binance", lookbackMs } = {}) {
     if (!symbol || !tf) throw new Error("FeedManager: symbol + tf required");
-    this.symbol = symbol.toUpperCase();
+    // Don't uppercase non-crypto symbols (Yahoo's "EURUSD=X" / "^GSPC" /
+    // ".L" / ".T" suffixes are case-sensitive).
+    const meta = getSymbol(symbol);
+    this.symbolMeta = meta || null;
+    this.assetType  = meta?.type || "crypto";
+    this.symbol = (this.assetType === "crypto") ? symbol.toUpperCase() : symbol;
+    // Synthesised universe-ids carry a `:PERP` / `:CM` suffix to keep
+    // futures separate from spot in the registry.  `wireSymbol` is the
+    // raw exchange ticker we pass to REST + WS subscribe.
+    this.wireSymbol = meta?.wsSym || this.symbol;
     this.tf = tf;
     this.lookbackMs = lookbackMs ?? DEFAULT_LOOKBACK[tf] ?? 24 * 60 * 60 * 1000;
-    this.exchange = getExchange(preferredExchange) || exchangeChain[0];
+
+    // Type-aware exchange dispatch.  Crypto follows the existing chain
+    // (binance → bybit failover); other types pin to the universe's
+    // declared `exchange` (yahoo for forex/commodities/indices, stooq
+    // for stocks/ETFs) with the non-crypto chain as fallback.
+    this.fallbackChain = (this.assetType === "crypto") ? exchangeChain : nonCryptoChain;
+    this.exchange = (meta?.exchange && getExchange(meta.exchange))
+                  || getExchange(preferredExchange)
+                  || this.fallbackChain[0];
 
     this.buffer = new CandleBuffer({
       symbol: this.symbol, tf: this.tf,
@@ -75,7 +93,8 @@ export class FeedManager {
     // Backfill any gap up to now
     try {
       const saved = await ensureRecent({
-        exchange: this.exchange, symbol: this.symbol, tf: this.tf, lookbackMs: this.lookbackMs,
+        exchange: this.exchange, symbol: this.symbol, tf: this.tf,
+        lookbackMs: this.lookbackMs, wireSymbol: this.wireSymbol,
       });
       EventBus.emit("feed:bootstrap", { symbol: this.symbol, tf: this.tf, count: saved });
       // Re-read tail so UI has fresh data
@@ -127,7 +146,7 @@ export class FeedManager {
 
     const connect = () => {
       this.stream = this.exchange.stream({
-        symbol: this.symbol, tf: this.tf,
+        symbol: this.wireSymbol, tf: this.tf,
         onStatus: (s) => {
           EventBus.emit("feed:status", { symbol: this.symbol, tf: this.tf, exchange: this.exchange.id, ...s });
           // Reconnect → fire an ensureRecent to catch any gap
@@ -158,7 +177,8 @@ export class FeedManager {
   async _backfillSinceLast() {
     try {
       const saved = await ensureRecent({
-        exchange: this.exchange, symbol: this.symbol, tf: this.tf, lookbackMs: this.lookbackMs,
+        exchange: this.exchange, symbol: this.symbol, tf: this.tf,
+        lookbackMs: this.lookbackMs, wireSymbol: this.wireSymbol,
       });
       if (saved > 0) EventBus.emit("feed:backfill", { symbol: this.symbol, tf: this.tf, saved });
     } catch (err) {
@@ -167,9 +187,10 @@ export class FeedManager {
   }
 
   async _tryFailover(err) {
-    // Rotate through the chain if primary is misbehaving
-    const idx = exchangeChain.indexOf(this.exchange);
-    const next = exchangeChain[idx + 1];
+    // Rotate through the asset-class fallback chain if primary fails
+    const ch  = this.fallbackChain || exchangeChain;
+    const idx = ch.indexOf(this.exchange);
+    const next = ch[idx + 1];
     if (!next) { EventBus.emit("feed:error", { symbol: this.symbol, tf: this.tf, err: String(err), phase: "no-more-adapters" }); return; }
     this.exchange = next;
     EventBus.emit("feed:failover", { symbol: this.symbol, tf: this.tf, newExchange: next.id });
@@ -177,7 +198,7 @@ export class FeedManager {
     try { this.stream?.close(); } catch {}
     if (this.role === "leader" && this.started) {
       this.stream = this.exchange.stream({
-        symbol: this.symbol, tf: this.tf,
+        symbol: this.wireSymbol, tf: this.tf,
         onStatus: (s) => EventBus.emit("feed:status", { symbol: this.symbol, tf: this.tf, exchange: this.exchange.id, ...s }),
         onKline:  (raw) => {
           const r = validateCandle(raw, { symbol: this.symbol, tf: this.tf });
@@ -212,7 +233,7 @@ export class FeedManager {
   _onBufferGap(g) {
     EventBus.emit("feed:gap", g);
     // fire-and-forget REST backfill for the gap range
-    this.exchange.history({ symbol: this.symbol, tf: this.tf, fromT: g.from, toT: g.to })
+    this.exchange.history({ symbol: this.wireSymbol, tf: this.tf, fromT: g.from, toT: g.to })
       .then(rows => {
         const valid = rows.map(r => validateCandle(r, { symbol: this.symbol, tf: this.tf }))
                           .filter(x => x.ok)

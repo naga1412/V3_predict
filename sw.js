@@ -8,7 +8,7 @@
  * Scenarios covered: cold-load perf, offline shell (#39), SW update flow (#62)
  */
 
-const SW_VERSION = "mnp-v3-m3.6-1";
+const SW_VERSION = "mnp-v3-m3.5x-3";
 const SHELL_CACHE = `${SW_VERSION}-shell`;
 const CDN_CACHE   = `${SW_VERSION}-cdn`;
 
@@ -32,7 +32,12 @@ const SHELL = [
   "./src/data/feedManager.js",
   "./src/data/exchanges/binance.js",
   "./src/data/exchanges/bybit.js",
+  "./src/data/exchanges/stooq.js",
+  "./src/data/exchanges/yahoo.js",
   "./src/data/exchanges/index.js",
+  // m3.5 — multi-asset universe
+  "./src/data/universe.js",
+  "./src/data/cryptoUniverse.js",
   // data layer (phase 2)
   "./src/data/compress.js",
   "./src/data/integrity.js",

@@ -16,8 +16,13 @@ import { serverNow } from "./clockSkew.js";
 /**
  * Fill the IDB `candles` store from [fromT, toT] (inclusive) using exchange.history().
  * Returns the number of candles actually persisted.
+ *
+ * `wireSymbol` is the raw exchange ticker passed to `exchange.history()`.
+ * It defaults to `symbol`, but for synthesised universe-ids (e.g.
+ * `BTCUSDT:PERP` for Binance USDT-M futures) the FeedManager passes
+ * the unsuffixed wire ticker so the REST endpoint accepts it.
  */
-export async function fillRange({ exchange, symbol, tf, fromT, toT, onBatch }) {
+export async function fillRange({ exchange, symbol, tf, fromT, toT, onBatch, wireSymbol }) {
   const step = tfMs(tf); if (!step) throw new Error(`unknown tf ${tf}`);
   let cur = Math.floor(fromT / step) * step;
   const end = Math.floor(toT   / step) * step;
@@ -25,10 +30,11 @@ export async function fillRange({ exchange, symbol, tf, fromT, toT, onBatch }) {
 
   let totalSaved = 0;
   const LIMIT = exchange.historyLimit || 1000;
+  const wsSym = wireSymbol || symbol;
 
   while (cur <= end) {
     const batchEnd = Math.min(end, cur + step * (LIMIT - 1));
-    const raw = await exchange.history({ symbol, tf, fromT: cur, toT: batchEnd, limit: LIMIT });
+    const raw = await exchange.history({ symbol: wsSym, tf, fromT: cur, toT: batchEnd, limit: LIMIT });
     if (!raw || !raw.length) break;
 
     const { valid, reasons } = validateBatch(raw, { symbol, tf });
@@ -56,9 +62,10 @@ export async function fillRange({ exchange, symbol, tf, fromT, toT, onBatch }) {
 
 /**
  * Ensure we have the last `lookbackMs` of candles locally for (symbol, tf).
- * Called on app start and on WS reconnect.
+ * Called on app start and on WS reconnect.  `wireSymbol` is forwarded
+ * to fillRange / exchange.history (defaults to `symbol` — see fillRange).
  */
-export async function ensureRecent({ exchange, symbol, tf, lookbackMs }) {
+export async function ensureRecent({ exchange, symbol, tf, lookbackMs, wireSymbol }) {
   const step = tfMs(tf); if (!step) return 0;
   const now = serverNow();
   const toT = Math.floor(now / step) * step - step; // last fully closed bucket
@@ -71,7 +78,7 @@ export async function ensureRecent({ exchange, symbol, tf, lookbackMs }) {
   const start = Math.max(haveUpTo + step, fromT);
   if (start > toT) return 0;
 
-  return fillRange({ exchange, symbol, tf, fromT: start, toT });
+  return fillRange({ exchange, symbol, tf, fromT: start, toT, wireSymbol });
 }
 
 /**

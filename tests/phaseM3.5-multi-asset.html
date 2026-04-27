@@ -1,0 +1,250 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>MNP · M3.5 — Multi-asset universe + Stooq + Yahoo unit tests</title>
+<style>
+  body { background:#131722; color:#d1d4dc; font:13px/1.5 monospace; padding:20px; }
+  .pass { color:#26a69a; }
+  .fail { color:#ef5350; }
+  .group { margin-top: 12px; font-weight:bold; color:#2962ff; }
+  h1 { color:#fff; font-size:18px; }
+  #out { white-space: pre-wrap; }
+  .note { color:#787b86; }
+  .summary { margin-top: 16px; padding: 8px; border:1px solid #2a2e39; }
+</style>
+</head>
+<body>
+<h1>MNP — M3.5 · Multi-asset universe + Stooq + Yahoo</h1>
+
+<script>
+  if (location.protocol === "file:") {
+    document.addEventListener("DOMContentLoaded", () => {
+      document.body.innerHTML = `
+        <h1 style="color:#fff">phase M3.5 test harness</h1>
+        <div style="background:#3a1d1d;border:1px solid #ef5350;padding:16px;margin-top:16px;border-radius:4px">
+          <div style="color:#ef5350;font-weight:bold">Run on http://localhost (not file://)</div>
+          <pre style="background:#1a1e2a;padding:10px;margin-top:10px;color:#26a69a">cd v3 && python -m http.server 3131</pre>
+        </div>`;
+    });
+    throw new Error("file:// origin");
+  }
+</script>
+
+<div id="out">running…</div>
+
+<script type="module">
+const out = document.getElementById("out");
+window.addEventListener("error", (e) => {
+  out.innerHTML += `<span class="fail">✗ ${e.message}</span>\n<span class="note">${e.filename}:${e.lineno}:${e.colno}</span>\n`;
+});
+window.addEventListener("unhandledrejection", (e) => {
+  out.innerHTML += `<span class="fail">✗ unhandled: ${e.reason?.message || e.reason}</span>\n<span class="note">${e.reason?.stack || ''}</span>\n`;
+});
+
+const V = "m35-" + Date.now();
+const U = (p) => new URL(`${p}?v=${V}`, location.href).href;
+
+const Universe   = await import(U("../src/data/universe.js"));
+const Stooq      = await import(U("../src/data/exchanges/stooq.js"));
+const Yahoo      = await import(U("../src/data/exchanges/yahoo.js"));
+
+let n = 0, p = 0;
+const log = (s, ok, err) => {
+  out.innerHTML += `<span class="${ok?'pass':'fail'}">${ok?'✓':'✗'} ${s}${err ? ' — ' + err : ''}</span>\n`;
+  n++; if (ok) p++;
+};
+const group = (s) => { out.innerHTML += `\n<span class="group">[${s}]</span>\n`; };
+const close = (a, b, eps=1e-7) => Math.abs(a - b) <= eps;
+
+/* ════════════ Universe registry ════════════ */
+group("Universe registry · seed shape");
+{
+  Universe._resetUniverseForTests();
+  const all = Universe.listUniverse();
+  log("seed has > 500 entries (no crypto)", all.length > 500);
+  log("every entry has id + type + exchange",
+      all.every(e => e.id && e.type && e.exchange));
+  log("seed contains AAPL (US stock)",      Universe.getSymbol("AAPL")?.type === "stock");
+  log("seed contains EURUSD=X (forex)",     Universe.getSymbol("EURUSD=X")?.type === "forex");
+  log("seed contains GC=F (commodity)",     Universe.getSymbol("GC=F")?.type === "commodity");
+  log("seed contains ^GSPC (index)",        Universe.getSymbol("^GSPC")?.type === "index");
+  log("seed contains SPY (ETF)",            Universe.getSymbol("SPY")?.type === "etf");
+  log("AAPL routes to stooq",               Universe.exchangeFor("AAPL") === "stooq");
+  log("EURUSD=X routes to yahoo",           Universe.exchangeFor("EURUSD=X") === "yahoo");
+}
+
+/* ════════════ registerSymbols + listeners ════════════ */
+group("registerSymbols · dynamic registration + listeners");
+{
+  Universe._resetUniverseForTests();
+  const before = Universe.listUniverse().length;
+
+  let fired = 0;
+  const off = Universe.onUniverseChange(() => { fired++; });
+
+  const r = Universe.registerSymbols([
+    { id: "BTCUSDT",  name: "BTC / USDT",  type: "crypto", exchange: "binance", currency: "USDT" },
+    { id: "ETHUSDT",  name: "ETH / USDT",  type: "crypto", exchange: "binance", currency: "USDT" },
+    { id: "FAKETEST", name: "Sentinel",    type: "stock",  exchange: "stooq",   currency: "USD"  },
+  ]);
+  log("registerSymbols returns added/updated counts", r.added === 3 && r.updated === 0);
+  log("listUniverse grows by 3 entries", Universe.listUniverse().length === before + 3);
+  log("BTCUSDT now in registry",       Universe.getSymbol("BTCUSDT")?.type === "crypto");
+  log("listener fired exactly once",   fired === 1);
+
+  // Update existing entry
+  const r2 = Universe.registerSymbols([
+    { id: "BTCUSDT", name: "Bitcoin", type: "crypto", exchange: "binance", category: "spot" },
+  ]);
+  log("re-registering same id counts as update", r2.added === 0 && r2.updated === 1);
+  log("update mutates fields in place",
+      Universe.getSymbol("BTCUSDT")?.name === "Bitcoin" &&
+      Universe.getSymbol("BTCUSDT")?.category === "spot");
+
+  off();
+  Universe.registerSymbols([{ id: "X1", name: "x", type: "stock", exchange: "stooq" }]);
+  log("after off(), listener no longer fires", fired === 2);   // 2 includes update event
+}
+
+/* ════════════ searchUniverse + counts ════════════ */
+group("Universe search + counts");
+{
+  Universe._resetUniverseForTests();
+  Universe.registerSymbols([
+    { id: "BTCUSDT", name: "Bitcoin / USDT", type: "crypto", exchange: "binance" },
+    { id: "ETHUSDT", name: "Ethereum / USDT", type: "crypto", exchange: "binance" },
+    { id: "MOTUSDT", name: "Mantra / USDT", type: "crypto", exchange: "binance" },
+  ]);
+
+  const counts = Universe.counts();
+  log("counts.all is total count", counts.all === Universe.listUniverse().length);
+  log("counts.crypto >= 3 (added)", counts.crypto >= 3);
+  log("counts.stock > 0 (US seed)", counts.stock > 0);
+
+  log("query 'apple' finds AAPL", Universe.searchUniverse("apple", "all").some(e => e.id === "AAPL"));
+  log("query 'btc' finds BTCUSDT (case-insensitive)",
+      Universe.searchUniverse("BTC").some(e => e.id === "BTCUSDT"));
+  log("type filter 'forex' returns only forex",
+      Universe.searchUniverse("", "forex").every(e => e.type === "forex"));
+  log("type filter 'crypto' returns only crypto",
+      Universe.searchUniverse("", "crypto").every(e => e.type === "crypto"));
+  log("limit caps result length",
+      Universe.searchUniverse("", "all", 5).length === 5);
+  log("region match (UK) finds UK stocks",
+      Universe.searchUniverse("UK", "stock").some(e => e.region === "UK"));
+}
+
+/* ════════════ Stooq CSV parsing ════════════ */
+group("Stooq · parseStooqCSV");
+{
+  const sample = `Date,Open,High,Low,Close,Volume
+2024-01-02,180.00,181.50,179.20,181.00,55000000
+2024-01-03,181.10,182.00,180.40,181.80,42000000
+2024-01-04,181.50,183.00,180.80,182.50,48000000`;
+  const rows = Stooq.parseStooqCSV(sample);
+  log("returns 3 rows",                           rows.length === 3);
+  log("first row open === 180",                   close(rows[0].o, 180));
+  log("first row close === 181",                  close(rows[0].c, 181));
+  log("first row volume === 55000000",            rows[0].v === 55000000);
+  log("rows ordered oldest-first",                rows[0].t < rows[2].t);
+  log("t parsed from YYYY-MM-DD as UTC midnight", rows[0].t === Date.parse("2024-01-02T00:00:00Z"));
+
+  // Empty / invalid input
+  log("empty string → []",       Stooq.parseStooqCSV("").length === 0);
+  log("null → []",               Stooq.parseStooqCSV(null).length === 0);
+  log("header-only → []",        Stooq.parseStooqCSV("Date,Open,High,Low,Close,Volume\n").length === 0);
+  // Non-numeric row gets dropped
+  const bad = `Date,Open,High,Low,Close,Volume
+2024-01-02,abc,181.50,179.20,181.00,55000000
+2024-01-03,181.10,182.00,180.40,181.80,42000000`;
+  log("non-numeric row skipped",  Stooq.parseStooqCSV(bad).length === 1);
+}
+
+/* ════════════ Yahoo chart parsing ════════════ */
+group("Yahoo · parseYahooChart");
+{
+  const sample = {
+    chart: {
+      result: [{
+        meta: { regularMarketTime: 1704067200, regularMarketPrice: 4750 },
+        timestamp: [1704067200, 1704153600, 1704240000],
+        indicators: { quote: [{
+          open:   [4720, 4750, 4770],
+          high:   [4760, 4790, 4810],
+          low:    [4710, 4740, 4750],
+          close:  [4750, 4770, 4800],
+          volume: [1.2e9, 1.5e9, 1.3e9],
+        }] },
+      }],
+    },
+  };
+  const rows = Yahoo.parseYahooChart(sample);
+  log("returns 3 rows",            rows.length === 3);
+  log("t converted from sec → ms", rows[0].t === 1704067200 * 1000);
+  log("first row open === 4720",   close(rows[0].o, 4720));
+  log("rows oldest-first",         rows[0].t < rows[2].t);
+
+  // NaN guard — null entries get dropped
+  const withNull = {
+    chart: { result: [{
+      timestamp: [1704067200, 1704153600],
+      indicators: { quote: [{ open:[null,4750], high:[null,4790], low:[null,4740], close:[null,4770], volume:[null,1e9] }] },
+    }]},
+  };
+  log("null OHLC row skipped", Yahoo.parseYahooChart(withNull).length === 1);
+
+  // Degenerate inputs
+  log("null → []",            Yahoo.parseYahooChart(null).length === 0);
+  log("empty result → []",    Yahoo.parseYahooChart({chart:{result:[]}}).length === 0);
+  log("missing timestamp → []",
+      Yahoo.parseYahooChart({chart:{result:[{indicators:{quote:[{}]}}]}}).length === 0);
+}
+
+/* ════════════ Stooq adapter shape ════════════ */
+group("Stooq adapter · shape");
+{
+  log("stooq.id === 'stooq'",          Stooq.stooq.id === "stooq");
+  log("stooq.realtime === false",      Stooq.stooq.realtime === false);
+  log("stooq.history is a function",   typeof Stooq.stooq.history === "function");
+  log("stooq.stream is a function",    typeof Stooq.stooq.stream === "function");
+  // Stream returns {close,readyState} — like a WebSocket
+  let statusEv = null;
+  const handle = Stooq.stooq.stream({
+    symbol: "AAPL", tf: "1d",
+    onKline:  () => {},
+    onStatus: (s) => { if (!statusEv) statusEv = s; },
+  });
+  log("stream() returns close()",      typeof handle.close === "function");
+  log("stream() readyState getter",    typeof handle.readyState === "number");
+  log("first status emitted is 'static'",
+      statusEv?.status === "static" && statusEv.source === "stooq");
+  handle.close();
+}
+
+/* ════════════ Yahoo adapter shape ════════════ */
+group("Yahoo adapter · shape");
+{
+  log("yahoo.id === 'yahoo'",          Yahoo.yahoo.id === "yahoo");
+  log("yahoo.realtime === true",       Yahoo.yahoo.realtime === true);
+  log("yahoo.history is a function",   typeof Yahoo.yahoo.history === "function");
+  log("yahoo.stream is a function",    typeof Yahoo.yahoo.stream === "function");
+  let statusEv = null;
+  const handle = Yahoo.yahoo.stream({
+    symbol: "EURUSD=X", tf: "1m",
+    onKline:  () => {},
+    onStatus: (s) => { if (!statusEv) statusEv = s; },
+  });
+  log("first status emitted is 'polling'",
+      statusEv?.status === "polling" && statusEv.source === "yahoo");
+  log("polling intervalMs is finite + > 0",
+      Number.isFinite(statusEv?.intervalMs) && statusEv.intervalMs > 0);
+  handle.close();
+}
+
+/* ════════════ Summary ════════════ */
+out.innerHTML += `\n<div class="summary ${p===n?'pass':'fail'}">Ran ${n} tests — ${p} passed, ${n-p} failed.</div>`;
+document.title = `MNP m3.5 ${p}/${n}`;
+</script>
+</body>
+</html>
