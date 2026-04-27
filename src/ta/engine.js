@@ -40,6 +40,7 @@ import { tagSessions, sessionStats } from "./structure/sessions.js";
 import { clusterLevels } from "./levels/supportResistance.js";
 import { lastFinite } from "./math.js";
 import { classifyRegime } from "../regime/classifier.js";
+import { classifyWyckoff } from "../regime/wyckoff.js";
 
 const DEFAULT_INDICATORS = {
   ema: [20, 50, 200],
@@ -183,6 +184,10 @@ export const TAEngine = {
     // ─── Regime (Phase 6) ─────────────────────────────────────────
     if (structure.regime !== false) {
       out.regime = classifyRegime(out);
+    }
+    // ─── Wyckoff phase (M4b) ──────────────────────────────────────
+    if (structure.wyckoff !== false) {
+      out.wyckoff = classifyWyckoff(out, typeof structure.wyckoff === "object" ? structure.wyckoff : {});
     }
 
     // ─── Summary (cheap, useful for the UI) ───────────────────────

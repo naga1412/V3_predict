@@ -763,6 +763,68 @@ function SymbolPicker({ symbol, setSymbol }) {
   );
 }
 
+/* ── M4b · MacroRibbon — Risk-ON / Risk-OFF pill in topbar ──
+   Polls Yahoo every 5 min for VIX / SPX / DXY / 10Y / GOLD,
+   feeds them to Macro.computeMacroState, renders a coloured pill. */
+function useMacroState() {
+  const [state, setState] = useState({ score: 0, label: "loading", contributions: [] });
+  useEffect(() => {
+    const Macro = window.__MNP__?.Macro;
+    const Yahoo = window.__MNP__?.Universe;   // not the right surface — use exchanges directly
+    const yahoo = window.__MNP__?.RSS && window.__MNP__;   // use exchanges adapter via window
+    if (!Macro || !Macro.computeMacroState) return;
+    const yahooAdapter = window.__MNP__?.exchanges?.yahoo || null;
+    let stopped = false;
+    const PROXIES = ["^VIX", "^GSPC", "DX-Y.NYB", "^TNX", "GC=F"];
+
+    const fetchOne = async (sym) => {
+      try {
+        // Use the same polling endpoint as the yahoo adapter (parsed → closes).
+        const url = `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=1mo&events=`;
+        const r = await fetch(url, { headers: { "Accept": "application/json" } });
+        if (!r.ok) return null;
+        const j = await r.json();
+        const closes = j?.chart?.result?.[0]?.indicators?.quote?.[0]?.close || [];
+        return closes.filter(Number.isFinite);
+      } catch { return null; }
+    };
+    const tick = async () => {
+      const samples = {};
+      const arrs = await Promise.all(PROXIES.map(fetchOne));
+      PROXIES.forEach((s, i) => { if (arrs[i]?.length) samples[s] = arrs[i]; });
+      if (stopped) return;
+      const next = Macro.computeMacroState(samples);
+      setState(next);
+      try { window.__MNP__?.EventBus?.emit("macro:state", next); } catch {}
+    };
+    tick();
+    const t = setInterval(tick, 5 * 60_000);
+    return () => { stopped = true; clearInterval(t); };
+  }, []);
+  return state;
+}
+
+function MacroRibbon() {
+  const m = useMacroState();
+  const tone = m.label === "risk-on"  ? "bull"
+             : m.label === "risk-off" ? "bear"
+             : "";
+  const arrow = m.label === "risk-on" ? "▲" : m.label === "risk-off" ? "▼" : "—";
+  return (
+    <span
+      className={"chip-toggle on " + tone}
+      style={{ fontSize: 10, padding: "3px 8px", marginRight: 6 }}
+      title={(m.contributions || []).map(c => `${c.label} ${c.score >= 0 ? "+":""}${c.score.toFixed(2)}`).join("  ·  ") || "macro"}>
+      {arrow} {String(m.label).toUpperCase()}
+      {Number.isFinite(m.score) && m.label !== "loading" && m.label !== "unknown" && (
+        <span style={{ marginLeft: 4, color: "var(--fg-dim)" }}>
+          {m.score >= 0 ? "+" : ""}{m.score.toFixed(2)}
+        </span>
+      )}
+    </span>
+  );
+}
+
 function TopBar({ tab, setTab, symbol, setSymbol, tf, setTf, net, skew, status, exchange }) {
   return (
     <header className="topbar" role="banner">
@@ -784,6 +846,7 @@ function TopBar({ tab, setTab, symbol, setSymbol, tf, setTf, net, skew, status, 
 
       <span className="spacer-flex" />
 
+      <MacroRibbon />
       <SymbolPicker symbol={symbol} setSymbol={setSymbol} />
 
       <div className="tf-group" role="group" aria-label="timeframe">
@@ -1869,6 +1932,35 @@ function DLSupervisorCard({ orch, expected, ta }) {
   );
 }
 
+/* ── M4b · WyckoffCard — phase chip + bull%/range/volume scores ── */
+function WyckoffCard({ ta }) {
+  const w = ta?.wyckoff;
+  if (!w) return null;
+  const phaseTone = w.bias === "bullish" ? "bull"
+                  : w.bias === "bearish" ? "bear"
+                  : "";
+  const phaseLabel = (w.phase || "neutral").toUpperCase();
+  return (
+    <div className="card">
+      <h3>
+        Wyckoff Phase
+        <span className={"badge " + phaseTone}>{phaseLabel}</span>
+      </h3>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
+        <div className="dl-cell"><div className="k">Bias</div><div className="v" style={{ textTransform: "capitalize" }}>{w.bias}</div></div>
+        <div className="dl-cell"><div className="k">Bull %</div><div className="v">{Number.isFinite(w.bullPct) ? w.bullPct.toFixed(0) + "%" : "—"}</div></div>
+        <div className="dl-cell"><div className="k">Volume slope</div><div className="v" style={{ color: w.volumeSlope > 0 ? "var(--bull)" : w.volumeSlope < 0 ? "var(--bear)" : "var(--fg)" }}>{Number.isFinite(w.volumeSlope) ? (w.volumeSlope >= 0 ? "+" : "") + (w.volumeSlope * 100).toFixed(1) + "%" : "—"}</div></div>
+        <div className="dl-cell"><div className="k">Range %</div><div className="v">{Number.isFinite(w.rangePct) ? (w.rangePct * 100).toFixed(2) + "%" : "—"}</div></div>
+      </div>
+      {Array.isArray(w.reasons) && w.reasons.length > 0 && (
+        <div style={{ fontSize: 10, color: "var(--fg-dim)", marginTop: 6 }}>
+          {w.reasons[0]}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ContextCard({ ta, candles }) {
   if (!ta || ta.empty) return null;
   const last = ta.close?.[ta.close.length - 1];
@@ -2788,6 +2880,7 @@ function SignalSidebar({ orch, expected, ghost, ta, candles, regime, symbol, gho
       {symbol && <LongShortRatioCard symbol={symbol} />}
       {symbol && <HTFBiasGridCard symbol={symbol} />}
       <ContextCard ta={ta} candles={candles} />
+      <WyckoffCard ta={ta} />
       <PatternCard ta={ta} />
       <ChartPatternCard ta={ta} />
       <KeyLevelsCard ta={ta} />

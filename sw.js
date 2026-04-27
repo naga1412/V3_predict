@@ -8,7 +8,7 @@
  * Scenarios covered: cold-load perf, offline shell (#39), SW update flow (#62)
  */
 
-const SW_VERSION = "mnp-v3-m4a-1";
+const SW_VERSION = "mnp-v3-m4b-1";
 const SHELL_CACHE = `${SW_VERSION}-shell`;
 const CDN_CACHE   = `${SW_VERSION}-cdn`;
 
@@ -87,6 +87,8 @@ const SHELL = [
   "./src/regime/classifier.js",
   "./src/regime/stateMachine.js",
   "./src/regime/calendar.js",
+  "./src/regime/wyckoff.js",
+  "./src/regime/macro.js",
   // phase 7 — 12 modules + orchestrator + calibration
   "./src/modules/baseModule.js",
   "./src/modules/trendFollow.js",

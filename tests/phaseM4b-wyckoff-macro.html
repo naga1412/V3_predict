@@ -1,0 +1,182 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>MNP · M4b — Wyckoff phase + macro Risk-ON/OFF</title>
+<style>
+  body { background:#131722; color:#d1d4dc; font:13px/1.5 monospace; padding:20px; }
+  .pass { color:#26a69a; }
+  .fail { color:#ef5350; }
+  .group { margin-top: 12px; font-weight:bold; color:#2962ff; }
+  h1 { color:#fff; font-size:18px; }
+  #out { white-space: pre-wrap; }
+  .summary { margin-top: 16px; padding: 8px; border:1px solid #2a2e39; }
+</style>
+</head>
+<body>
+<h1>MNP — M4b · Wyckoff + Macro</h1>
+<script>
+  if (location.protocol === "file:") { document.body.innerHTML = `<div style="color:#ef5350">Run on http://localhost (not file://)</div>`; throw new Error("file://"); }
+</script>
+<div id="out">running…</div>
+
+<script type="module">
+const out = document.getElementById("out");
+window.addEventListener("error", (e) => { out.innerHTML += `<span class="fail">✗ ${e.message}</span>\n`; });
+const V = "m4b-" + Date.now();
+const U = (p) => new URL(`${p}?v=${V}`, location.href).href;
+const W = await import(U("../src/regime/wyckoff.js"));
+const M = await import(U("../src/regime/macro.js"));
+
+let n = 0, p = 0;
+const log = (s, ok, err) => { out.innerHTML += `<span class="${ok?'pass':'fail'}">${ok?'✓':'✗'} ${s}${err ? ' — ' + err : ''}</span>\n`; n++; if (ok) p++; };
+const group = (s) => { out.innerHTML += `\n<span class="group">[${s}]</span>\n`; };
+
+/* ─── Synthetic TA ─── */
+function makeTA({ trend = "up", bars = 60, withVolume = true } = {}) {
+  const open = [], high = [], low = [], close = [], volume = [];
+  let p0 = 100;
+  for (let i = 0; i < bars; i++) {
+    const drift = trend === "up" ? 0.5 : trend === "down" ? -0.5 : 0;
+    const noise = (Math.sin(i * 0.7) * 0.2);
+    const o = p0;
+    const c = p0 + drift + noise;
+    const h = Math.max(o, c) + 0.3;
+    const l = Math.min(o, c) - 0.3;
+    open.push(o); close.push(c); high.push(h); low.push(l);
+    volume.push(withVolume ? 1000 + i * 5 : 1000);  // rising volume by default
+    p0 = c;
+  }
+  // Build EMA-style stacks consistent with the trend
+  const ema20  = close.map((_, i) => close[Math.max(0, i - 5)]);
+  const ema50  = close.map((_, i) => close[Math.max(0, i - 15)]);
+  const ema200 = close.map((_, i) => close[Math.max(0, i - 30)]);
+  return {
+    open, high, low, close, volume,
+    ema20, ema50, ema200,
+    adx14: { adx: close.map(() => trend === "up" || trend === "down" ? 30 : 12) },
+    bb_20_2: { mid: close.map(c => c), up: close.map(c => c + 1), lo: close.map(c => c - 1) },
+  };
+}
+
+/* ════════════ Wyckoff ════════════ */
+group("bullPct");
+{
+  const ta = makeTA({ trend: "up" });
+  const bp = W.bullPct(ta, 30);
+  log("bullPct returns finite number", Number.isFinite(bp));
+  log("uptrend bullPct >= 60", bp >= 60);
+  const taDn = makeTA({ trend: "down" });
+  log("downtrend bullPct <= 40", W.bullPct(taDn, 30) <= 40);
+  log("empty ta → NaN", Number.isNaN(W.bullPct({}, 10)));
+}
+
+group("volumeSlope");
+{
+  const ta = makeTA({ withVolume: true });
+  log("rising volume → slope > 0", W.volumeSlope(ta, 20) > 0);
+  // Falling volume
+  const ta2 = makeTA();
+  for (let i = 0; i < ta2.volume.length; i++) ta2.volume[i] = 2000 - i * 5;
+  log("falling volume → slope < 0", W.volumeSlope(ta2, 20) < 0);
+  log("missing volume → 0", W.volumeSlope({ volume: [] }, 20) === 0);
+}
+
+group("classifyWyckoff · phase decisions");
+{
+  const taUp = makeTA({ trend: "up" });
+  const r1 = W.classifyWyckoff(taUp);
+  log("uptrend + rising volume → markup", r1.phase === "markup");
+  log("uptrend → bullish bias", r1.bias === "bullish");
+  log("score has 4 dimensions",
+      typeof r1.score === "object" && "trend" in r1.score && "vol" in r1.score && "momentum" in r1.score && "volume" in r1.score);
+
+  const taDn = makeTA({ trend: "down" });
+  const r2 = W.classifyWyckoff(taDn);
+  log("downtrend + rising volume → markdown", r2.phase === "markdown");
+  log("downtrend → bearish bias", r2.bias === "bearish");
+
+  // Tight-range neutral case
+  const flat = makeTA({ trend: "flat", bars: 60 });
+  flat.bb_20_2 = { mid: flat.close.map(c => c), up: flat.close.map(c => c + 0.05), lo: flat.close.map(c => c - 0.05) };
+  for (let i = 0; i < flat.volume.length; i++) flat.volume[i] = 1000 - i * 4;   // falling volume
+  const r3 = W.classifyWyckoff(flat);
+  log("tight range + falling volume returns a phase", typeof r3.phase === "string");
+  log("phase one of accumulation/distribution/neutral",
+      ["accumulation","distribution","neutral"].includes(r3.phase));
+
+  // Insufficient data
+  const r4 = W.classifyWyckoff({ close: [1] });
+  log("< 5 bars → neutral", r4.phase === "neutral");
+  log("reasons array non-empty", Array.isArray(r4.reasons) && r4.reasons.length > 0);
+}
+
+group("summarizeWyckoff");
+{
+  const w = W.classifyWyckoff(makeTA({ trend: "up" }));
+  const s = W.summarizeWyckoff(w);
+  log("summary has phase + bias + bullPct",
+      s && s.phase && s.bias && Number.isFinite(s.bullPct));
+  log("null → null", W.summarizeWyckoff(null) === null);
+}
+
+/* ════════════ Macro ════════════ */
+group("Macro · trendScore");
+{
+  const rising  = Array.from({ length: 20 }, (_, i) => 100 + i);
+  const falling = Array.from({ length: 20 }, (_, i) => 120 - i);
+  log("rising series → trendScore > 0",  M.trendScore(rising) > 0);
+  log("falling series → trendScore < 0", M.trendScore(falling) < 0);
+  log("flat series → trendScore ≈ 0",    Math.abs(M.trendScore(Array.from({length:20}, () => 100))) < 0.01);
+  log("< 3 elements → 0",                 M.trendScore([100, 101]) === 0);
+}
+
+group("Macro · computeMacroState");
+{
+  // SPX rising, VIX falling, DXY falling, 10Y falling, GOLD falling → strongly risk-on
+  const samples = {
+    "^GSPC":    Array.from({ length: 20 }, (_, i) => 4500 + i * 5),
+    "^VIX":     Array.from({ length: 20 }, (_, i) => 18 - i * 0.1),
+    "DX-Y.NYB": Array.from({ length: 20 }, (_, i) => 105 - i * 0.05),
+    "^TNX":     Array.from({ length: 20 }, (_, i) => 4.5 - i * 0.01),
+    "GC=F":     Array.from({ length: 20 }, (_, i) => 2080 - i * 1),
+  };
+  const s = M.computeMacroState(samples);
+  log("score in [-1, +1]", s.score >= -1 && s.score <= 1);
+  log("label === 'risk-on'", s.label === "risk-on");
+  log("contributions has 5 entries", s.contributions.length === 5);
+  log("coverage > 0.9", s.coverage > 0.9);
+
+  // Reverse → risk-off
+  const rev = {};
+  for (const [k, arr] of Object.entries(samples)) rev[k] = arr.slice().reverse();
+  const sRev = M.computeMacroState(rev);
+  log("reversed → risk-off", sRev.label === "risk-off");
+  log("reversed score < 0", sRev.score < 0);
+
+  // Empty samples
+  const empty = M.computeMacroState({});
+  log("empty samples → label='unknown'", empty.label === "unknown");
+  log("empty coverage = 0", empty.coverage === 0);
+
+  // Partial coverage (only SPX)
+  const partial = M.computeMacroState({ "^GSPC": samples["^GSPC"] });
+  log("partial coverage produces a label", typeof partial.label === "string");
+  log("partial coverage < 1", partial.coverage < 1);
+}
+
+group("Macro · summarizeMacro");
+{
+  const s = M.computeMacroState({ "^GSPC": Array.from({length: 20}, (_, i) => 100 + i) });
+  const txt = M.summarizeMacro(s);
+  log("summary is a string", typeof txt === "string" && txt.length > 0);
+  log("summary mentions label", new RegExp(s.label.toUpperCase()).test(txt));
+  log("null → '—'", M.summarizeMacro(null) === "—");
+}
+
+/* ════════════ Summary ════════════ */
+out.innerHTML += `\n<div class="summary ${p===n?'pass':'fail'}">Ran ${n} tests — ${p} passed, ${n-p} failed.</div>`;
+document.title = `MNP m4b ${p}/${n}`;
+</script>
+</body>
+</html>

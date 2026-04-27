@@ -78,6 +78,9 @@ import * as Sentiment   from "../news/sentiment.js";
 import * as NewsCats    from "../news/categories.js";
 import * as RSS         from "../news/rss.js";
 import * as NewsManager from "../news/newsManager.js";
+// M4b — Wyckoff phase + macro Risk-ON/OFF
+import * as Wyckoff from "../regime/wyckoff.js";
+import * as Macro   from "../regime/macro.js";
 // Phase 10 — Auto-validation + drift monitor
 import * as PredictionStore from "../validation/predictionStore.js";
 import * as Validator from "../validation/validator.js";
@@ -166,13 +169,16 @@ export async function boot() {
     NewsCats,
     RSS,
     NewsManager,
+    // M4b
+    Wyckoff,
+    Macro,
     // Phase 10
     PredictionStore,
     Validator,
     Drift,
     ValidationMonitor,
     createDefaultMonitor,
-    version: "3.0.0-m4a",
+    version: "3.0.0-m4b",
   };
 
   // Degrade decisions ------------------------------------------------------
