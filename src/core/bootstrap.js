@@ -81,6 +81,10 @@ import * as NewsManager from "../news/newsManager.js";
 // M4b — Wyckoff phase + macro Risk-ON/OFF
 import * as Wyckoff from "../regime/wyckoff.js";
 import * as Macro   from "../regime/macro.js";
+// M4c — Derivatives + intermarket
+import * as BinanceFutures from "../derivs/binanceFutures.js";
+import * as DerivManager   from "../derivs/derivManager.js";
+import * as Correlation    from "../intermarket/correlation.js";
 // Phase 10 — Auto-validation + drift monitor
 import * as PredictionStore from "../validation/predictionStore.js";
 import * as Validator from "../validation/validator.js";
@@ -172,13 +176,17 @@ export async function boot() {
     // M4b
     Wyckoff,
     Macro,
+    // M4c
+    BinanceFutures,
+    DerivManager,
+    Correlation,
     // Phase 10
     PredictionStore,
     Validator,
     Drift,
     ValidationMonitor,
     createDefaultMonitor,
-    version: "3.0.0-m4b",
+    version: "3.0.0-m4c",
   };
 
   // Degrade decisions ------------------------------------------------------

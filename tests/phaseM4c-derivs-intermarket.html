@@ -1,0 +1,124 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>MNP · M4c — Derivs + intermarket</title>
+<style>
+  body { background:#131722; color:#d1d4dc; font:13px/1.5 monospace; padding:20px; }
+  .pass { color:#26a69a; } .fail { color:#ef5350; }
+  .group { margin-top: 12px; font-weight:bold; color:#2962ff; }
+  h1 { color:#fff; font-size:18px; }
+  #out { white-space: pre-wrap; }
+  .summary { margin-top: 16px; padding: 8px; border:1px solid #2a2e39; }
+</style>
+</head>
+<body>
+<h1>MNP — M4c · Derivs + intermarket</h1>
+<script>
+  if (location.protocol === "file:") { document.body.innerHTML = `<div style="color:#ef5350">Run on http://localhost</div>`; throw new Error("file://"); }
+</script>
+<div id="out">running…</div>
+
+<script type="module">
+const out = document.getElementById("out");
+window.addEventListener("error", (e) => { out.innerHTML += `<span class="fail">✗ ${e.message}</span>\n`; });
+const V = "m4c-" + Date.now();
+const U = (p) => new URL(`${p}?v=${V}`, location.href).href;
+const C = await import(U("../src/intermarket/correlation.js"));
+const DM = await import(U("../src/derivs/derivManager.js"));
+
+let n = 0, p = 0;
+const log = (s, ok, err) => { out.innerHTML += `<span class="${ok?'pass':'fail'}">${ok?'✓':'✗'} ${s}${err ? ' — ' + err : ''}</span>\n`; n++; if (ok) p++; };
+const group = (s) => { out.innerHTML += `\n<span class="group">[${s}]</span>\n`; };
+const close = (a, b, eps=1e-9) => Math.abs(a - b) <= eps;
+
+/* ════════════ Correlation ════════════ */
+group("pearson");
+{
+  log("perfect positive → +1",  close(C.pearson([1,2,3,4,5], [10,20,30,40,50]), 1, 1e-9));
+  log("perfect negative → -1",  close(C.pearson([1,2,3,4,5], [50,40,30,20,10]), -1, 1e-9));
+  log("uncorrelated near 0",    Math.abs(C.pearson([1,2,3,4,5], [3,1,4,1,5])) < 0.6);
+  log("constant series → 0",    C.pearson([5,5,5,5,5], [1,2,3,4,5]) === 0);
+  log("< 3 elements → NaN",     Number.isNaN(C.pearson([1,2], [3,4])));
+  log("non-array → NaN",        Number.isNaN(C.pearson(null, [1,2,3])));
+}
+
+group("logReturns");
+{
+  const r = C.logReturns([100, 110, 121]);
+  log("returns N-1 entries",  r.length === 2);
+  log("first return ≈ ln(110/100)", close(r[0], Math.log(110/100), 1e-9));
+  log("empty → []",           C.logReturns([]).length === 0);
+  log("single → []",          C.logReturns([100]).length === 0);
+}
+
+group("alignByT");
+{
+  const A = [{t: 1, c: 100}, {t: 2, c: 110}, {t: 3, c: 120}];
+  const B = [{t: 2, c: 200}, {t: 3, c: 210}, {t: 4, c: 220}];
+  const aligned = C.alignByT(A, B);
+  log("aligns 2 shared timestamps", aligned.t.length === 2);
+  log("a values match A on shared t", aligned.a[0] === 110 && aligned.a[1] === 120);
+  log("b values match B on shared t", aligned.b[0] === 200 && aligned.b[1] === 210);
+}
+
+group("correlationMatrix");
+{
+  const m = C.correlationMatrix({
+    A: [1,2,3,4,5],
+    B: [10,20,30,40,50],
+    C: [50,40,30,20,10],
+  });
+  log("ids array length 3",     m.ids.length === 3);
+  log("matrix is 3x3",            m.matrix.length === 3 && m.matrix[0].length === 3);
+  log("diagonal === 1",            m.matrix[0][0] === 1 && m.matrix[1][1] === 1 && m.matrix[2][2] === 1);
+  log("A vs B == +1",              close(m.matrix[0][1], 1, 1e-9));
+  log("A vs C == -1",              close(m.matrix[0][2], -1, 1e-9));
+  log("matrix is symmetric",       close(m.matrix[1][0], m.matrix[0][1], 1e-9));
+}
+
+group("relativeStrength");
+{
+  // Asset rises 20%, base rises 10% → RS ≈ +0.10
+  const asset = Array.from({length: 25}, (_, i) => 100 + i * 0.8);
+  const base  = Array.from({length: 25}, (_, i) => 100 + i * 0.4);
+  const rs = C.relativeStrength(asset, base, 20);
+  log("asset outperforming → RS > 0", rs > 0);
+  log("RS finite",                    Number.isFinite(rs));
+  // Reverse → RS < 0
+  log("base outperforming → RS < 0", C.relativeStrength(base, asset, 20) < 0);
+  log("non-array → NaN",              Number.isNaN(C.relativeStrength(null, base)));
+}
+
+group("beta");
+{
+  // Asset returns = 1.5x base returns → beta ≈ 1.5
+  const baseR  = Array.from({length: 30}, (_, i) => Math.sin(i * 0.5) * 0.01);
+  const assetR = baseR.map(r => r * 1.5);
+  const b = C.beta(assetR, baseR);
+  log("beta close to 1.5", Math.abs(b - 1.5) < 0.1);
+  log("self-beta == 1",     Math.abs(C.beta(baseR, baseR) - 1) < 1e-9);
+  log("< 3 → NaN",          Number.isNaN(C.beta([1], [2])));
+}
+
+/* ════════════ DerivManager · cache + isCryptoUSDT ════════════ */
+group("DerivManager · symbol gating");
+{
+  // Non-crypto / non-USDT → returns null without firing fetch
+  const a = await DM.getSnapshot("AAPL");
+  log("AAPL → null (non-crypto)", a === null);
+  const b = await DM.getSnapshot("EURUSD=X");
+  log("EURUSD=X → null", b === null);
+
+  // Cache visibility helpers
+  log("listCached returns array", Array.isArray(DM.listCached()));
+  log("clear() exists",            typeof DM.clear === "function");
+  log("subscribe() returns off()", typeof DM.subscribe(() => {}) === "function");
+}
+
+/* ════════════ Summary ════════════ */
+out.innerHTML += `\n<div class="summary ${p===n?'pass':'fail'}">Ran ${n} tests — ${p} passed, ${n-p} failed.</div>`;
+document.title = `MNP m4c ${p}/${n}`;
+</script>
+</body>
+</html>

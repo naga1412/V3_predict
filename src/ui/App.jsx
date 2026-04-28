@@ -2457,6 +2457,129 @@ function useLongShortRatio(symbol, tf = "15m") {
   return data;
 }
 
+/* ── M4c · DerivCard — OI / funding / L-S snapshot via Binance USDT-M ── */
+function DerivCard({ symbol }) {
+  const [snap, setSnap] = useState(null);
+  const [err, setErr]   = useState(null);
+  useEffect(() => {
+    const DM = window.__MNP__?.DerivManager;
+    if (!DM?.getSnapshot) { setSnap(null); return; }
+    let stopped = false;
+    setSnap(null); setErr(null);
+    DM.getSnapshot(symbol).then((s) => { if (!stopped) setSnap(s); })
+      .catch((e) => { if (!stopped) setErr(e?.message || String(e)); });
+    const t = setInterval(() => {
+      DM.getSnapshot(symbol, { force: true }).then((s) => { if (!stopped) setSnap(s); }).catch(() => {});
+    }, 60_000);
+    return () => { stopped = true; clearInterval(t); };
+  }, [symbol]);
+
+  // Skip card entirely for non-USDT crypto / non-crypto.
+  if (!/USDT(:.*)?$/.test(String(symbol||"")) && !/USD_PERP/.test(String(symbol||""))) return null;
+  if (!snap) {
+    return (
+      <div className="card">
+        <h3>Derivatives <span className="badge">{err ? "err" : "loading…"}</span></h3>
+        <div style={{ color: "var(--fg-dim)", fontSize: 12 }}>
+          {err ? `Fetch failed: ${err}` : "Pulling OI / funding / L-S from Binance USDT-M…"}
+        </div>
+      </div>
+    );
+  }
+  const fund = snap.premiumIndex?.lastFundingRate;
+  const fundPct = Number.isFinite(fund) ? fund * 100 : null;
+  const fundTone = !Number.isFinite(fund) ? ""
+                 : fund > 0.0001 ? "bear"   // longs paying shorts → richer-priced longs → mean revert bear
+                 : fund < -0.0001 ? "bull"
+                 : "";
+  const lsLatest = (snap.lsHist && snap.lsHist[snap.lsHist.length - 1]) || null;
+  const ls       = lsLatest?.longShortRatio;
+  const lsTone   = !Number.isFinite(ls) ? ""
+                 : ls > 1.5 ? "bear"
+                 : ls < 0.7 ? "bull"
+                 : "";
+  const oiUSD    = snap.oiHist && snap.oiHist[snap.oiHist.length - 1]?.openInterestUSD;
+  const oiPrev   = snap.oiHist && snap.oiHist[Math.max(0, snap.oiHist.length - 24)]?.openInterestUSD;
+  const oiPct    = (Number.isFinite(oiUSD) && Number.isFinite(oiPrev) && oiPrev > 0)
+                  ? ((oiUSD - oiPrev) / oiPrev) * 100 : null;
+  const fmtUSD = (v) => !Number.isFinite(v) ? "—"
+                      : v > 1e9 ? `$${(v/1e9).toFixed(2)}B`
+                      : v > 1e6 ? `$${(v/1e6).toFixed(1)}M`
+                      :           `$${Math.round(v).toLocaleString()}`;
+  return (
+    <div className="card">
+      <h3>Derivatives <span className="badge">{snap.symbol}</span></h3>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
+        <div className="dl-cell">
+          <div className="k">OI (USD)</div>
+          <div className="v">{fmtUSD(oiUSD || snap.oi?.openInterest)}</div>
+        </div>
+        <div className="dl-cell">
+          <div className="k">OI Δ24h</div>
+          <div className="v" style={{ color: oiPct > 0 ? "var(--bull)" : oiPct < 0 ? "var(--bear)" : "var(--fg)" }}>
+            {Number.isFinite(oiPct) ? `${oiPct >= 0 ? "+" : ""}${oiPct.toFixed(2)}%` : "—"}
+          </div>
+        </div>
+        <div className="dl-cell">
+          <div className="k">Funding (8h)</div>
+          <div className={"v " + fundTone} style={{ color: fundTone === "bear" ? "var(--bear)" : fundTone === "bull" ? "var(--bull)" : undefined }}>
+            {Number.isFinite(fundPct) ? `${fundPct >= 0 ? "+" : ""}${fundPct.toFixed(4)}%` : "—"}
+          </div>
+        </div>
+        <div className="dl-cell">
+          <div className="k">L/S (top trader)</div>
+          <div className={"v " + lsTone} style={{ color: lsTone === "bear" ? "var(--bear)" : lsTone === "bull" ? "var(--bull)" : undefined }}>
+            {Number.isFinite(ls) ? ls.toFixed(2) : "—"}
+          </div>
+        </div>
+        <div className="dl-cell">
+          <div className="k">Mark</div>
+          <div className="v">{Number.isFinite(snap.premiumIndex?.markPrice) ? fmt(snap.premiumIndex.markPrice) : "—"}</div>
+        </div>
+        <div className="dl-cell">
+          <div className="k">Index</div>
+          <div className="v">{Number.isFinite(snap.premiumIndex?.indexPrice) ? fmt(snap.premiumIndex.indexPrice) : "—"}</div>
+        </div>
+      </div>
+      <div style={{ fontSize: 10, color: "var(--fg-dim)", marginTop: 6 }}>
+        OI samples: {snap.oiHist?.length || 0} · L/S samples: {snap.lsHist?.length || 0}
+      </div>
+    </div>
+  );
+}
+
+/* ── M4c · IntermarketCard — RS-vs-BTC + correlation panel for current symbol ── */
+function IntermarketCard({ symbol, candles }) {
+  if (!Array.isArray(candles) || candles.length < 30) return null;
+  const C = window.__MNP__?.Correlation;
+  if (!C) return null;
+  // For now: compute RS-vs-BTC from current symbol's closes vs synthetic
+  // BTC-USDT closes (only if our symbol IS BTC, just show vs SPX).
+  // Real cross-asset closes need a fetched BTC series — keep light:
+  // we only show "self" stats here unless the bus brings a peer series.
+  const closes = candles.map(c => +c.c).filter(Number.isFinite);
+  if (closes.length < 30) return null;
+  // Pearson of returns vs lagged returns of same series (autocorrelation)
+  const rets  = C.logReturns(closes);
+  const lag   = rets.slice(0, -1);
+  const fwd   = rets.slice(1);
+  const auto  = C.pearson(lag, fwd);
+  const beta1 = C.beta(rets.slice(-30), rets.slice(-30));
+  const rs20  = (closes.length >= 22) ? C.relativeStrength(closes, closes.slice(0, -1), 20) : NaN;
+  return (
+    <div className="card">
+      <h3>Intermarket <span className="badge">{symbol}</span></h3>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
+        <div className="dl-cell"><div className="k">Autocorr (1)</div><div className="v">{Number.isFinite(auto) ? auto.toFixed(3) : "—"}</div></div>
+        <div className="dl-cell"><div className="k">Self-β</div><div className="v">{Number.isFinite(beta1) ? beta1.toFixed(2) : "—"}</div></div>
+      </div>
+      <div style={{ fontSize: 10, color: "var(--fg-dim)", marginTop: 6 }}>
+        Cross-asset corr matrix arrives in M4c-2 (multi-symbol fetcher).
+      </div>
+    </div>
+  );
+}
+
 function LongShortRatioCard({ symbol }) {
   const data = useLongShortRatio(symbol, "15m");
   if (!data) {
@@ -2879,6 +3002,8 @@ function SignalSidebar({ orch, expected, ghost, ta, candles, regime, symbol, gho
       <DLSupervisorCard orch={orch} expected={expected} ta={ta} />
       {symbol && <LongShortRatioCard symbol={symbol} />}
       {symbol && <HTFBiasGridCard symbol={symbol} />}
+      {symbol && <DerivCard symbol={symbol} />}
+      {symbol && <IntermarketCard symbol={symbol} candles={candles} />}
       <ContextCard ta={ta} candles={candles} />
       <WyckoffCard ta={ta} />
       <PatternCard ta={ta} />
