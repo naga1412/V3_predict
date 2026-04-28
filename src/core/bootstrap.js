@@ -85,6 +85,9 @@ import * as Macro   from "../regime/macro.js";
 import * as BinanceFutures from "../derivs/binanceFutures.js";
 import * as DerivManager   from "../derivs/derivManager.js";
 import * as Correlation    from "../intermarket/correlation.js";
+// M5 — Stability + adaptive weights
+import * as Stability from "../ml/stability.js";
+import * as Adaptive  from "../ml/adaptive.js";
 // Phase 10 — Auto-validation + drift monitor
 import * as PredictionStore from "../validation/predictionStore.js";
 import * as Validator from "../validation/validator.js";
@@ -180,13 +183,16 @@ export async function boot() {
     BinanceFutures,
     DerivManager,
     Correlation,
+    // M5
+    Stability,
+    Adaptive,
     // Phase 10
     PredictionStore,
     Validator,
     Drift,
     ValidationMonitor,
     createDefaultMonitor,
-    version: "3.0.0-m4c",
+    version: "3.0.0-m5",
   };
 
   // Degrade decisions ------------------------------------------------------

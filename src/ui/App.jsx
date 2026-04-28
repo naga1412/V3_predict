@@ -1847,6 +1847,92 @@ function TradeSignalCard({ orch, expected, regime, ta }) {
   );
 }
 
+/* ── M5 · StabilityCard — bias σ + flip rate + interval growth ── */
+function StabilityCard({ stability }) {
+  if (!stability || stability.label === "unknown") {
+    return (
+      <div className="card">
+        <h3>Stability <span className="badge">warmup</span></h3>
+        <div style={{ color: "var(--fg-dim)", fontSize: 12 }}>Need ≥ 3 bars of orchestration history.</div>
+      </div>
+    );
+  }
+  const tone = stability.label === "stable" ? "bull"
+            : stability.label === "moderate" ? ""
+            : "bear";
+  const c = stability.components || {};
+  const bar = (label, v, color) => (
+    <div style={{ display: "grid", gridTemplateColumns: "70px 1fr 32px", gap: 6, alignItems: "center", fontSize: 11 }}>
+      <span style={{ color: "var(--fg-dim)" }}>{label}</span>
+      <div style={{ position: "relative", height: 6, background: "var(--bg)", borderRadius: 2, overflow: "hidden" }}>
+        <span style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: `${Math.round((v||0)*100)}%`, background: color }} />
+      </div>
+      <span style={{ fontFamily: "var(--font-mono)", textAlign: "right" }}>{((v||0)*100).toFixed(0)}</span>
+    </div>
+  );
+  return (
+    <div className="card">
+      <h3>Stability <span className={"badge " + tone}>{stability.label.toUpperCase()} {(stability.score*100).toFixed(0)}</span></h3>
+      <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+        {bar("Bias σ",       c.bias,      "rgba(38,166,154,.7)")}
+        {bar("Direction",    c.direction, "rgba(41,98,255,.7)")}
+        {bar("Interval",     c.interval,  "rgba(255,176,32,.7)")}
+      </div>
+      <div style={{ fontSize: 10, color: "var(--fg-dim)", marginTop: 6 }}>
+        σ(bias)={Number.isFinite(stability.biasSigma) ? stability.biasSigma.toFixed(3) : "—"} · flips={Number.isFinite(stability.flipRate) ? (stability.flipRate * 100).toFixed(0)+"%" : "—"} · n={stability.n}
+      </div>
+    </div>
+  );
+}
+
+/* ── M5 · AdaptiveWeightsCard — per-module EWMA hit-rates ── */
+function AdaptiveWeightsCard({ adaptive, tick, orch }) {
+  if (!adaptive) return null;
+  const ema = adaptive.emaSnapshot ? adaptive.emaSnapshot() : {};
+  const ids = Object.keys(ema);
+  if (ids.length === 0) {
+    return (
+      <div className="card">
+        <h3>Adaptive Weights <span className="badge">warmup</span></h3>
+        <div style={{ color: "var(--fg-dim)", fontSize: 12 }}>Awaiting validation:verdict events to learn module accuracy.</div>
+      </div>
+    );
+  }
+  const weights = adaptive.weights ? adaptive.weights(ids) : {};
+  const sorted = ids.slice().sort((a, b) => (ema[b] || 0) - (ema[a] || 0));
+  const meta = MODULE_META || {};
+  return (
+    <div className="card">
+      <h3>Adaptive Weights <span className="badge">{ids.length} mods</span></h3>
+      <div style={{ display: "flex", flexDirection: "column", gap: 3, fontSize: 11 }}>
+        {sorted.slice(0, 10).map((id) => {
+          const e = ema[id] || 0;
+          const w = weights[id] || 0;
+          const tone = e >= 0.6 ? "bull" : e <= 0.4 ? "bear" : "";
+          const m = meta[id];
+          return (
+            <div key={id} style={{ display: "grid", gridTemplateColumns: "20px 1fr 50px", gap: 6, alignItems: "center" }}>
+              <span style={{ fontSize: 12 }}>{m?.emoji || "•"}</span>
+              <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                <span style={{ color: "var(--fg)" }}>{m?.label || id}</span>
+                <div style={{ position: "relative", height: 4, background: "var(--bg)", borderRadius: 2, overflow: "hidden" }}>
+                  <span style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: `${Math.round(w*100)}%`, background: tone === "bull" ? "var(--bull)" : tone === "bear" ? "var(--bear)" : "var(--accent)" }} />
+                </div>
+              </div>
+              <span style={{ fontFamily: "var(--font-mono)", textAlign: "right", color: tone === "bull" ? "var(--bull)" : tone === "bear" ? "var(--bear)" : "var(--fg)" }}>
+                {(e*100).toFixed(0)}%
+              </span>
+            </div>
+          );
+        })}
+      </div>
+      <div style={{ fontSize: 10, color: "var(--fg-dim)", marginTop: 6 }}>
+        EWMA hit-rate · α=0.05 · learns from validation:verdict
+      </div>
+    </div>
+  );
+}
+
 function MasterBiasCard({ orch }) {
   if (!orch) return null;
   return (
@@ -2990,7 +3076,7 @@ function FeatureDrawer({ ta }) {
   );
 }
 
-function SignalSidebar({ orch, expected, ghost, ta, candles, regime, symbol, ghostNBars, setGhostNBars }) {
+function SignalSidebar({ orch, expected, ghost, ta, candles, regime, symbol, ghostNBars, setGhostNBars, stability, adaptive, adaptiveTick }) {
   return (
     <aside className="sidebar" aria-label="signal-sidebar">
       <TradeSignalCard orch={orch} expected={expected} regime={regime} ta={ta} />
@@ -2999,6 +3085,8 @@ function SignalSidebar({ orch, expected, ghost, ta, candles, regime, symbol, gho
       <TradeSetupCard orch={orch} expected={expected} ta={ta} />
       <NextCandleCard orch={orch} expected={expected} ta={ta} />
       <MasterBiasCard orch={orch} />
+      <StabilityCard stability={stability} />
+      <AdaptiveWeightsCard adaptive={adaptive} tick={adaptiveTick} orch={orch} />
       <DLSupervisorCard orch={orch} expected={expected} ta={ta} />
       {symbol && <LongShortRatioCard symbol={symbol} />}
       {symbol && <HTFBiasGridCard symbol={symbol} />}
@@ -3757,6 +3845,38 @@ function App() {
   });
   useGhostResolver(symbol, tf, feed.candles);
 
+  // ── M5 · Stability history + adaptive weights
+  // Append one snapshot per orchestration tick (capped at 200 bars).
+  const [stabHistory, setStabHistory] = useState([]);
+  useEffect(() => {
+    const Stability = window.__MNP__?.Stability;
+    if (!Stability?.appendHistory || !orch) return;
+    setStabHistory((prev) => Stability.appendHistory(prev, {
+      bias:      Number.isFinite(orch.rawScore) ? orch.rawScore : 0,
+      direction: orch.direction || "neutral",
+      cpWidth:   Number.isFinite(ghost?.bars?.[0]?.width) ? ghost.bars[0].width : null,
+    }, 200));
+  }, [orch?.rawScore, orch?.direction, ghost?.bars?.[0]?.width]);
+  const stability = useMemo(() => {
+    const S = window.__MNP__?.Stability;
+    return S?.computeStability ? S.computeStability(stabHistory, { window: 30 }) : null;
+  }, [stabHistory]);
+
+  // Adaptive weights — singleton instance per (symbol, tf), updated
+  // whenever a `validation:verdict` lands.
+  const adaptiveRef = useRef(null);
+  if (!adaptiveRef.current) {
+    const A = window.__MNP__?.Adaptive;
+    adaptiveRef.current = A ? new A.AdaptiveWeights({}) : null;
+  }
+  const [adaptiveTick, setAdaptiveTick] = useState(0);
+  useBusEvent("validation:verdict", (e) => {
+    const A = window.__MNP__?.Adaptive;
+    if (!A?.recordVerdict || !adaptiveRef.current) return;
+    A.recordVerdict(adaptiveRef.current, orch, e?.verdict || {});
+    setAdaptiveTick((n) => n + 1);
+  });
+
   // ── Validation signal (Phase 10)
   const [validation, setValidation] = useState({ accuracy: null, lastDrift: null });
   useBusEvent("validation:verdict", (e) => {
@@ -3807,7 +3927,7 @@ function App() {
               expected={expected} subplots={subplots}
               ghost={ghost}
             />
-            <SignalSidebar orch={orch} expected={expected} ghost={ghost} ta={ta} candles={feed.candles} regime={ta?.regime?.label} symbol={symbol} ghostNBars={ghostNBars} setGhostNBars={setGhostNBars} />
+            <SignalSidebar orch={orch} expected={expected} ghost={ghost} ta={ta} candles={feed.candles} regime={ta?.regime?.label} symbol={symbol} ghostNBars={ghostNBars} setGhostNBars={setGhostNBars} stability={stability} adaptive={adaptiveRef.current} adaptiveTick={adaptiveTick} />
           </>
         )}
         {tab === "scanner" && (
@@ -3823,7 +3943,7 @@ function App() {
         {tab === "chat" && (
           <>
             <AIChatPane orch={orch} expected={expected} ta={ta} symbol={symbol} tf={tf} />
-            <SignalSidebar orch={orch} expected={expected} ghost={ghost} ta={ta} candles={feed.candles} regime={ta?.regime?.label} symbol={symbol} ghostNBars={ghostNBars} setGhostNBars={setGhostNBars} />
+            <SignalSidebar orch={orch} expected={expected} ghost={ghost} ta={ta} candles={feed.candles} regime={ta?.regime?.label} symbol={symbol} ghostNBars={ghostNBars} setGhostNBars={setGhostNBars} stability={stability} adaptive={adaptiveRef.current} adaptiveTick={adaptiveTick} />
           </>
         )}
         {tab === "system" && (

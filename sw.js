@@ -8,7 +8,7 @@
  * Scenarios covered: cold-load perf, offline shell (#39), SW update flow (#62)
  */
 
-const SW_VERSION = "mnp-v3-m4c-1";
+const SW_VERSION = "mnp-v3-m5-1";
 const SHELL_CACHE = `${SW_VERSION}-shell`;
 const CDN_CACHE   = `${SW_VERSION}-cdn`;
 
@@ -93,6 +93,9 @@ const SHELL = [
   "./src/derivs/binanceFutures.js",
   "./src/derivs/derivManager.js",
   "./src/intermarket/correlation.js",
+  // m5 — stability + adaptive
+  "./src/ml/stability.js",
+  "./src/ml/adaptive.js",
   // phase 7 — 12 modules + orchestrator + calibration
   "./src/modules/baseModule.js",
   "./src/modules/trendFollow.js",

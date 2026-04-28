@@ -1,0 +1,160 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>MNP · M5 — Stability + Adaptive weights</title>
+<style>
+  body { background:#131722; color:#d1d4dc; font:13px/1.5 monospace; padding:20px; }
+  .pass { color:#26a69a; } .fail { color:#ef5350; }
+  .group { margin-top: 12px; font-weight:bold; color:#2962ff; }
+  h1 { color:#fff; font-size:18px; }
+  #out { white-space: pre-wrap; }
+  .summary { margin-top: 16px; padding: 8px; border:1px solid #2a2e39; }
+</style>
+</head>
+<body>
+<h1>MNP — M5 · Stability + Adaptive</h1>
+<script>
+  if (location.protocol === "file:") { document.body.innerHTML = `<div style="color:#ef5350">Run on http://localhost</div>`; throw new Error("file://"); }
+</script>
+<div id="out">running…</div>
+<script type="module">
+const out = document.getElementById("out");
+window.addEventListener("error", (e) => { out.innerHTML += `<span class="fail">✗ ${e.message}</span>\n`; });
+const V = "m5-" + Date.now();
+const U = (p) => new URL(`${p}?v=${V}`, location.href).href;
+const S = await import(U("../src/ml/stability.js"));
+const A = await import(U("../src/ml/adaptive.js"));
+
+let n = 0, p = 0;
+const log = (s, ok, err) => { out.innerHTML += `<span class="${ok?'pass':'fail'}">${ok?'✓':'✗'} ${s}${err ? ' — ' + err : ''}</span>\n`; n++; if (ok) p++; };
+const group = (s) => { out.innerHTML += `\n<span class="group">[${s}]</span>\n`; };
+const close = (a, b, eps=1e-6) => Math.abs(a - b) <= eps;
+
+/* ════════════ Stability ════════════ */
+group("computeStability · degenerate");
+{
+  log("empty → unknown",  S.computeStability([]).label === "unknown");
+  log("< 3 → unknown",     S.computeStability([{bias:0.5}, {bias:0.6}]).label === "unknown");
+  log("score === 0 on unknown", S.computeStability([]).score === 0);
+}
+
+group("computeStability · stable run");
+{
+  // Same bias + direction every bar = max stability
+  const hist = Array.from({length: 30}, () => ({ bias: 0.5, direction: 1 }));
+  const r = S.computeStability(hist);
+  log("constant series → score >= 0.7",   r.score >= 0.7);
+  log("constant series → label='stable'", r.label === "stable");
+  log("biasSigma === 0", r.biasSigma === 0);
+  log("flipRate === 0",  r.flipRate === 0);
+  log("components.bias === 1",      close(r.components.bias, 1));
+  log("components.direction === 1", close(r.components.direction, 1));
+}
+
+group("computeStability · volatile flips");
+{
+  // Direction flips every bar
+  const hist = Array.from({length: 20}, (_, i) => ({ bias: i % 2 ? 0.6 : -0.6, direction: i % 2 ? 1 : -1 }));
+  const r = S.computeStability(hist);
+  log("flipping → flipRate ≈ 1",  r.flipRate >= 0.9);
+  log("flipping → label='volatile'", r.label === "volatile");
+  log("flipping → direction component low", r.components.direction <= 0.2);
+}
+
+group("computeStability · interval growth");
+{
+  // CP width doubles → interval stab drops
+  const hist = Array.from({length: 30}, (_, i) => ({ bias: 0.5, direction: 1, cpWidth: 1 + i * 0.05 }));
+  const r = S.computeStability(hist);
+  log("growing CP width drops interval", r.components.interval < 0.5);
+}
+
+group("appendHistory");
+{
+  const a = S.appendHistory([], { rawScore: 0.3, direction: "long", cpWidth: 2 }, 5);
+  log("appends 1 entry",                 a.length === 1);
+  log("converts direction to ±1",         a[0].direction === 1);
+  let h = [];
+  for (let i = 0; i < 10; i++) h = S.appendHistory(h, { rawScore: i / 10, direction: "long" }, 5);
+  log("respects maxLen cap",              h.length === 5);
+  log("rolling: keeps last (oldest dropped)", h[0].bias > 0);
+}
+
+/* ════════════ Adaptive ════════════ */
+group("AdaptiveWeights · observe + EWMA");
+{
+  const aw = new A.AdaptiveWeights({ alpha: 0.5, prior: 0.5 });
+  // After 1 hit (1.0), EWMA = 0.5*0.5 + 0.5*1 = 0.75
+  aw.observe("trend-follow", 1);
+  log("EWMA after 1 hit ≈ 0.75", close(aw.confidenceFor("trend-follow"), 0.75));
+  // After 1 miss
+  aw.observe("trend-follow", 0);
+  log("EWMA after hit then miss ≈ 0.375", close(aw.confidenceFor("trend-follow"), 0.375));
+
+  // Unknown module → prior
+  log("unknown module → prior", aw.confidenceFor("nonexistent") === 0.5);
+
+  // Invalid hit ignored
+  aw.observe("x", 5);
+  log("invalid hit → no record",  !aw.scores.has("x"));
+}
+
+group("AdaptiveWeights · weights normalised + floor");
+{
+  const aw = new A.AdaptiveWeights({ alpha: 0.5, prior: 0.5, minWeight: 0.05 });
+  aw.observe("good", 1); aw.observe("good", 1); aw.observe("good", 1);
+  aw.observe("bad",  0); aw.observe("bad",  0); aw.observe("bad",  0);
+  const w = aw.weights();
+  log("weights sum to ~1",  Math.abs((w.good + w.bad) - 1) < 1e-6);
+  log("good weight > bad",  w.good > w.bad);
+  log("bad >= minWeight",   w.bad >= 0.05);
+}
+
+group("AdaptiveWeights · empty → uniform");
+{
+  const aw = new A.AdaptiveWeights({});
+  const w = aw.weights(["a", "b", "c"]);
+  log("empty observations + ids → uniform 1/N",
+      Math.abs(w.a - 1/3) < 1e-3 && Math.abs(w.b - 1/3) < 1e-3 && Math.abs(w.c - 1/3) < 1e-3);
+}
+
+group("AdaptiveWeights · serialise");
+{
+  const aw = new A.AdaptiveWeights({ alpha: 0.1 });
+  aw.observe("m1", 1); aw.observe("m1", 1); aw.observe("m2", 0);
+  const json = aw.toJSON();
+  const aw2  = A.AdaptiveWeights.fromJSON(json);
+  log("round-trip preserves EWMA",
+      close(aw2.confidenceFor("m1"), aw.confidenceFor("m1")));
+  log("round-trip preserves cfg.alpha", aw2.cfg.alpha === 0.1);
+}
+
+group("recordVerdict · orch → adaptive");
+{
+  const aw = new A.AdaptiveWeights({ alpha: 0.5, prior: 0.5 });
+  // verdict says direction was UP (positive); modules with positive
+  // signal correct, negative signal incorrect.
+  A.recordVerdict(aw,
+    { signals: [
+      { moduleId: "trend-up",   signal: 0.7 },
+      { moduleId: "trend-down", signal: -0.6 },
+      { moduleId: "neutral",    signal: 0 },
+    ]},
+    { direction: "long" });
+  log("trend-up rewarded",  aw.confidenceFor("trend-up") > 0.5);
+  log("trend-down penalised", aw.confidenceFor("trend-down") < 0.5);
+  log("neutral signal skipped", !aw.scores.has("neutral"));
+
+  // No-direction verdict → no-op
+  const aw2 = new A.AdaptiveWeights({});
+  A.recordVerdict(aw2, { signals: [{moduleId:"x",signal:0.5}] }, {});
+  log("no direction → no observation", aw2.scores.size === 0);
+}
+
+/* ════════════ Summary ════════════ */
+out.innerHTML += `\n<div class="summary ${p===n?'pass':'fail'}">Ran ${n} tests — ${p} passed, ${n-p} failed.</div>`;
+document.title = `MNP m5 ${p}/${n}`;
+</script>
+</body>
+</html>
