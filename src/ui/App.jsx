@@ -1605,23 +1605,24 @@ function ChartPane({ symbol, tf, candles, forming, ta, indicators, structure, ex
     const refs = seriesRef.current;
     const on = !!(structure?.ghost && ghost && Array.isArray(ghost.bars) && ghost.bars.length);
 
-    // Lazily create the ghost series
+    // Lazily create the ghost series — Ghost Candles 2.0 uses higher
+    // opacity bodies + colored step markers (yellow → magenta → blue).
     if (on && !refs.ghost) {
       try {
         refs.ghost = chart.addCandlestickSeries({
-          upColor: "rgba(38,166,154,.35)", downColor: "rgba(239,83,80,.35)",
-          borderUpColor: "rgba(38,166,154,.55)", borderDownColor: "rgba(239,83,80,.55)",
-          wickUpColor: "rgba(38,166,154,.45)", wickDownColor: "rgba(239,83,80,.45)",
+          upColor: "rgba(38,166,154,.55)", downColor: "rgba(239,83,80,.55)",
+          borderUpColor: "rgba(38,166,154,.85)", borderDownColor: "rgba(239,83,80,.85)",
+          wickUpColor: "rgba(38,166,154,.7)", wickDownColor: "rgba(239,83,80,.7)",
           priceLineVisible: false, lastValueVisible: false,
         });
       } catch {}
       try {
         refs.ghostHi = chart.addLineSeries({
-          color: "rgba(179,136,255,.45)", lineWidth: 1, lineStyle: 2 /* dashed */,
+          color: "rgba(179,136,255,.55)", lineWidth: 1, lineStyle: 2 /* dashed */,
           priceLineVisible: false, lastValueVisible: false,
         });
         refs.ghostLo = chart.addLineSeries({
-          color: "rgba(179,136,255,.45)", lineWidth: 1, lineStyle: 2,
+          color: "rgba(179,136,255,.55)", lineWidth: 1, lineStyle: 2,
           priceLineVisible: false, lastValueVisible: false,
         });
       } catch {}
@@ -1655,6 +1656,12 @@ function ChartPane({ symbol, tf, candles, forming, ta, indicators, structure, ex
     try { refs.ghost?.setData([anchor, ...serialized.candleData]); } catch {}
     try { refs.ghostHi?.setData([anchorBand, ...serialized.upperBand]); } catch {}
     try { refs.ghostLo?.setData([anchorBand, ...serialized.lowerBand]); } catch {}
+    // Step markers — colored dots per ghost bar + "Predicted" arrow on first.
+    try {
+      if (Array.isArray(serialized.markers) && serialized.markers.length) {
+        refs.ghost?.setMarkers(serialized.markers);
+      }
+    } catch {}
   }, [ghost, structure?.ghost]);
 
   // Chart header — price + OHLC readout

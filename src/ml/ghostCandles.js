@@ -243,20 +243,52 @@ export function predictGhostCandles(ta, orch, opts = {}) {
  */
 export function toChartSeriesData(forecast) {
   if (!forecast || !Array.isArray(forecast.bars)) {
-    return { candleData: [], upperBand: [], lowerBand: [], pointLine: [] };
+    return { candleData: [], upperBand: [], lowerBand: [], pointLine: [], markers: [] };
   }
   const candleData = new Array(forecast.bars.length);
   const upperBand  = new Array(forecast.bars.length);
   const lowerBand  = new Array(forecast.bars.length);
   const pointLine  = new Array(forecast.bars.length);
-  for (let i = 0; i < forecast.bars.length; i++) {
+  // Step markers — colored dots on each ghost bar.  Hue cycles
+  // yellow → orange → magenta → blue → cyan as the horizon extends,
+  // mirroring the Crp_Pre visual style.  First bar gets a "Predicted"
+  // arrow annotation.
+  const markers = [];
+  const N = forecast.bars.length;
+  const dirSign = forecast.bars[N - 1].c >= forecast.anchorClose ? 1 : -1;
+  for (let i = 0; i < N; i++) {
     const b = forecast.bars[i];
     candleData[i] = { time: b.time, open: b.o, high: b.h, low: b.l, close: b.c };
     upperBand[i]  = { time: b.time, value: b.hi };
     lowerBand[i]  = { time: b.time, value: b.lo };
     pointLine[i]  = { time: b.time, value: b.c };
+
+    // Hue cycles from 50° (yellow) through 320° (magenta) to 220° (blue).
+    const t   = N > 1 ? i / (N - 1) : 0;
+    const hue = Math.round(50 + t * 290);
+    const sat = 78;
+    const lum = 55;
+    const color = `hsl(${hue}, ${sat}%, ${lum}%)`;
+    markers.push({
+      time:     b.time,
+      position: dirSign >= 0 ? "belowBar" : "aboveBar",
+      color,
+      shape:    "circle",
+      size:     1,
+    });
   }
-  return { candleData, upperBand, lowerBand, pointLine };
+  // First-bar "Predicted ↓/↑" annotation
+  if (forecast.bars[0]) {
+    markers.unshift({
+      time:     forecast.bars[0].time,
+      position: dirSign >= 0 ? "aboveBar" : "belowBar",
+      color:    dirSign >= 0 ? "#26a69a" : "#ef5350",
+      shape:    dirSign >= 0 ? "arrowUp" : "arrowDown",
+      text:     "Predicted",
+      size:     1,
+    });
+  }
+  return { candleData, upperBand, lowerBand, pointLine, markers };
 }
 
 /**
