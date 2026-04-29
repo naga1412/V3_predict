@@ -2086,28 +2086,44 @@ function AdaptiveWeightsCard({ adaptive, tick, orch }) {
 /* ── M-LEARN-1 · MistakeLedgerCard ──
    Shows the running mistake count + last 5 wrong calls for the
    current (symbol, tf) so you can see the brain working. */
-/* ── M-LEARN-4 · BrainCard — meta-NN status + manual retrain ── */
+/* ── M-LEARN-4/5 · BrainCard — meta-NN status + cycles + retrain ── */
 function BrainCard() {
   const [st, setSt]   = useState(null);
+  const [cc, setCc]   = useState(null);   // M-LEARN-5 status + cycles
   const [tick, setTick] = useState(0);
   const [busy, setBusy] = useState(false);
   useEffect(() => {
-    const off = window.__MNP__?.EventBus?.on?.("metabrain:trained", () => setTick((n) => n + 1));
-    return () => { try { off?.(); } catch {} };
+    const M = window.__MNP__;
+    if (!M?.EventBus) return;
+    const off1 = M.EventBus.on("metabrain:trained",  () => setTick((n) => n + 1));
+    const off2 = M.EventBus.on("metabrain:cycle",    () => setTick((n) => n + 1));
+    const off3 = M.EventBus.on("metabrain:rollback", () => setTick((n) => n + 1));
+    return () => { try { off1?.(); off2?.(); off3?.(); } catch {} };
   }, []);
   useEffect(() => {
     let stopped = false;
     const MB = window.__MNP__?.MetaBrain;
+    const CC = window.__MNP__?.ChampionChallenger;
     if (!MB?.status) return;
     MB.status().then((s) => { if (!stopped) setSt(s); }).catch(() => {});
+    if (CC?.status) {
+      try {
+        const ccSt = CC.status();
+        const cycles = CC.recentCycles?.({ limit: 5 }) || [];
+        if (!stopped) setCc({ ...ccSt, cycles });
+      } catch {}
+    }
     return () => { stopped = true; };
   }, [tick]);
   const onRetrain = async () => {
+    const CC = window.__MNP__?.ChampionChallenger;
     const MB = window.__MNP__?.MetaBrain;
-    if (!MB?.maybeTrain) return;
     setBusy(true);
-    try { const r = await MB.maybeTrain({ force: true }); console.log("[brain] retrain", r); }
-    finally { setBusy(false); setTick((n) => n + 1); }
+    try {
+      // Use the C/C cycle so manual retrains also go through the gate.
+      if (CC?.runCycle) await CC.runCycle({ minRows: 1 });
+      else if (MB?.maybeTrain) await MB.maybeTrain({ force: true });
+    } finally { setBusy(false); setTick((n) => n + 1); }
   };
   if (!st) return (
     <div className="card"><h3>Meta-Brain <span className="badge">…</span></h3></div>
@@ -2144,6 +2160,31 @@ function BrainCard() {
           {busy ? "training…" : "retrain now"}
         </button>
       </div>
+      {cc && Array.isArray(cc.cycles) && cc.cycles.length > 0 && (
+        <div style={{ marginTop: 8, fontSize: 10, color: "var(--fg-dim)" }}>
+          <div style={{ marginBottom: 3, letterSpacing: 1, textTransform: "uppercase" }}>Cycles</div>
+          {cc.cycles.slice(0, 4).map((c, i) => {
+            const tone = c.kind === "promoted" ? "bull"
+                       : c.kind === "rejected" ? "bear"
+                       : c.kind === "rollback" ? "bear"
+                       : "";
+            const accStr = c.champion?.accuracy != null ? ` · ${(c.champion.accuracy * 100).toFixed(0)}%` : "";
+            return (
+              <div key={i} style={{ display: "flex", gap: 6, alignItems: "center", padding: "1px 0" }}>
+                <span className={"chip-toggle " + tone} style={{ fontSize: 9, padding: "0 5px" }}>{c.kind}</span>
+                <span style={{ flex: 1 }}>{c.reason || "—"}{accStr}</span>
+                <span>{timeAgo(c.at)}</span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+      {cc?.drift?.ewma != null && cc.drift.baseline != null && (
+        <div style={{ marginTop: 6, fontSize: 10, color: cc.drift.drifted ? "var(--bear)" : "var(--fg-dim)" }}>
+          Live acc {(cc.drift.ewma * 100).toFixed(0)}% vs baseline {(cc.drift.baseline * 100).toFixed(0)}%
+          {cc.drift.drifted && <b style={{ marginLeft: 4 }}>· DRIFT</b>}
+        </div>
+      )}
     </div>
   );
 }

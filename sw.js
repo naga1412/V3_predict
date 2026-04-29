@@ -8,7 +8,7 @@
  * Scenarios covered: cold-load perf, offline shell (#39), SW update flow (#62)
  */
 
-const SW_VERSION = "mnp-v3-mscan-1";
+const SW_VERSION = "mnp-v3-mlearn5-1";
 const SHELL_CACHE = `${SW_VERSION}-shell`;
 const CDN_CACHE   = `${SW_VERSION}-cdn`;
 
@@ -110,6 +110,8 @@ const SHELL = [
   "./src/learn/metaVeto.js",
   // m-learn-4 — meta-brain (decision layer)
   "./src/learn/metaBrain.js",
+  // m-learn-5 — champion / challenger online retrainer
+  "./src/learn/championChallenger.js",
   // m-scan — multi-symbol background scanner
   "./src/scan/scanManager.js",
   // phase 7 — 12 modules + orchestrator + calibration

@@ -101,6 +101,8 @@ import * as AntiPatterns  from "../learn/antiPatterns.js";
 import * as MetaVeto      from "../learn/metaVeto.js";
 // M-LEARN-4 — Meta-Brain (decision layer)
 import * as MetaBrain     from "../learn/metaBrain.js";
+// M-LEARN-5 — Champion / Challenger online retrainer
+import * as ChampionChallenger from "../learn/championChallenger.js";
 // M-SCAN — multi-symbol background scanner
 import * as Scan          from "../scan/scanManager.js";
 // Phase 10 — Auto-validation + drift monitor
@@ -214,6 +216,8 @@ export async function boot() {
     MetaVeto,
     // M-LEARN-4
     MetaBrain,
+    // M-LEARN-5
+    ChampionChallenger,
     // M-SCAN
     Scan,
     // Phase 10
@@ -222,7 +226,7 @@ export async function boot() {
     Drift,
     ValidationMonitor,
     createDefaultMonitor,
-    version: "3.0.0-mscan",
+    version: "3.0.0-mlearn5",
   };
 
   // Degrade decisions ------------------------------------------------------
@@ -311,16 +315,25 @@ export async function boot() {
   const _TRAIN_MIN_INT  = 4 * 60 * 60_000;
   const _runMetaTrain = async () => {
     try {
-      const res = await MetaBrain.maybeTrain({});
-      if (res?.trained) {
+      // M-LEARN-5: full champion/challenger cycle — protects the active
+      // model.  A challenger only replaces the champion when its
+      // held-out accuracy beats by ≥ 1pp.  No-op if pool too small.
+      const res = await ChampionChallenger.runCycle({});
+      if (res?.kind === "promoted") {
         _lastTrainT = Date.now();
         _labelsSinceLastTrain = 0;
-        log("metaBrain trained", `rows=${res.rows} acc=${(res.accuracy*100).toFixed(1)}%  v=${res.version}`);
+        log("metaBrain promoted", `acc=${(res.champion.accuracy*100).toFixed(1)}% v=${res.champion.version}`);
+      } else if (res?.kind === "rejected") {
+        _lastTrainT = Date.now();
+        _labelsSinceLastTrain = 0;
+        log("metaBrain rejected challenger", `chal=${res.challenger.accuracy} champ=${res.champion.accuracy}`);
       }
-    } catch (err) { log("metaBrain train failed", err?.message || err); }
+    } catch (err) { log("metaBrain cycle failed", err?.message || err); }
   };
-  EventBus.on("validation:verdict", () => {
+  EventBus.on("validation:verdict", (e) => {
     _labelsSinceLastTrain++;
+    // Drift tracker — keep rolling window of correct/incorrect
+    try { ChampionChallenger.onVerdict(e?.verdict, e?.prediction); } catch {}
     const elapsed = Date.now() - _lastTrainT;
     if (_labelsSinceLastTrain >= _TRAIN_MIN_NEW || elapsed >= _TRAIN_MIN_INT) {
       _runMetaTrain();
@@ -328,6 +341,11 @@ export async function boot() {
   });
   // Initial pass after 12s in case there are pre-existing labeled rows
   setTimeout(() => _runMetaTrain(), 12_000);
+  // Drift watchdog — every 10 min check if the live champion is failing
+  // and roll back to the previous if so.
+  setInterval(() => {
+    ChampionChallenger.recoverIfDrifted().catch(() => {});
+  }, 10 * 60_000);
 
   // M-LEARN-2 — Schedule anti-pattern discovery whenever the ledger
   // grows past a threshold OR an hour has passed since the last run.

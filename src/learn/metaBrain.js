@@ -225,7 +225,14 @@ async function loadModelOnce() {
   if (_modelLoadInflight) return _modelLoadInflight;
   _modelLoadInflight = (async () => {
     try {
-      const row = await ModelStore.latestModel({ regime: MODEL_REGIME });
+      // Prefer the explicit champion (M-LEARN-5).  Fall back to most-recent
+      // model row if no champion is tagged (back-compat with M-LEARN-4 IDB).
+      const all = await ModelStore.listModels({ regime: MODEL_REGIME });
+      if (!all.length) return null;
+      const champs = all.filter((r) => !r.meta?.role || r.meta.role === "champion");
+      const pool = champs.length ? champs : all;
+      pool.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+      const row = pool[0];
       const w = row?.weights || row?.payload;
       if (!row || !w) return null;
       const mlp = MLP.deserialize(w);
@@ -365,7 +372,7 @@ export async function readyCount() {
  * @param {{minRows?:number, force?:boolean}} [opts]
  * @returns {Promise<{trained:boolean, rows:number, accuracy:number, version:string}>}
  */
-export async function maybeTrain({ minRows = MIN_TRAIN_ROWS, force = false } = {}) {
+export async function maybeTrain({ minRows = MIN_TRAIN_ROWS, force = false, role = "champion", returnModel = false } = {}) {
   const labeled = await loadLabeledRows();
   if (!force && labeled.length < minRows) return { trained: false, rows: labeled.length };
 
@@ -415,23 +422,75 @@ export async function maybeTrain({ minRows = MIN_TRAIN_ROWS, force = false } = {
   const accuracy = evaluable > 0 ? correct / evaluable : 0;
 
   const version = `mb-${Date.now()}`;
-  await ModelStore.saveModel({
+  const meta = {
+    accuracy: +accuracy.toFixed(4),
+    rows: labeled.length,
+    valRows: Math.floor(labeled.length * 0.2),
+    params: paramCount(mlp),
+    lastLoss: Number.isFinite(lastLoss) ? +lastLoss.toFixed(6) : null,
+    role,
+  };
+  const id = await ModelStore.saveModel({
     kind: "mlp",
     regime: MODEL_REGIME,
     version,
     weights: mlp.serialize(),
-    meta: {
-      accuracy: +accuracy.toFixed(4),
-      rows: labeled.length,
-      valRows: Math.floor(labeled.length * 0.2),
-      params: paramCount(mlp),
-      lastLoss: Number.isFinite(lastLoss) ? +lastLoss.toFixed(6) : null,
-    },
+    meta,
     createdAt: Date.now(),
   });
+  if (role === "champion") invalidateModelCache();
+  try { EventBus.emit("metabrain:trained", { rows: labeled.length, accuracy, version, role }); } catch {}
+  const result = { trained: true, rows: labeled.length, accuracy, version, role, id };
+  if (returnModel) {
+    // For champion/challenger evaluation we also need the held-out X/Y slice
+    // and the model itself so we don't have to deserialize twice.
+    const D = labeled[0].input.length;
+    const split = Math.floor(labeled.length * 0.8);
+    const evalN = labeled.length - split;
+    const evalX = new Float32Array(evalN * D);
+    const evalY = new Float32Array(evalN);
+    for (let i = 0; i < evalN; i++) {
+      const src = labeled[split + i];
+      for (let j = 0; j < D; j++) evalX[i * D + j] = +src.input[j] || 0;
+      evalY[i] = +src.label || 0;
+    }
+    result.mlp = mlp;
+    result.evalX = evalX;
+    result.evalY = evalY;
+    result.evalN = evalN;
+    result.D = D;
+  }
+  return result;
+}
+
+/* ═══════════════════════════ Champion lookup ═══════════════════════════ */
+
+/** Find the current champion model row (role==="champion" or no role for legacy). */
+export async function findChampion() {
+  const all = await ModelStore.listModels({ regime: MODEL_REGIME });
+  const eligible = all.filter((r) => !r.meta?.role || r.meta.role === "champion");
+  if (!eligible.length) return null;
+  eligible.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  return eligible[0];
+}
+
+/** Find the most recent challenger awaiting evaluation. */
+export async function findChallenger() {
+  const all = await ModelStore.listModels({ regime: MODEL_REGIME });
+  const ch = all.filter((r) => r.meta?.role === "challenger");
+  if (!ch.length) return null;
+  ch.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  return ch[0];
+}
+
+/** Set a model row's role + invalidate cache so the next decide() re-loads. */
+export async function setRole(id, role) {
+  const row = await ModelStore.loadModel(id);
+  if (!row) return false;
+  row.meta = { ...(row.meta || {}), role };
+  await ModelStore.saveModel(row);
   invalidateModelCache();
-  try { EventBus.emit("metabrain:trained", { rows: labeled.length, accuracy, version }); } catch {}
-  return { trained: true, rows: labeled.length, accuracy, version };
+  return true;
 }
 
 async function loadLabeledRows() {
