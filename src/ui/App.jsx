@@ -3365,7 +3365,7 @@ function FeatureDrawer({ ta }) {
   );
 }
 
-function SignalSidebar({ orch, expected, ghost, ta, candles, regime, symbol, ghostNBars, setGhostNBars, stability, adaptive, adaptiveTick }) {
+function SignalSidebar({ orch, expected, ghost, ta, candles, regime, symbol, tf, ghostNBars, setGhostNBars, stability, adaptive, adaptiveTick }) {
   return (
     <aside className="sidebar" aria-label="signal-sidebar">
       <TradeSignalCard orch={orch} expected={expected} regime={regime} ta={ta} />
@@ -4531,7 +4531,7 @@ function App() {
               expected={expected} subplots={subplots}
               ghost={ghost}
             />
-            <SignalSidebar orch={orch} expected={expected} ghost={ghost} ta={ta} candles={feed.candles} regime={ta?.regime?.label} symbol={symbol} ghostNBars={ghostNBars} setGhostNBars={setGhostNBars} stability={stability} adaptive={adaptiveRef.current} adaptiveTick={adaptiveTick} />
+            <SignalSidebar orch={orch} expected={expected} ghost={ghost} ta={ta} candles={feed.candles} regime={ta?.regime?.label} symbol={symbol} tf={tf} ghostNBars={ghostNBars} setGhostNBars={setGhostNBars} stability={stability} adaptive={adaptiveRef.current} adaptiveTick={adaptiveTick} />
           </>
         )}
         {tab === "scanner" && (
@@ -4547,7 +4547,7 @@ function App() {
         {tab === "chat" && (
           <>
             <AIChatPane orch={orch} expected={expected} ta={ta} symbol={symbol} tf={tf} ghost={ghost} stability={stability} />
-            <SignalSidebar orch={orch} expected={expected} ghost={ghost} ta={ta} candles={feed.candles} regime={ta?.regime?.label} symbol={symbol} ghostNBars={ghostNBars} setGhostNBars={setGhostNBars} stability={stability} adaptive={adaptiveRef.current} adaptiveTick={adaptiveTick} />
+            <SignalSidebar orch={orch} expected={expected} ghost={ghost} ta={ta} candles={feed.candles} regime={ta?.regime?.label} symbol={symbol} tf={tf} ghostNBars={ghostNBars} setGhostNBars={setGhostNBars} stability={stability} adaptive={adaptiveRef.current} adaptiveTick={adaptiveTick} />
           </>
         )}
         {tab === "system" && (
