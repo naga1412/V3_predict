@@ -1,0 +1,153 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>MNP · M6.5 — Web-LLM + LLM Router</title>
+<style>
+  body { background:#131722; color:#d1d4dc; font:13px/1.5 monospace; padding:20px; }
+  .pass { color:#26a69a; } .fail { color:#ef5350; }
+  .group { margin-top: 12px; font-weight:bold; color:#2962ff; }
+  h1 { color:#fff; font-size:18px; }
+  #out { white-space: pre-wrap; }
+  .summary { margin-top: 16px; padding: 8px; border:1px solid #2a2e39; }
+</style>
+</head>
+<body>
+<h1>MNP — M6.5 · Web-LLM + Router</h1>
+<script>
+  if (location.protocol === "file:") { document.body.innerHTML = `<div style="color:#ef5350">Run on http://localhost</div>`; throw new Error("file://"); }
+</script>
+<div id="out">running…</div>
+<script type="module">
+const out = document.getElementById("out");
+window.addEventListener("error", (e) => { out.innerHTML += `<span class="fail">✗ ${e.message}</span>\n`; });
+const V = "m65-" + Date.now();
+const U = (p) => new URL(`${p}?v=${V}`, location.href).href;
+const W = await import(U("../src/llm/webllm.js"));
+const R = await import(U("../src/llm/llmRouter.js"));
+
+let n = 0, p = 0;
+const log = (s, ok, err) => { out.innerHTML += `<span class="${ok?'pass':'fail'}">${ok?'✓':'✗'} ${s}${err ? ' — ' + err : ''}</span>\n`; n++; if (ok) p++; };
+const group = (s) => { out.innerHTML += `\n<span class="group">[${s}]</span>\n`; };
+
+/* ════════════ Web-LLM module shape ════════════ */
+group("WebLLM · public surface");
+{
+  log("MODELS is non-empty array", Array.isArray(W.MODELS) && W.MODELS.length > 0);
+  log("every model has id+name+sizeMB+ctx",
+      W.MODELS.every(m => m.id && m.name && Number.isFinite(m.sizeMB) && Number.isFinite(m.ctx)));
+  log("at least one model marked default",
+      W.MODELS.some(m => m.default === true));
+  log("hasWebGPU returns boolean",      typeof W.hasWebGPU() === "boolean");
+  log("ping returns boolean",           typeof (await W.ping()) === "boolean");
+  log("listModels returns id strings",  Array.isArray(await W.listModels()));
+  log("activeModel initially null",     W.activeModel() === null);
+  log("onProgress returns off()",       typeof W.onProgress(() => {}) === "function");
+  log("preload is a function",          typeof W.preload === "function");
+  log("getEngine is a function",        typeof W.getEngine === "function");
+  log("unload is a function",           typeof W.unload === "function");
+}
+
+group("WebLLM · offline guard");
+{
+  if (!W.hasWebGPU()) {
+    let err = null;
+    const r = await W.chat({ messages: [{ role: "user", content: "hi" }] }, { onError: (e) => { err = e?.message; } });
+    log("chat returns null sans WebGPU", r === null);
+    log("onError fires with WebGPU msg", typeof err === "string" && /WebGPU/.test(err));
+
+    // Bad input always rejected — but ONLY safe to call when WebGPU
+    // missing, otherwise it would try loading the library.
+    let err2 = null;
+    const r2 = await W.chat({ messages: [] }, { onError: (e) => { err2 = e?.message; } });
+    log("chat with empty messages → null", r2 === null);
+
+    let err3 = null;
+    const r3 = await W.generate({ prompt: "" }, { onError: (e) => { err3 = e?.message; } });
+    log("generate with empty prompt → null", r3 === null);
+  } else {
+    // WebGPU present — running these would download the library; skip.
+    log("WebGPU present — skipping calls that would load the CDN library", true);
+  }
+}
+
+/* ════════════ LLMRouter ════════════ */
+group("LLMRouter · probe + pickTier");
+{
+  const status = await R.probe();
+  log("probe returns {ollama, webllm}",
+      typeof status.ollama === "boolean" && typeof status.webllm === "boolean");
+
+  const picked = await R.pickTier();
+  log("pickTier returns {tier, status}",
+      picked && "tier" in picked && "status" in picked);
+  log("tier is 'ollama' | 'webllm' | null",
+      picked.tier === null || picked.tier === "ollama" || picked.tier === "webllm");
+
+  // Tier should match availability when no pin set.
+  R.pinTier(null);
+  const auto = await R.pickTier();
+  if (status.ollama)      log("auto-picks ollama when ollama available", auto.tier === "ollama");
+  else if (status.webllm) log("auto-picks webllm when only webllm available", auto.tier === "webllm");
+  else                    log("returns null when neither available", auto.tier === null);
+}
+
+group("LLMRouter · pin + clear");
+{
+  R.pinTier("webllm");
+  log("pinnedTier === 'webllm' after pin", R.pinnedTier() === "webllm");
+  const status = await R.probe();
+  const picked = await R.pickTier();
+  if (status.webllm) {
+    log("pin honoured when tier available", picked.tier === "webllm");
+  } else {
+    log("pin ignored when tier not available — falls through",
+        picked.tier !== "webllm");
+  }
+  R.pinTier(null);
+  log("pinTier(null) clears pin", R.pinnedTier() === null);
+
+  // Bad input is no-op
+  R.pinTier("nonsense");
+  log("invalid tier ignored", R.pinnedTier() !== "nonsense");
+}
+
+group("LLMRouter · TIERS constant");
+{
+  log("TIERS is array",                Array.isArray(R.TIERS));
+  log("includes 'ollama' + 'webllm'",  R.TIERS.includes("ollama") && R.TIERS.includes("webllm"));
+  log("frozen",                          Object.isFrozen(R.TIERS));
+}
+
+group("LLMRouter · listModels dispatch");
+{
+  const ollamaList = await R.listModels("ollama");
+  log("listModels('ollama') returns array", Array.isArray(ollamaList));
+  const webList    = await R.listModels("webllm");
+  log("listModels('webllm') returns array",  Array.isArray(webList));
+  log("webllm list non-empty",                webList.length > 0);
+  const empty      = await R.listModels("bogus");
+  log("listModels(bogus) → []",                Array.isArray(empty) && empty.length === 0);
+}
+
+group("LLMRouter · chatVia + generateVia bad inputs");
+{
+  // Without messages, both should propagate to the underlying client's
+  // null return path.
+  const r1 = await R.chatVia("ollama", { messages: [] }, { onError: () => {} });
+  log("chatVia(ollama, no messages) → null", r1 === null);
+
+  // Bogus tier → null
+  const r2 = await R.chatVia("bogus", { messages: [{role:"user",content:"x"}] }, {});
+  log("chatVia(bogus, …) → null",            r2 === null);
+
+  const r3 = await R.generateVia("bogus", { prompt: "x", model: "y" }, {});
+  log("generateVia(bogus, …) → null",        r3 === null);
+}
+
+/* ════════════ Summary ════════════ */
+out.innerHTML += `\n<div class="summary ${p===n?'pass':'fail'}">Ran ${n} tests — ${p} passed, ${n-p} failed.</div>`;
+document.title = `MNP m6.5 ${p}/${n}`;
+</script>
+</body>
+</html>

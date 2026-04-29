@@ -8,7 +8,7 @@
  * Scenarios covered: cold-load perf, offline shell (#39), SW update flow (#62)
  */
 
-const SW_VERSION = "mnp-v3-m6-1";
+const SW_VERSION = "mnp-v3-m6.5-1";
 const SHELL_CACHE = `${SW_VERSION}-shell`;
 const CDN_CACHE   = `${SW_VERSION}-cdn`;
 
@@ -100,6 +100,9 @@ const SHELL = [
   "./src/llm/ollama.js",
   "./src/llm/prompt.js",
   "./src/llm/stream.js",
+  // m6.5 — Web-LLM (in-browser WebGPU) + router
+  "./src/llm/webllm.js",
+  "./src/llm/llmRouter.js",
   // phase 7 — 12 modules + orchestrator + calibration
   "./src/modules/baseModule.js",
   "./src/modules/trendFollow.js",

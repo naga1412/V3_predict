@@ -3631,41 +3631,55 @@ function ScannerPane({ tf }) {
    ║  AI Chat stub tab                                                ║
    ╚══════════════════════════════════════════════════════════════════╝ */
 
-/* ── M6 · AIChatPane — Ollama-streamed reasoning trace ──
-   Talks to a local Ollama daemon at http://localhost:11434.  When
-   unavailable (daemon down or HTTPS-blocked mixed-content) falls back
-   to the deterministic analyst from v3-pre-M6. */
+/* ── M6.5 · AIChatPane — multi-tier LLM (Ollama → Web-LLM → fallback) ──
+   The Router (window.__MNP__.LLMRouter) auto-picks the active tier:
+     - ollama  : http://localhost:11434 (best, but needs install)
+     - webllm  : in-browser WebGPU (zero-install, ~1.5 GB model dl)
+   When neither is reachable, falls back to the deterministic analyst. */
 function AIChatPane({ orch, expected, ta, symbol, tf, ghost, regime, wyckoff, macro, deriv, stability, news }) {
   const [msgs, setMsgs] = useState([
-    { role: "ai", text: "Hi — I'm wired to your local Ollama daemon (model below). Ask anything. If Ollama isn't running, I fall back to a deterministic local analyst." },
+    { role: "ai", text: "Hi — I auto-pick the best local LLM tier:\n  • Ollama if running on :11434 (best quality)\n  • Web-LLM in-browser via WebGPU (zero install, ~1.5 GB model on first run)\n  • Deterministic analyst fallback otherwise.\nAsk anything." },
   ]);
   const [input, setInput] = useState("");
+  const [tier, setTier]     = useState(null);
+  const [tierStatus, setTierStatus] = useState({ ollama: false, webllm: false });
   const [models, setModels] = useState([]);
   const [model, setModel]   = useState(localStorage.getItem("mnp.llm.model") || "");
-  const [llmReady, setLlmReady] = useState(false);
   const [busy, setBusy]     = useState(false);
+  const [dl, setDl]         = useState(null);   // { progress, text } for web-llm download
   const abortRef = useRef(null);
 
-  // Probe Ollama once on mount + every 30s.
+  // Probe both tiers on mount + every 30s.  Pick the active tier.
   useEffect(() => {
-    const O = window.__MNP__?.Ollama;
-    if (!O) return;
+    const R = window.__MNP__?.LLMRouter;
+    if (!R) return;
     let stopped = false;
     const probe = async () => {
-      const ok = await O.ping();
+      const { tier: picked, status } = await R.pickTier();
       if (stopped) return;
-      setLlmReady(ok);
-      if (ok) {
-        const list = await O.listModels();
+      setTierStatus(status);
+      setTier(picked);
+      if (picked === "ollama") {
+        const list = await window.__MNP__.Ollama.listModels();
         if (stopped) return;
         setModels(list);
-        if (!model && list.length) {
-          // Prefer DeepSeek if installed
+        if ((!model || !list.includes(model)) && list.length) {
           const ds = list.find((m) => /deepseek/i.test(m));
           const pick = ds || list[0];
           setModel(pick);
-          localStorage.setItem("mnp.llm.model", pick);
+          try { localStorage.setItem("mnp.llm.model", pick); } catch {}
         }
+      } else if (picked === "webllm") {
+        const W = window.__MNP__.WebLLM;
+        const list = (W?.MODELS || []).map((m) => m.id);
+        setModels(list);
+        if ((!model || !list.includes(model)) && list.length) {
+          const def = (W.MODELS.find((m) => m.default) || W.MODELS[0]).id;
+          setModel(def);
+          try { localStorage.setItem("mnp.llm.model", def); } catch {}
+        }
+      } else {
+        setModels([]);
       }
     };
     probe();
@@ -3673,9 +3687,22 @@ function AIChatPane({ orch, expected, ta, symbol, tf, ghost, regime, wyckoff, ma
     return () => { stopped = true; clearInterval(t); };
   }, []);
 
+  // Subscribe to Web-LLM download progress.
+  useEffect(() => {
+    const W = window.__MNP__?.WebLLM;
+    if (!W?.onProgress) return;
+    return W.onProgress((p) => setDl(p));
+  }, []);
+
   const onModelChange = useCallback((m) => {
     setModel(m);
     try { localStorage.setItem("mnp.llm.model", m); } catch {}
+  }, []);
+
+  const onTierChange = useCallback((t) => {
+    const R = window.__MNP__?.LLMRouter;
+    R?.pinTier?.(t);
+    setTier(t);
   }, []);
 
   const buildCtx = useCallback(() => ({
@@ -3718,22 +3745,24 @@ function AIChatPane({ orch, expected, ta, symbol, tf, ghost, regime, wyckoff, ma
     setInput("");
     setMsgs(m => [...m, { role: "you", text: user }]);
 
-    const O   = window.__MNP__?.Ollama;
+    const R   = window.__MNP__?.LLMRouter;
     const PB  = window.__MNP__?.LLMPrompt;
-    if (!llmReady || !O || !PB || !model) {
+    if (!tier || !R || !PB) {
       setMsgs(m => [...m, { role: "ai", text: deterministic(user) }]);
       return;
     }
     setBusy(true);
-    const aiIdx = msgs.length + 1;   // index of the streaming AI bubble (after we push)
-    setMsgs(m => [...m, { role: "ai", text: "", streaming: true }]);
+    setMsgs(m => [...m, { role: "ai", text: "", streaming: true, tier }]);
     const ctl = new AbortController();
     abortRef.current = ctl;
     const ctx = buildCtx();
     const { system, prompt } = PB.buildPrompt({ ctx, question: user });
     let acc = "";
     try {
-      await O.generate(
+      // Route through the active tier.  Ollama uses /generate, Web-LLM
+      // gets the same prompt funnelled through its chat endpoint.
+      const fn = tier === "ollama" ? "generateVia" : "generateVia";
+      await R[fn](tier,
         { model, prompt, system, signal: ctl.signal, options: { temperature: 0.4 } },
         {
           onToken: (tok) => {
@@ -3749,13 +3778,13 @@ function AIChatPane({ orch, expected, ta, symbol, tf, ghost, regime, wyckoff, ma
             acc = `(LLM error: ${err?.message || err})\n\n` + deterministic(user);
             setMsgs((m) => {
               const arr = m.slice();
-              arr[arr.length - 1] = { role: "ai", text: acc, streaming: false };
+              arr[arr.length - 1] = { role: "ai", text: acc, streaming: false, tier };
               return arr;
             });
           },
         }
       );
-    } catch { /* swallowed; onError handled it */ }
+    } catch { /* onError handled */ }
     setMsgs((m) => {
       const arr = m.slice();
       const last = arr[arr.length - 1];
@@ -3764,7 +3793,7 @@ function AIChatPane({ orch, expected, ta, symbol, tf, ghost, regime, wyckoff, ma
     });
     setBusy(false);
     abortRef.current = null;
-  }, [input, busy, llmReady, model, msgs.length, buildCtx, deterministic]);
+  }, [input, busy, tier, model, buildCtx, deterministic]);
 
   const stop = useCallback(() => {
     if (abortRef.current) { try { abortRef.current.abort(); } catch {} abortRef.current = null; }
@@ -3772,22 +3801,58 @@ function AIChatPane({ orch, expected, ta, symbol, tf, ghost, regime, wyckoff, ma
 
   return (
     <div className="chat-shell" aria-label="ai-chat">
-      <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 10px", borderBottom: "1px solid var(--border)", fontSize: 11 }}>
-        <span style={{ color: "var(--fg-dim)" }}>Ollama</span>
-        <span className={"chip-toggle on " + (llmReady ? "bull" : "bear")} style={{ fontSize: 9, padding: "1px 6px" }}>
-          {llmReady ? "online" : "offline"}
-        </span>
-        {llmReady && models.length > 0 && (
+      <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 10px", borderBottom: "1px solid var(--border)", fontSize: 11, flexWrap: "wrap" }}>
+        {/* Tier toggles */}
+        <span style={{ color: "var(--fg-dim)" }}>Tier</span>
+        <button type="button"
+          className={"chip-toggle " + (tier === "ollama" ? "on bull" : "")}
+          style={{ fontSize: 10, padding: "2px 8px", opacity: tierStatus.ollama ? 1 : 0.4 }}
+          disabled={!tierStatus.ollama}
+          onClick={() => tierStatus.ollama && onTierChange("ollama")}
+          title={tierStatus.ollama ? "Local Ollama daemon" : "start `ollama serve` then `ollama pull deepseek-r1`"}>
+          Ollama {tierStatus.ollama ? "●" : "○"}
+        </button>
+        <button type="button"
+          className={"chip-toggle " + (tier === "webllm" ? "on accent" : "")}
+          style={{ fontSize: 10, padding: "2px 8px", opacity: tierStatus.webllm ? 1 : 0.4 }}
+          disabled={!tierStatus.webllm}
+          onClick={() => tierStatus.webllm && onTierChange("webllm")}
+          title={tierStatus.webllm ? "In-browser WebGPU LLM" : "WebGPU not available — try Chromium 113+"}>
+          Web-LLM {tierStatus.webllm ? "●" : "○"}
+        </button>
+
+        {/* Model picker — labels differ per tier */}
+        {tier && models.length > 0 && (
           <select
-            value={model}
+            value={model || ""}
             onChange={(e) => onModelChange(e.target.value)}
-            style={{ fontSize: 11, padding: "2px 4px", background: "var(--bg)", color: "var(--fg)", border: "1px solid var(--border)", borderRadius: 3 }}>
-            {models.map((m) => <option key={m} value={m}>{m}</option>)}
+            style={{ fontSize: 11, padding: "2px 4px", background: "var(--bg)", color: "var(--fg)", border: "1px solid var(--border)", borderRadius: 3, maxWidth: 200 }}>
+            {models.map((m) => {
+              // Friendly label for Web-LLM model ids
+              const W = window.__MNP__?.WebLLM;
+              const meta = tier === "webllm" && Array.isArray(W?.MODELS)
+                ? W.MODELS.find((x) => x.id === m)
+                : null;
+              const label = meta ? `${meta.name} · ${(meta.sizeMB/1024).toFixed(1)} GB` : m;
+              return <option key={m} value={m}>{label}</option>;
+            })}
           </select>
         )}
-        {!llmReady && (
-          <span style={{ color: "var(--fg-dim)" }}>(start with `ollama serve` then pull a model)</span>
+
+        {!tier && (
+          <span style={{ color: "var(--fg-dim)" }}>(no LLM tier available — using deterministic fallback)</span>
         )}
+
+        {/* Web-LLM download progress */}
+        {tier === "webllm" && dl && dl.progress > 0 && dl.progress < 1 && (
+          <span style={{ color: "var(--fg-dim)", display: "flex", alignItems: "center", gap: 4 }}>
+            ⇣ {(dl.progress * 100).toFixed(0)}%
+            <span style={{ display: "inline-block", width: 80, height: 4, background: "var(--bg)", borderRadius: 2, overflow: "hidden" }}>
+              <span style={{ display: "block", height: "100%", width: `${dl.progress*100}%`, background: "var(--accent)" }} />
+            </span>
+          </span>
+        )}
+
         {busy && <button type="button" onClick={stop} className="chip-toggle" style={{ fontSize: 10, padding: "2px 6px", marginLeft: "auto" }}>stop</button>}
       </div>
       <div className="chat-log">
