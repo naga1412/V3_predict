@@ -82,8 +82,11 @@ export function classifyError(prediction, verdict, hint = {}) {
   switch (k) {
     case "direction": {
       // hit=false means we picked the wrong side (long when market went short).
+      // Validator emits the realized magnitude as `realized` (return), not
+      // `realizedReturn`.  Older tests / external callers may pass
+      // `realizedReturn` for convenience — accept both.
       if (verdict.hit === false) {
-        const realizedRet = +verdict.realizedReturn;
+        const realizedRet = +(verdict.realized ?? verdict.realizedReturn);
         const errorMag = Number.isFinite(realizedRet)
           ? (Number.isFinite(hint.atr) && hint.atr > 0
               ? Math.abs(realizedRet) * (prediction.payload?.refPrice || 1) / hint.atr
@@ -110,6 +113,9 @@ export function classifyError(prediction, verdict, hint = {}) {
       return null;
     }
     case "set": {
+      // Validator's set verdict uses `covered` only when the user passed
+      // a target class explicitly; absent that, treat empty/abstain as
+      // a non-mistake.
       if (verdict.covered === false) return { errorType: "set-miss", errorMag: 1.0 };
       return null;
     }
@@ -158,11 +164,21 @@ export function buildMistake({ prediction, verdict, ta, orch, regime, wyckoff, m
       rawScore:  Number.isFinite(prediction.payload?.rawScore)    ? prediction.payload.rawScore    : null,
     },
     realized: {
-      direction: verdict.realizedDirection || (verdict.hit === false && prediction.payload?.direction
-                  ? (prediction.payload.direction === "long" ? "short" : "long")
+      // Validator field is `realizedDir` ("up" | "down" | "flat").
+      // Fall back to inverting predicted direction when hit=false.
+      direction: verdict.realizedDir || verdict.realizedDirection
+              || (verdict.hit === false && prediction.payload?.direction
+                  ? (prediction.payload.direction === "long" ? "short"
+                    : prediction.payload.direction === "short" ? "long"
+                    : "?")
                   : "?"),
-      magnitude: Number.isFinite(+verdict.realizedReturn) ? +verdict.realizedReturn : null,
-      close:     Number.isFinite(+verdict.realizedClose)  ? +verdict.realizedClose  : null,
+      // Validator emits `realized` (the realized return); accept legacy
+      // `realizedReturn` alias for callers that synthesise verdicts.
+      magnitude: Number.isFinite(+(verdict.realized ?? verdict.realizedReturn))
+                  ? +(verdict.realized ?? verdict.realizedReturn) : null,
+      // Validator does not emit a realizedClose; accept it when the
+      // caller provides one (test fixtures, future verdicts).
+      close:     Number.isFinite(+verdict.realizedClose) ? +verdict.realizedClose : null,
     },
     context: {
       regime:      regime  || ta?.regime?.label || null,

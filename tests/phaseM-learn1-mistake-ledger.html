@@ -116,6 +116,44 @@ group("classifyError · pure logic");
   log("null inputs → null", ML.classifyError(null, null) === null);
 }
 
+/* ════════════ Real validator integration (catches field-name drift) ════════════ */
+group("classifyError · real validator output");
+{
+  const Validator = await import("../src/validation/validator.js");
+  // Direction-miss: predicted up, realized down
+  const candle = { o: 100, h: 101, l: 95, c: 96 };           // closed bearish
+  const v1 = Validator.verdictFor({ kind: "direction", payload: { dir: "up", refPrice: 100 } }, candle, { band: 0 });
+  // Real validator emits {hit, realizedDir, …}.  classifyError should
+  // accept it and produce a direction-miss with finite magnitude.
+  const c1 = ML.classifyError({ kind: "direction", payload: { refPrice: 100 } }, v1, { atr: 1 });
+  log("real validator direction-miss → errorType='direction'", c1?.errorType === "direction");
+  log("real validator: errorMag finite + > 0",                Number.isFinite(c1?.errorMag) && c1.errorMag > 0);
+
+  // Build a full Mistake from real verdict — magnitude + direction set
+  const m = ML.buildMistake({
+    prediction: { id: 1, symbol: "BTC", tf: "1h", t: 0, kind: "direction", payload: { direction: "long", refPrice: 100 } },
+    verdict:    v1,
+    ta: { atr14: [1] },
+  });
+  // Direction-only verdicts don't carry a scalar return — magnitude
+  // stays null on the realized side; classifyError still produces
+  // a finite errorMag derived elsewhere.
+  log("real verdict → realized.magnitude null (direction verdict has no scalar return)",
+      m?.realized?.magnitude === null);
+  log("real verdict → realized.direction !== '?'", m?.realized?.direction !== "?");
+  log("real verdict → realized.direction === 'down'", m?.realized?.direction === "down");
+
+  // Interval miss via real validator
+  const v2 = Validator.verdictFor(
+    { kind: "interval", payload: { lo: 0, hi: 0.005, refPrice: 100 } },
+    { o: 100, h: 110, l: 99, c: 110 },     // big up — outside the band
+    {}
+  );
+  const c2 = ML.classifyError({ kind: "interval" }, v2);
+  log("real validator interval-miss detected", c2?.errorType === "interval-miss");
+  log("real validator interval errorMag finite", Number.isFinite(c2?.errorMag));
+}
+
 /* ════════════ buildMistake ════════════ */
 group("buildMistake · captures context");
 {
