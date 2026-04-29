@@ -94,6 +94,8 @@ import * as LLMPrompt from "../llm/prompt.js";
 import * as LLMStream from "../llm/stream.js";
 import * as WebLLM    from "../llm/webllm.js";
 import * as LLMRouter from "../llm/llmRouter.js";
+// M-LEARN-1 — Mistake ledger (closed-loop self-correction)
+import * as MistakeLedger from "../learn/mistakeLedger.js";
 // Phase 10 — Auto-validation + drift monitor
 import * as PredictionStore from "../validation/predictionStore.js";
 import * as Validator from "../validation/validator.js";
@@ -198,13 +200,15 @@ export async function boot() {
     LLMStream,
     WebLLM,
     LLMRouter,
+    // M-LEARN-1
+    MistakeLedger,
     // Phase 10
     PredictionStore,
     Validator,
     Drift,
     ValidationMonitor,
     createDefaultMonitor,
-    version: "3.0.0-m6.5",
+    version: "3.0.0-mlearn1",
   };
 
   // Degrade decisions ------------------------------------------------------

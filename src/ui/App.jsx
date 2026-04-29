@@ -1933,6 +1933,94 @@ function AdaptiveWeightsCard({ adaptive, tick, orch }) {
   );
 }
 
+/* ── M-LEARN-1 · MistakeLedgerCard ──
+   Shows the running mistake count + last 5 wrong calls for the
+   current (symbol, tf) so you can see the brain working. */
+function MistakeLedgerCard({ symbol, tf }) {
+  const [sum, setSum] = useState(null);
+  const [recent, setRecent] = useState([]);
+  const [tick, setTick] = useState(0);
+
+  // Listen for new mistakes; refresh stats.
+  useEffect(() => {
+    const off = window.__MNP__?.EventBus?.on?.("mistake:recorded", () => setTick((n) => n + 1));
+    return () => { try { off?.(); } catch {} };
+  }, []);
+
+  useEffect(() => {
+    let stopped = false;
+    const ML = window.__MNP__?.MistakeLedger;
+    if (!ML) return;
+    (async () => {
+      try {
+        const [s, r] = await Promise.all([
+          ML.summary(),
+          ML.recent({ limit: 5, symbol, tf }),
+        ]);
+        if (!stopped) { setSum(s); setRecent(r); }
+      } catch { /* ignore */ }
+    })();
+    return () => { stopped = true; };
+  }, [symbol, tf, tick]);
+
+  if (!sum) {
+    return (
+      <div className="card">
+        <h3>Mistake Ledger <span className="badge">loading</span></h3>
+      </div>
+    );
+  }
+  const total = sum.total || 0;
+  const tone = total === 0 ? "" : "warn";
+  const dirN = sum.byErrorType?.direction || 0;
+  const intN = sum.byErrorType?.["interval-miss"] || 0;
+  const magN = sum.byErrorType?.magnitude || 0;
+  return (
+    <div className="card">
+      <h3>Mistake Ledger <span className={"badge " + tone}>{total}</span></h3>
+      {total === 0 ? (
+        <div style={{ color: "var(--fg-dim)", fontSize: 12 }}>
+          No wrong calls recorded yet.  When verdicts come in, mistakes land here.
+        </div>
+      ) : (
+        <>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6, marginBottom: 8 }}>
+            <div className="dl-cell"><div className="k">Direction</div><div className="v" style={{ color: dirN > 0 ? "var(--bear)" : "var(--fg)" }}>{dirN}</div></div>
+            <div className="dl-cell"><div className="k">Interval</div><div className="v" style={{ color: intN > 0 ? "var(--bear)" : "var(--fg)" }}>{intN}</div></div>
+            <div className="dl-cell"><div className="k">Magnitude</div><div className="v" style={{ color: magN > 0 ? "var(--bear)" : "var(--fg)" }}>{magN}</div></div>
+          </div>
+          {recent.length > 0 ? (
+            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+              <div style={{ fontSize: 10, color: "var(--fg-dim)", textTransform: "uppercase", letterSpacing: 1 }}>
+                Last {recent.length} on {symbol} · {tf}
+              </div>
+              {recent.map((m) => {
+                const age = Date.now() - (m.t || m.createdAt || 0);
+                const ageStr = age < 3600_000 ? `${(age/60_000)|0}m`
+                            : age < 86400_000 ? `${(age/3600_000)|0}h`
+                            : `${(age/86400_000)|0}d`;
+                return (
+                  <div key={m.id} style={{ display: "grid", gridTemplateColumns: "auto 1fr auto", gap: 6, fontSize: 11, padding: "3px 6px", background: "var(--bg)", borderRadius: 3 }}>
+                    <span className="chip-toggle on bear" style={{ fontSize: 9, padding: "1px 5px" }}>{m.errorType}</span>
+                    <span style={{ color: "var(--fg-dim)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      pred {m.predicted?.direction || "?"} → real {m.realized?.direction || "?"}
+                      {Number.isFinite(m.errorMag) && ` · ${m.errorMag.toFixed(2)} ATR`}
+                      {m.context?.regime && <span style={{ marginLeft: 4 }}>· {m.context.regime}</span>}
+                    </span>
+                    <span style={{ color: "var(--fg-dim)", fontFamily: "var(--font-mono)" }}>{ageStr}</span>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <div style={{ fontSize: 10, color: "var(--fg-dim)" }}>No recent mistakes for this pair.</div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
 function MasterBiasCard({ orch }) {
   if (!orch) return null;
   return (
@@ -3087,6 +3175,7 @@ function SignalSidebar({ orch, expected, ghost, ta, candles, regime, symbol, gho
       <MasterBiasCard orch={orch} />
       <StabilityCard stability={stability} />
       <AdaptiveWeightsCard adaptive={adaptive} tick={adaptiveTick} orch={orch} />
+      <MistakeLedgerCard symbol={symbol} tf={tf} />
       <DLSupervisorCard orch={orch} expected={expected} ta={ta} />
       {symbol && <LongShortRatioCard symbol={symbol} />}
       {symbol && <HTFBiasGridCard symbol={symbol} />}
@@ -4060,6 +4149,26 @@ function App() {
     if (!A?.recordVerdict || !adaptiveRef.current) return;
     A.recordVerdict(adaptiveRef.current, orch, e?.verdict || {});
     setAdaptiveTick((n) => n + 1);
+  });
+
+  // M-LEARN-1 — auto-record any miss into the Mistake Ledger with the
+  // full feature snapshot at predict-time.  Pulls live ctx from the
+  // current React render so the captured context matches what the
+  // orchestrator actually saw.
+  useBusEvent("validation:verdict", async (e) => {
+    const ML = window.__MNP__?.MistakeLedger;
+    if (!ML?.buildMistake) return;
+    try {
+      const m = ML.buildMistake({
+        prediction: e?.prediction,
+        verdict:    e?.verdict,
+        ta, orch,
+        regime:  ta?.regime?.label,
+        wyckoff: ta?.wyckoff?.phase,
+        macro:   null,
+      });
+      if (m) await ML.recordMistake(m);
+    } catch { /* swallow */ }
   });
 
   // ── Validation signal (Phase 10)

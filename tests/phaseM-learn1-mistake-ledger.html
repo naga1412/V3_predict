@@ -1,0 +1,275 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate" />
+<meta http-equiv="Pragma"        content="no-cache" />
+<meta http-equiv="Expires"       content="0" />
+<title>MNP · M-LEARN-1 — Mistake Ledger</title>
+<style>
+  body { background:#131722; color:#d1d4dc; font:13px/1.5 monospace; padding:20px; }
+  .pass { color:#26a69a; } .fail { color:#ef5350; }
+  .group { margin-top: 12px; font-weight:bold; color:#2962ff; }
+  h1 { color:#fff; font-size:18px; }
+  #out { white-space: pre-wrap; }
+  .summary { margin-top: 16px; padding: 8px; border:1px solid #2a2e39; }
+</style>
+</head>
+<body>
+<h1>MNP — M-LEARN-1 · Mistake Ledger</h1>
+<script>
+  if (location.protocol === "file:") { document.body.innerHTML = `<div style="color:#ef5350">Run on http://localhost</div>`; throw new Error("file://"); }
+</script>
+<div id="out">running…</div>
+
+<script type="module">
+const out = document.getElementById("out");
+function showErr(prefix, info) {
+  const safe = (typeof info === "string" ? info : (info?.message || info?.reason || JSON.stringify(info))) || "(empty)";
+  console.error("[test]", prefix, info);
+  out.innerHTML += `<span class="fail">✗ ${prefix}: ${safe}</span>\n`;
+}
+window.addEventListener("error", (e) => showErr("error", { message: e.message, filename: e.filename, line: e.lineno, error: e.error?.message }));
+window.addEventListener("unhandledrejection", (e) => showErr("rejection", e.reason?.message || String(e.reason)));
+const V = "ml1-" + Date.now();
+const U = (p) => new URL(`${p}?v=${V}`, location.href).href;
+
+// Force-revalidate every module the test (transitively) depends on so
+// a stale browser HTTP cache can't serve us an old DB schema.
+for (const f of [
+  "../src/data/schema.js",
+  "../src/data/idb.js",
+  "../src/learn/mistakeLedger.js",
+  "../src/core/bus.js",
+  "../src/core/resilience.js",
+]) {
+  try { await fetch(f, { cache: "reload" }); } catch {}
+}
+
+// Hydrate the IDB schema.  Wipe any older DB so the v6 migration runs.
+const IDB = await import(U("../src/data/idb.js"));
+try {
+  // Best-effort wipe of pre-existing v5 DB to avoid VersionError when
+  // schema.js is browser-cached at v5 elsewhere.
+  await new Promise((res) => {
+    const req = indexedDB.deleteDatabase("mnp_v3");
+    req.onsuccess = req.onerror = req.onblocked = () => res();
+  });
+} catch {}
+try {
+  await IDB.openDB();
+} catch (err) {
+  out.innerHTML += `<span class="fail">✗ openDB failed: ${err?.name || ""} ${err?.message || err}</span>\n`;
+  throw err;
+}
+
+const ML = await import(U("../src/learn/mistakeLedger.js"));
+
+let n = 0, p = 0;
+const log = (s, ok, err) => { out.innerHTML += `<span class="${ok?'pass':'fail'}">${ok?'✓':'✗'} ${s}${err ? ' — ' + err : ''}</span>\n`; n++; if (ok) p++; };
+const group = (s) => { out.innerHTML += `\n<span class="group">[${s}]</span>\n`; };
+
+// Clean slate
+await ML.clearAll();
+
+/* ════════════ classifyError ════════════ */
+group("classifyError · pure logic");
+{
+  // direction-miss → returns errorType:"direction"
+  const d = ML.classifyError({ kind: "direction", payload: { refPrice: 100 } },
+                              { kind: "direction", hit: false, realizedReturn: -0.02 },
+                              { atr: 1 });
+  log("direction miss → errorType='direction'", d?.errorType === "direction");
+  log("direction miss → errorMag finite + > 0", Number.isFinite(d?.errorMag) && d.errorMag > 0);
+
+  // direction hit → null
+  const dh = ML.classifyError({ kind: "direction" }, { kind: "direction", hit: true, realizedReturn: 0.01 });
+  log("direction hit → null", dh === null);
+
+  // abstain → null
+  const da = ML.classifyError({ kind: "direction" }, { kind: "direction", abstain: true });
+  log("abstain → null", da === null);
+
+  // interval miss → errorType:"interval-miss"
+  const i = ML.classifyError({ kind: "interval" }, { kind: "interval", covered: false, centreResidual: 1.5 });
+  log("interval-miss returned", i?.errorType === "interval-miss");
+  log("interval errorMag === |centreResidual|", i?.errorMag === 1.5);
+
+  // interval covered → null
+  const ic = ML.classifyError({ kind: "interval" }, { kind: "interval", covered: true });
+  log("interval covered → null", ic === null);
+
+  // return miss with > 1 ATR error
+  const r = ML.classifyError({ kind: "return" }, { kind: "return", absError: 2.5 }, { atr: 1 });
+  log("return |error|>ATR → errorType='magnitude'", r?.errorType === "magnitude");
+  log("magnitude errorMag === error/ATR", r?.errorMag === 2.5);
+
+  // return tiny error (< ATR) → null
+  const rs = ML.classifyError({ kind: "return" }, { kind: "return", absError: 0.5 }, { atr: 1 });
+  log("return |error|<ATR → null", rs === null);
+
+  // set miss
+  const sm = ML.classifyError({ kind: "set" }, { kind: "set", covered: false });
+  log("set-miss returned", sm?.errorType === "set-miss");
+
+  // null inputs
+  log("null inputs → null", ML.classifyError(null, null) === null);
+}
+
+/* ════════════ buildMistake ════════════ */
+group("buildMistake · captures context");
+{
+  const prediction = {
+    id: 7, symbol: "BTCUSDT", tf: "1h", t: 1714123200000,
+    kind: "direction",
+    payload: { direction: "long", probability: 0.7, target: 65500, refPrice: 64000 },
+  };
+  const verdict = { kind: "direction", hit: false, realizedReturn: -0.02, realizedClose: 62720 };
+  const ta = {
+    atr14: [350, 360, 380],
+    regime: { label: "trend-down-strong" },
+    wyckoff: { phase: "markdown" },
+  };
+  const orch = {
+    signals: [
+      { moduleId: "trend-follow", signal:  0.8, confidence: 0.9 },
+      { moduleId: "momentum",     signal:  0.6, confidence: 0.7 },
+      { moduleId: "rsi",          signal: -0.2, confidence: 0.4 },
+    ],
+    featureVec: [0.1, 0.2, 0.3],
+  };
+  const m = ML.buildMistake({ prediction, verdict, ta, orch });
+  log("buildMistake returns object",                  m && typeof m === "object");
+  log("predictionId === 7",                            m.predictionId === 7);
+  log("symbol/tf/t carried",                            m.symbol === "BTCUSDT" && m.tf === "1h" && m.t === 1714123200000);
+  log("errorType === 'direction'",                     m.errorType === "direction");
+  log("errorMag finite + > 0",                         Number.isFinite(m.errorMag) && m.errorMag > 0);
+  log("predicted.direction captured",                  m.predicted.direction === "long");
+  log("realized.direction inverted",                   m.realized.direction === "short");
+  log("context.regime captured",                       m.context.regime === "trend-down-strong");
+  log("context.wyckoff captured",                       m.context.wyckoff === "markdown");
+  log("context.atr === lastFinite(atr14)",             m.context.atr === 380);
+  log("topModules has 3 entries (sorted by |sig*conf|)", Array.isArray(m.context.topModules) && m.context.topModules.length === 3);
+  log("topModules[0] === trend-follow (highest)",      m.context.topModules[0].moduleId === "trend-follow");
+  log("featureVec snapshot copied",                     Array.isArray(m.context.featureVec) && m.context.featureVec.length === 3);
+
+  // Hit verdicts produce null
+  const hitV = { kind: "direction", hit: true, realizedReturn: 0.01 };
+  log("hit verdict → null mistake", ML.buildMistake({ prediction, verdict: hitV, ta, orch }) === null);
+}
+
+/* ════════════ Persistence ════════════ */
+group("recordMistake · IDB round-trip");
+{
+  await ML.clearAll();
+  const fakeM = {
+    predictionId: 1, symbol: "ETHUSDT", tf: "5m", t: 1000,
+    kind: "direction", errorType: "direction", errorMag: 1.5,
+    predicted: { direction: "long" },
+    realized:  { direction: "short" },
+    context:   { regime: "trend-up-strong" },
+    createdAt: Date.now(),
+  };
+  const id = await ML.recordMistake(fakeM);
+  log("recordMistake returns numeric id", typeof id === "number" && id > 0);
+
+  const total = await ML.count();
+  log("count === 1 after one record", total === 1);
+
+  const r = await ML.recent({ limit: 10 });
+  log("recent returns 1 row",  r.length === 1);
+  log("row.id matches",          r[0].id === id);
+  log("row.symbol matches",      r[0].symbol === "ETHUSDT");
+}
+
+/* ════════════ Filtering + summary ════════════ */
+group("recent + summary · aggregations");
+{
+  await ML.clearAll();
+  const samples = [
+    { predictionId: 1, symbol: "BTCUSDT", tf: "1h", t: 100, kind: "direction", errorType: "direction",     errorMag: 1, predicted:{direction:"long"},  realized:{direction:"short"}, context:{regime:"A"}, createdAt: Date.now() },
+    { predictionId: 2, symbol: "BTCUSDT", tf: "1h", t: 200, kind: "direction", errorType: "direction",     errorMag: 1, predicted:{direction:"short"}, realized:{direction:"long"},  context:{regime:"B"}, createdAt: Date.now() },
+    { predictionId: 3, symbol: "ETHUSDT", tf: "1h", t: 300, kind: "interval",  errorType: "interval-miss", errorMag: 2, predicted:{direction:"long"},  realized:{direction:"long"},  context:{regime:"A"}, createdAt: Date.now() },
+    { predictionId: 4, symbol: "BTCUSDT", tf: "5m", t: 400, kind: "return",    errorType: "magnitude",     errorMag: 3, predicted:{direction:"long"},  realized:{direction:"long"},  context:{regime:"B"}, createdAt: Date.now() },
+  ];
+  for (const m of samples) await ML.recordMistake(m);
+
+  const all = await ML.recent({ limit: 10 });
+  log("recent returns 4 (newest first)", all.length === 4);
+  log("recent[0].t === 400 (newest)",     all[0].t === 400);
+
+  const btc = await ML.recent({ symbol: "BTCUSDT" });
+  log("symbol filter returns 3", btc.length === 3);
+
+  const intOnly = await ML.recent({ errorType: "interval-miss" });
+  log("errorType filter returns 1", intOnly.length === 1);
+
+  const regA = await ML.recent({ regime: "A" });
+  log("regime filter returns 2", regA.length === 2);
+
+  const sum = await ML.summary();
+  log("summary.total === 4",                    sum.total === 4);
+  log("byErrorType.direction === 2",            sum.byErrorType.direction === 2);
+  log("byErrorType.interval-miss === 1",        sum.byErrorType["interval-miss"] === 1);
+  log("byErrorType.magnitude === 1",            sum.byErrorType.magnitude === 1);
+  log("byRegime.A === 2 + .B === 2",            sum.byRegime.A === 2 && sum.byRegime.B === 2);
+  log("lastT === 400",                           sum.lastT === 400);
+}
+
+/* ════════════ Auto-recorder via EventBus ════════════ */
+group("startAutoRecorder · validation:verdict listener");
+{
+  await ML.clearAll();
+  // Use the SAME bus.js path mistakeLedger imports — module identity
+  // is keyed by resolved URL, so a different ?v= would yield a
+  // different EventBus singleton.
+  const Bus = (await import("../src/core/bus.js")).EventBus;
+
+  const off = ML.startAutoRecorder({
+    getCtx: () => ({
+      ta: { atr14: [1, 1, 1], regime: { label: "trend-up" }, wyckoff: { phase: "markup" } },
+      orch: { signals: [{ moduleId: "x", signal: 0.5, confidence: 0.5 }] },
+    }),
+  });
+
+  // Fire a miss-verdict — ledger should pick it up
+  Bus.emit("validation:verdict", {
+    prediction: { id: 99, symbol: "SOLUSDT", tf: "15m", t: 5000, kind: "direction", payload: { direction: "long", refPrice: 100 } },
+    verdict:    { kind: "direction", hit: false, realizedReturn: -0.03 },
+  });
+
+  // EventBus listeners are sync; the recorder uses an async write.
+  // Wait a tick for the put() to land.
+  await new Promise(r => setTimeout(r, 80));
+
+  const after = await ML.count();
+  log("auto-recorder wrote one row", after === 1);
+
+  // Fire a HIT-verdict — should NOT record.
+  Bus.emit("validation:verdict", {
+    prediction: { id: 100, symbol: "SOLUSDT", tf: "15m", t: 6000, kind: "direction", payload: { direction: "long" } },
+    verdict:    { kind: "direction", hit: true, realizedReturn: 0.02 },
+  });
+  await new Promise(r => setTimeout(r, 80));
+
+  log("hit verdict not recorded", (await ML.count()) === 1);
+
+  // Fire mistake:recorded should bubble back
+  let saw = null;
+  Bus.on("mistake:recorded", (e) => { saw = e; });
+  Bus.emit("validation:verdict", {
+    prediction: { id: 101, symbol: "SOLUSDT", tf: "15m", t: 7000, kind: "direction", payload: { direction: "short", refPrice: 100 } },
+    verdict:    { kind: "direction", hit: false, realizedReturn: 0.04 },
+  });
+  await new Promise(r => setTimeout(r, 80));
+  log("mistake:recorded event fired", saw && saw.mistake && saw.mistake.symbol === "SOLUSDT");
+
+  off?.();
+}
+
+/* ════════════ Summary ════════════ */
+out.innerHTML += `\n<div class="summary ${p===n?'pass':'fail'}">Ran ${n} tests — ${p} passed, ${n-p} failed.</div>`;
+document.title = `MNP m-learn-1 ${p}/${n}`;
+</script>
+</body>
+</html>

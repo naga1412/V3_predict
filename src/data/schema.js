@@ -13,7 +13,7 @@
  */
 
 export const DB_NAME    = "mnp";
-export const DB_VERSION = 5;
+export const DB_VERSION = 6;
 
 export const STORES = {
   // Time-series (OHLCV)
@@ -134,6 +134,21 @@ export const STORES = {
     ],
   },
 
+  // M-LEARN-1 (DB v6): mistake ledger — frozen snapshot of every wrong
+  // prediction, indexed by regime / errorType / timestamp.  Drives the
+  // anti-pattern discovery worker downstream.
+  mistakes: {
+    keyPath: "id",
+    autoIncrement: true,
+    indexes: [
+      { name: "by_t",         keyPath: "t" },
+      { name: "by_symbol_tf", keyPath: ["symbol", "tf"] },
+      { name: "by_regime",    keyPath: "context.regime" },
+      { name: "by_errorType", keyPath: "errorType" },
+      { name: "by_predId",    keyPath: "predictionId" },
+    ],
+  },
+
   // M4a (DB v5): news headlines + sentiment + categorisation.  Row shape:
   //   { guid, source, sourceId, link, title, summary, pubDate, fetchedAt,
   //     sentiment: {compound,label,pos,neg},
@@ -209,6 +224,18 @@ export const MIGRATIONS = {
     if (db.objectStoreNames.contains("news")) return;
     const def = STORES.news;
     const store = db.createObjectStore("news", {
+      keyPath: def.keyPath,
+      autoIncrement: def.autoIncrement || false,
+    });
+    (def.indexes || []).forEach(({ name: iname, keyPath, unique = false, multiEntry = false }) => {
+      store.createIndex(iname, keyPath, { unique, multiEntry });
+    });
+  },
+  // M-LEARN-1: added `mistakes` store for wrong-prediction ledger.
+  6: (db /*: IDBDatabase */) => {
+    if (db.objectStoreNames.contains("mistakes")) return;
+    const def = STORES.mistakes;
+    const store = db.createObjectStore("mistakes", {
       keyPath: def.keyPath,
       autoIncrement: def.autoIncrement || false,
     });
