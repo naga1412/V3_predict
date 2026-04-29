@@ -8,7 +8,7 @@
  * Scenarios covered: cold-load perf, offline shell (#39), SW update flow (#62)
  */
 
-const SW_VERSION = "mnp-v3-mlearn4-2";
+const SW_VERSION = "mnp-v3-mlearn4-3";
 const SHELL_CACHE = `${SW_VERSION}-shell`;
 const CDN_CACHE   = `${SW_VERSION}-cdn`;
 
@@ -196,12 +196,34 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
-  // Same-origin shell — cache-first with network fallback
+  // index.html / "/" / "./" — NETWORK-FIRST so the version string in
+  // <script V=…> is always fresh and a stale shell can't pin users to
+  // an obsolete App.jsx?v=… (cache trap that bricks the page after a fix).
+  const path = url.pathname.replace(/\/+$/, "/");
+  const isShell = path === "/" || path.endsWith("/index.html");
+  if (url.origin === self.location.origin && isShell) {
+    event.respondWith(networkFirst(req, SHELL_CACHE));
+    return;
+  }
+
+  // Other same-origin assets — cache-first with network fallback
   if (url.origin === self.location.origin) {
     event.respondWith(cacheFirst(req, SHELL_CACHE));
     return;
   }
 });
+
+async function networkFirst(req, cacheName) {
+  const cache = await caches.open(cacheName);
+  try {
+    const res = await fetch(req, { cache: "no-store" });
+    if (res.ok) cache.put(req, res.clone());
+    return res;
+  } catch {
+    const cached = await cache.match(req);
+    return cached || new Response("offline", { status: 503, statusText: "offline", headers: { "content-type": "text/plain" } });
+  }
+}
 
 async function cacheFirst(req, cacheName) {
   const cache = await caches.open(cacheName);
