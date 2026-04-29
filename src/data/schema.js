@@ -13,7 +13,7 @@
  */
 
 export const DB_NAME    = "mnp";
-export const DB_VERSION = 8;
+export const DB_VERSION = 9;
 
 export const STORES = {
   // Time-series (OHLCV)
@@ -192,6 +192,19 @@ export const STORES = {
       { name: "by_highImpact",    keyPath: "classification.highImpact" },
     ],
   },
+
+  // M-SCAN (DB v9): per-symbol scan results — orchestrator + meta-brain
+  // verdict for every symbol scanned across the universe.  Indexed by
+  // (symbol, tf) for fast ranked lookups; refreshed on every scan run.
+  scanResults: {
+    keyPath: ["symbol", "tf"],
+    autoIncrement: false,
+    indexes: [
+      { name: "by_scannedAt", keyPath: "scannedAt" },
+      { name: "by_assetType", keyPath: "assetType" },
+      { name: "by_absBias",   keyPath: "absBias" },
+    ],
+  },
 };
 
 /**
@@ -288,6 +301,18 @@ export const MIGRATIONS = {
     if (db.objectStoreNames.contains("metaBrainPool")) return;
     const def = STORES.metaBrainPool;
     const store = db.createObjectStore("metaBrainPool", {
+      keyPath: def.keyPath,
+      autoIncrement: def.autoIncrement || false,
+    });
+    (def.indexes || []).forEach(({ name: iname, keyPath, unique = false, multiEntry = false }) => {
+      store.createIndex(iname, keyPath, { unique, multiEntry });
+    });
+  },
+  // M-SCAN: added `scanResults` store.
+  9: (db /*: IDBDatabase */) => {
+    if (db.objectStoreNames.contains("scanResults")) return;
+    const def = STORES.scanResults;
+    const store = db.createObjectStore("scanResults", {
       keyPath: def.keyPath,
       autoIncrement: def.autoIncrement || false,
     });

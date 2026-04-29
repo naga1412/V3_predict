@@ -3922,86 +3922,184 @@ function NewsPane({ symbol }) {
    ║  Scanner tab                                                     ║
    ╚══════════════════════════════════════════════════════════════════╝ */
 
-function ScannerPane({ tf }) {
-  const [rows, setRows] = useState([]);
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState(null);
+/* ── M-SCAN · Background scanner with crypto / non-crypto toggle ──
+   Walks the universe (capped at 30 by default), runs TA + orchestrator
+   + meta-brain decision per symbol, ranks by |bias|×conf×prob, and
+   surfaces the strongest signals.  Persisted in IDB so re-opening the
+   tab is instant; rescan-on-demand or every 5 min in the background. */
+function ScannerPane({ tf, setSymbol, setTab }) {
+  const [assetClass, setAssetClass] = useState("crypto");
+  const [rows, setRows]   = useState([]);
+  const [busy, setBusy]   = useState(false);
+  const [progress, setProgress] = useState({ done: 0, total: 0 });
+  const [lastTs, setLastTs] = useState(0);
+  const [err, setErr]     = useState(null);
+
+  // Hydrate from IDB on mount + filter changes — instant paint.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const M = window.__MNP__;
+      if (!M?.Scan?.latestResults) return;
+      try {
+        const cached = await M.Scan.latestResults({ assetClass, tf, limit: 60 });
+        if (!cancelled && Array.isArray(cached)) {
+          setRows(cached);
+          setLastTs(cached[0]?.scannedAt || 0);
+        }
+      } catch {}
+    })();
+    return () => { cancelled = true; };
+  }, [assetClass, tf]);
+
+  // Subscribe to live scan progress.
+  useBusEvent("scan:progress", (e) => {
+    setProgress({ done: e.done, total: e.total });
+  });
+  useBusEvent("scan:done", (e) => {
+    setBusy(false);
+    setLastTs(e.ts);
+    // Re-hydrate ranked results
+    const M = window.__MNP__;
+    M?.Scan?.latestResults?.({ assetClass, tf, limit: 60 })
+      .then((r) => Array.isArray(r) && setRows(r))
+      .catch(() => {});
+  });
+  useBusEvent("scan:error", (e) => {
+    if (e?.symbol) console.warn("[scan] err", e.symbol, e.err);
+  });
 
   const scan = useCallback(async () => {
-    setBusy(true); setErr(null); setRows([]);
-    const mnp = window.__MNP__;
-    if (!mnp) { setBusy(false); setErr("runtime not ready"); return; }
-    const out = [];
+    setBusy(true); setErr(null); setProgress({ done: 0, total: 0 });
+    const M = window.__MNP__;
+    if (!M?.Scan?.runScan) { setBusy(false); setErr("scanner not ready"); return; }
     try {
-      for (const sym of SYMBOLS) {
-        try {
-          const candles = await mnp.getStored({ symbol: sym, tf, limit: 300 });
-          if (!Array.isArray(candles) || candles.length < 50) {
-            out.push({ symbol: sym, status: "no-data", candles: candles?.length || 0 });
-            continue;
-          }
-          const ta = mnp.TAEngine.compute(candles);
-          const orch = mnp.Orchestrator.runModules(ta, {});
-          const last = ta.close?.[ta.close.length - 1];
-          const atr  = Array.isArray(ta.atr14) ? ta.atr14[ta.atr14.length - 1] : ta.atr14;
-          out.push({
-            symbol: sym,
-            status: "ok",
-            last, atr, trend: ta.trend,
-            direction: orch.direction,
-            bias: orch.rawScore,
-            prob: orch.probability,
-            conf: orch.confidence,
-            candles: candles.length,
-          });
-        } catch (e) {
-          out.push({ symbol: sym, status: "err", err: e?.message || String(e) });
-        }
-        // micro-yield
-        await new Promise(r => setTimeout(r, 5));
-      }
-      setRows(out.sort((a, b) => Math.abs(b.bias || 0) - Math.abs(a.bias || 0)));
+      await M.Scan.runScan({ assetClass, tf, limit: 30, concurrency: 4 });
     } catch (e) {
       setErr(e?.message || String(e));
-    } finally { setBusy(false); }
-  }, [tf]);
+      setBusy(false);
+    }
+  }, [assetClass, tf]);
 
-  // initial scan + rescan on tf change
-  useEffect(() => { scan(); }, [scan]);
+  // Auto-scan if cached results are stale (> 5 min) on mount/filter change.
+  useEffect(() => {
+    if (busy) return;
+    if (!rows.length || (Date.now() - lastTs) > 5 * 60 * 1000) {
+      scan();
+    }
+  }, [assetClass, tf]);   // eslint-disable-line react-hooks/exhaustive-deps
+
+  const handleWatch = useCallback((sym) => {
+    if (typeof setSymbol === "function") setSymbol(sym);
+    if (typeof setTab    === "function") setTab("chart");
+  }, [setSymbol, setTab]);
+
+  const pct = progress.total > 0 ? Math.round((progress.done / progress.total) * 100) : 0;
+  const ranked = rows.filter((r) => r.status === "ok");
+  const top = ranked.slice(0, 30);
 
   return (
     <section className="card" style={{ overflow: "auto", height: "100%" }}>
-      <h3>Scanner <span className="badge">{SYMBOLS.length} symbols · {tf}</span></h3>
-      <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
-        <button className="btn-primary" onClick={scan} disabled={busy}>{busy ? "scanning…" : "Rescan"}</button>
+      <h3>
+        Scanner
+        <span className="badge">{ranked.length}/{rows.length} signals · {tf}</span>
+      </h3>
+
+      <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 10, flexWrap: "wrap" }}>
+        {[
+          { id: "crypto",    label: "Crypto" },
+          { id: "stock",     label: "Stocks" },
+          { id: "etf",       label: "ETFs" },
+          { id: "forex",     label: "Forex" },
+          { id: "commodity", label: "Commodities" },
+          { id: "index",     label: "Indices" },
+          { id: "all",       label: "All" },
+        ].map((c) => (
+          <button key={c.id}
+            className={"chip-toggle" + (assetClass === c.id ? " on" : "")}
+            onClick={() => setAssetClass(c.id)}
+            disabled={busy}
+            style={{ fontSize: 11, padding: "3px 10px" }}>
+            {c.label}
+          </button>
+        ))}
+        <span style={{ flex: 1 }} />
+        <button className="btn-primary" onClick={scan} disabled={busy} style={{ fontSize: 12, padding: "4px 12px" }}>
+          {busy ? `scanning… ${pct}%` : "Rescan"}
+        </button>
+        {lastTs > 0 && !busy && (
+          <span style={{ fontSize: 11, color: "var(--fg-dim)" }}>updated {timeAgo(lastTs)}</span>
+        )}
         {err && <span style={{ color: "var(--bear)", fontSize: 12 }}>{err}</span>}
       </div>
+
+      {busy && (
+        <div style={{ height: 4, background: "var(--bg)", borderRadius: 2, overflow: "hidden", marginBottom: 8 }}>
+          <div style={{ width: `${pct}%`, height: "100%", background: "var(--accent)", transition: "width .15s linear" }} />
+        </div>
+      )}
+
       <table className="scan-table">
         <thead>
           <tr>
-            <th>Symbol</th><th>Last</th><th>Trend</th><th>Direction</th>
-            <th>Bias</th><th>P(up)</th><th>Conf</th><th>ATR</th><th>Candles</th>
+            <th>Symbol</th>
+            <th>Type</th>
+            <th>Last</th>
+            <th>Direction</th>
+            <th>Bias</th>
+            <th>P(up)</th>
+            <th>Brain</th>
+            <th>Conf</th>
+            <th>ATR</th>
+            <th></th>
           </tr>
         </thead>
         <tbody>
-          {rows.map(r => {
+          {top.length === 0 && !busy && (
+            <tr><td colSpan={10} style={{ color: "var(--fg-dim)", padding: "20px 0", textAlign: "center" }}>
+              No results yet — click <b>Rescan</b>
+            </td></tr>
+          )}
+          {top.map((r) => {
             const tone = directionTone(r.direction);
+            const brainOn = r.brain?.used === "meta-nn";
             return (
-              <tr key={r.symbol}>
-                <td><b style={{ color: "var(--fg)" }}>{r.symbol}</b></td>
+              <tr key={`${r.symbol}-${r.tf}`}>
+                <td>
+                  <b style={{ color: "var(--fg)" }}>{r.symbol}</b>
+                  {r.name && <div style={{ fontSize: 10, color: "var(--fg-dim)" }}>{r.name}</div>}
+                </td>
+                <td><span className="chip-toggle" style={{ fontSize: 9, padding: "1px 6px" }}>{r.assetType || "—"}</span></td>
                 <td>{fmt(r.last)}</td>
-                <td className={r.trend === "up" ? "bull" : r.trend === "down" ? "bear" : "flat"}>{r.trend || "—"}</td>
                 <td className={tone}>{(r.direction || "—").toUpperCase()}</td>
                 <td className={r.bias >= 0 ? "bull" : "bear"}>{fmtSigned(r.bias, 2)}</td>
                 <td>{Number.isFinite(r.prob) ? fmtPct(r.prob) : "—"}</td>
-                <td>{Number.isFinite(r.conf) ? fmtPct(r.conf) : "—"}</td>
+                <td>
+                  {brainOn ? (
+                    <span className="chip-toggle on" style={{ fontSize: 9, padding: "1px 6px" }}>🧠 NN</span>
+                  ) : (
+                    <span style={{ color: "var(--fg-dim)", fontSize: 10 }}>orch</span>
+                  )}
+                </td>
+                <td>{Number.isFinite(r.confidence) ? fmtPct(r.confidence) : "—"}</td>
                 <td>{fmt(r.atr)}</td>
-                <td style={{ opacity: .7 }}>{r.candles ?? 0}</td>
+                <td>
+                  <button type="button"
+                    className="chip-toggle"
+                    style={{ fontSize: 10, padding: "2px 8px" }}
+                    onClick={() => handleWatch(r.symbol)}>
+                    open
+                  </button>
+                </td>
               </tr>
             );
           })}
         </tbody>
       </table>
+
+      <div style={{ marginTop: 8, fontSize: 10, color: "var(--fg-dim)" }}>
+        Ranked by |bias| × confidence × probability · 🧠 NN means the meta-brain decided · auto-rescans every 5 min
+      </div>
     </section>
   );
 }
@@ -4604,7 +4702,7 @@ function App() {
         )}
         {tab === "scanner" && (
           <div style={{ gridColumn: "1 / -1", overflow: "auto" }}>
-            <ScannerPane tf={tf} />
+            <ScannerPane tf={tf} setSymbol={setSymbol} setTab={setTab} />
           </div>
         )}
         {tab === "news" && (

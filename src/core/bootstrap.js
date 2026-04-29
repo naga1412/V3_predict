@@ -101,6 +101,8 @@ import * as AntiPatterns  from "../learn/antiPatterns.js";
 import * as MetaVeto      from "../learn/metaVeto.js";
 // M-LEARN-4 — Meta-Brain (decision layer)
 import * as MetaBrain     from "../learn/metaBrain.js";
+// M-SCAN — multi-symbol background scanner
+import * as Scan          from "../scan/scanManager.js";
 // Phase 10 — Auto-validation + drift monitor
 import * as PredictionStore from "../validation/predictionStore.js";
 import * as Validator from "../validation/validator.js";
@@ -212,13 +214,15 @@ export async function boot() {
     MetaVeto,
     // M-LEARN-4
     MetaBrain,
+    // M-SCAN
+    Scan,
     // Phase 10
     PredictionStore,
     Validator,
     Drift,
     ValidationMonitor,
     createDefaultMonitor,
-    version: "3.0.0-mlearn4",
+    version: "3.0.0-mscan",
   };
 
   // Degrade decisions ------------------------------------------------------
