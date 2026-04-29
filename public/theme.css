@@ -330,6 +330,115 @@ html, body {
   .sidebar { order: 2; }
 }
 
+/* ── M-SCAN · Card grid ───────────────────────────────────────── */
+.scan-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 10px;
+  padding: 4px 0 16px;
+}
+.scan-card {
+  text-align: left;
+  cursor: pointer;
+  background: var(--bg-elev-1);
+  border: 1px solid var(--border);
+  border-top: 3px solid var(--fg-dim);
+  border-radius: 8px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font: inherit;
+  color: inherit;
+  transition: transform .12s ease, border-color .12s ease, box-shadow .12s ease;
+  box-shadow: 0 1px 2px rgba(0,0,0,.25);
+}
+.scan-card:hover {
+  transform: translateY(-1px);
+  border-color: var(--accent);
+  box-shadow: 0 4px 14px rgba(0,0,0,.4);
+}
+.scan-card-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 8px;
+}
+.scan-card-sym {
+  font-weight: 700;
+  font-size: 14px;
+  color: var(--fg);
+  letter-spacing: .3px;
+  font-family: var(--font-mono);
+}
+.scan-card-name {
+  font-size: 10px;
+  color: var(--fg-dim);
+  margin-top: 1px;
+}
+.scan-card-dir {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .8px;
+  padding: 3px 8px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, .04);
+  white-space: nowrap;
+}
+.scan-card-price {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: 16px;
+  color: var(--fg);
+}
+.scan-card-bias-track {
+  position: relative;
+  height: 4px;
+  background: var(--bg);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.scan-card-bias-fill {
+  position: absolute;
+  top: 0; bottom: 0;
+  border-radius: 2px;
+}
+.scan-card-bias-zero {
+  position: absolute;
+  top: -2px; bottom: -2px;
+  left: 50%;
+  width: 1px;
+  background: var(--fg-dimmer);
+  opacity: .5;
+}
+.scan-card-stats {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 4px 10px;
+  font-size: 11px;
+}
+.scan-card-stats > div {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 4px;
+}
+.scan-card-stats .k {
+  color: var(--fg-dim);
+  letter-spacing: .5px;
+  text-transform: uppercase;
+  font-size: 9px;
+}
+.scan-card-stats .v {
+  font-family: var(--font-mono);
+  color: var(--fg);
+}
+.scan-card-stats .v.bull { color: var(--bull); }
+.scan-card-stats .v.bear { color: var(--bear); }
+
 /* M8 — Mobile responsive: tab nav scrolls, sidebar collapses to drawer
    on phones, top bar wraps cleanly without overflowing. */
 @media (max-width: 768px) {

@@ -22,7 +22,7 @@
  */
 
 import { EventBus } from "../core/bus.js";
-import { searchUniverse, getSymbol } from "../data/universe.js";
+import { searchUniverse, getSymbol, listUniverse } from "../data/universe.js";
 import { ensureRecent } from "../data/gapFiller.js";
 import { getStored as idbGetStored } from "../data/gapFiller.js";
 import { withStore, put, req2promise } from "../data/idb.js";
@@ -55,9 +55,24 @@ export async function runScan({
   if (_inflight.has(key)) return _inflight.get(key);
   const promise = (async () => {
     const t0 = Date.now();
-    const universe = (assetClass === "all")
-      ? searchUniverse("", "all", limit * 4)
-      : searchUniverse("", assetClass, limit * 2);
+    let universe;
+    if (assetClass === "crypto") {
+      // Only USDT-M perpetual futures — what an active trader actually
+      // wants.  Filters out spot, BTC-quoted altcoins, coin-margined
+      // contracts, and stable-stable pairs.
+      universe = listUniverse().filter((e) =>
+        e.type === "crypto" &&
+        e.category === "futures-linear" &&
+        e.quote === "USDT"
+      );
+      // Rank by alphabetical so the top-N is stable; popular pairs
+      // (BTC/ETH/SOL) naturally float to the top of an alpha sort.
+      universe.sort((a, b) => a.id.localeCompare(b.id));
+    } else if (assetClass === "all") {
+      universe = searchUniverse("", "all", limit * 4);
+    } else {
+      universe = searchUniverse("", assetClass, limit * 2);
+    }
     const symbols = universe.slice(0, limit);
 
     EventBus.emit("scan:start", { assetClass, tf, total: symbols.length });

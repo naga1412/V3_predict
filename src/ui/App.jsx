@@ -4081,68 +4081,68 @@ function ScannerPane({ tf, setSymbol, setTab }) {
         </div>
       )}
 
-      <table className="scan-table">
-        <thead>
-          <tr>
-            <th>Symbol</th>
-            <th>Type</th>
-            <th>Last</th>
-            <th>Direction</th>
-            <th>Bias</th>
-            <th>P(up)</th>
-            <th>Brain</th>
-            <th>Conf</th>
-            <th>ATR</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody>
-          {top.length === 0 && !busy && (
-            <tr><td colSpan={10} style={{ color: "var(--fg-dim)", padding: "20px 0", textAlign: "center" }}>
-              No results yet — click <b>Rescan</b>
-            </td></tr>
-          )}
-          {top.map((r) => {
-            const tone = directionTone(r.direction);
-            const brainOn = r.brain?.used === "meta-nn";
-            return (
-              <tr key={`${r.symbol}-${r.tf}`}>
-                <td>
-                  <b style={{ color: "var(--fg)" }}>{r.symbol}</b>
-                  {r.name && <div style={{ fontSize: 10, color: "var(--fg-dim)" }}>{r.name}</div>}
-                </td>
-                <td><span className="chip-toggle" style={{ fontSize: 9, padding: "1px 6px" }}>{r.assetType || "—"}</span></td>
-                <td>{fmt(r.last)}</td>
-                <td className={tone}>{(r.direction || "—").toUpperCase()}</td>
-                <td className={r.bias >= 0 ? "bull" : "bear"}>{fmtSigned(r.bias, 2)}</td>
-                <td>{Number.isFinite(r.prob) ? fmtPct(r.prob) : "—"}</td>
-                <td>
-                  {brainOn ? (
-                    <span className="chip-toggle on" style={{ fontSize: 9, padding: "1px 6px" }}>🧠 NN</span>
-                  ) : (
-                    <span style={{ color: "var(--fg-dim)", fontSize: 10 }}>orch</span>
-                  )}
-                </td>
-                <td>{Number.isFinite(r.confidence) ? fmtPct(r.confidence) : "—"}</td>
-                <td>{fmt(r.atr)}</td>
-                <td>
-                  <button type="button"
-                    className="chip-toggle"
-                    style={{ fontSize: 10, padding: "2px 8px" }}
-                    onClick={() => handleWatch(r.symbol)}>
-                    open
-                  </button>
-                </td>
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
+      {top.length === 0 && !busy && (
+        <div style={{ color: "var(--fg-dim)", padding: "30px 0", textAlign: "center" }}>
+          No results yet — click <b>Rescan</b>
+        </div>
+      )}
 
-      <div style={{ marginTop: 8, fontSize: 10, color: "var(--fg-dim)" }}>
+      <div className="scan-grid">
+        {top.map((r) => <ScanCard key={`${r.symbol}-${r.tf}`} r={r} onOpen={() => handleWatch(r.symbol)} />)}
+      </div>
+
+      <div style={{ marginTop: 12, fontSize: 10, color: "var(--fg-dim)" }}>
         Ranked by |bias| × confidence × probability · 🧠 NN means the meta-brain decided · auto-rescans every 5 min
       </div>
     </section>
+  );
+}
+
+/* ── M-SCAN · ScanCard — TradingView-style ranked tile ── */
+function ScanCard({ r, onOpen }) {
+  const tone   = directionTone(r.direction);
+  const brainOn = r.brain?.used === "meta-nn";
+  // Bias visualised as a center-anchored bar in [-1, +1].
+  const biasN  = Math.max(-1, Math.min(1, r.bias || 0));
+  const barPct = Math.abs(biasN) * 50;
+  const barLeft = biasN < 0 ? `${50 - barPct}%` : "50%";
+  // Friendly display id — strip the ":PERP" suffix, show "BTC/USDT".
+  const displayId = (r.symbol || "").replace(/:PERP$|:CM$/, "");
+  const pretty = r.name ? r.name.replace(/\s+\(perp\)$/, "") : displayId;
+  const dirText = (r.direction || "neutral").toUpperCase();
+  const accent  = r.direction === "long" ? "var(--bull)"
+                : r.direction === "short" ? "var(--bear)"
+                : "var(--fg-dim)";
+  return (
+    <button type="button" className="scan-card" onClick={onOpen} style={{ borderTopColor: accent }}>
+      <div className="scan-card-head">
+        <div>
+          <div className="scan-card-sym">{displayId}</div>
+          <div className="scan-card-name">{pretty}</div>
+        </div>
+        <div className={"scan-card-dir " + tone} style={{ color: accent }}>{dirText}</div>
+      </div>
+
+      <div className="scan-card-price">
+        <span>{fmt(r.last)}</span>
+        {brainOn && <span className="chip-toggle on" style={{ fontSize: 9, padding: "1px 5px" }}>🧠 NN</span>}
+      </div>
+
+      <div className="scan-card-bias-track">
+        <div className="scan-card-bias-fill" style={{
+          left: barLeft, width: `${barPct}%`,
+          background: biasN >= 0 ? "var(--bull)" : "var(--bear)",
+        }} />
+        <div className="scan-card-bias-zero" />
+      </div>
+
+      <div className="scan-card-stats">
+        <div><span className="k">P(up)</span><span className="v">{Number.isFinite(r.prob) ? fmtPct(r.prob) : "—"}</span></div>
+        <div><span className="k">Conf</span><span className="v">{Number.isFinite(r.confidence) ? fmtPct(r.confidence) : "—"}</span></div>
+        <div><span className="k">Bias</span><span className={"v " + (biasN >= 0 ? "bull" : "bear")}>{fmtSigned(biasN, 2)}</span></div>
+        <div><span className="k">ATR</span><span className="v">{fmt(r.atr)}</span></div>
+      </div>
+    </button>
   );
 }
 
