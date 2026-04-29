@@ -1,0 +1,205 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate" />
+<title>MNP · M-LEARN-4 — Meta-Brain</title>
+<style>
+  body { background:#131722; color:#d1d4dc; font:13px/1.5 monospace; padding:20px; }
+  .pass { color:#26a69a; } .fail { color:#ef5350; }
+  .group { margin-top: 12px; font-weight:bold; color:#2962ff; }
+  h1 { color:#fff; font-size:18px; }
+  #out { white-space: pre-wrap; }
+  .summary { margin-top: 16px; padding: 8px; border:1px solid #2a2e39; }
+</style>
+</head>
+<body>
+<h1>MNP — M-LEARN-4 · Meta-Brain</h1>
+<script>
+  if (location.protocol === "file:") { document.body.innerHTML = `<div style="color:#ef5350">Run on http://localhost</div>`; throw new Error("file://"); }
+</script>
+<div id="out">running…</div>
+<script type="module">
+const out = document.getElementById("out");
+function showErr(prefix, info) {
+  const safe = (info?.message || info?.reason || JSON.stringify(info)) || "(empty)";
+  out.innerHTML += `<span class="fail">✗ ${prefix}: ${safe}</span>\n`;
+}
+window.addEventListener("error", (e) => showErr("error", { message: e.message, file: e.filename, line: e.lineno }));
+window.addEventListener("unhandledrejection", (e) => showErr("rejection", e.reason?.message || String(e.reason)));
+
+const V = "ml4-" + Date.now();
+const U = (p) => new URL(`${p}?v=${V}`, location.href).href;
+
+for (const f of [
+  "../src/data/schema.js","../src/data/idb.js",
+  "../src/learn/metaBrain.js",
+  "../src/ml/nn.js","../src/ml/modelStore.js",
+  "../src/core/bus.js","../src/core/resilience.js",
+]) try { await fetch(f, { cache: "reload" }); } catch {}
+
+await new Promise((res) => { const r = indexedDB.deleteDatabase("mnp_v3"); r.onsuccess = r.onerror = r.onblocked = () => res(); });
+const IDB = await import(U("../src/data/idb.js"));
+await IDB.openDB();
+
+const MB = await import(U("../src/learn/metaBrain.js"));
+
+let n = 0, p = 0;
+const log = (s, ok, err) => { out.innerHTML += `<span class="${ok?'pass':'fail'}">${ok?'✓':'✗'} ${s}${err ? ' — ' + err : ''}</span>\n`; n++; if (ok) p++; };
+const group = (s) => { out.innerHTML += `\n<span class="group">[${s}]</span>\n`; };
+const close = (a, b, eps=1e-6) => Math.abs(a - b) <= eps;
+
+/* ════════════ aggregate · 80-dim feature builder ════════════ */
+group("aggregate · shape + ranges");
+{
+  const v = MB.aggregate({});
+  log("returns Float32Array",     v instanceof Float32Array);
+  log("length === 80",             v.length === 80);
+  log("all entries finite",        Array.from(v).every(Number.isFinite));
+
+  // Module signals
+  const v2 = MB.aggregate({
+    orch: { signals: [
+      { signal: 0.7, confidence: 0.8 },
+      { signal: -0.3, confidence: 0.5 },
+    ]},
+  });
+  log("module signal[0] in slot 0",  close(v2[0], 0.7));
+  log("module conf[0] in slot 1",     close(v2[1], 0.8));
+  log("module signal[1] in slot 2",   close(v2[2], -0.3));
+  log("clamps signal to [-1,+1]",
+      MB.aggregate({ orch: { signals: [{ signal: 5, confidence: 2 }] } })[0] === 1);
+
+  // Regime one-hot
+  const vR = MB.aggregate({ regime: { trend: "up", strength: "strong", volatility: "high" } });
+  log("regime trend=up   → slot 37 = 1", vR[37] === 1);
+  log("regime strong     → slot 40 = 1", vR[40] === 1);
+  log("regime volHigh    → slot 43 = 1", vR[43] === 1);
+
+  // Wyckoff one-hot
+  const vW = MB.aggregate({ wyckoff: { phase: "markdown" } });
+  log("wyckoff markdown  → slot 45 = 1", vW[45] === 1);
+
+  // Macro
+  const vM = MB.aggregate({ macro: { score: 0.5, label: "risk-on" } });
+  log("macro score in slot 48",  close(vM[48], 0.5));
+  log("macro label in slot 49",  vM[49] === 1);
+
+  // Stability
+  const vS = MB.aggregate({ stability: { score: 0.7, biasSigma: 0.2, flipRate: 0.1 } });
+  log("stability score in slot 54",   close(vS[54], 0.7));
+  log("stability flipRate in slot 56", close(vS[56], 0.1));
+
+  // anti-pattern hitRate default 0.5
+  const vAP = MB.aggregate({});
+  log("default antiPattern hitRate = 0.5", close(vAP[62], 0.5));
+}
+
+/* ════════════ pairForTraining + labelForTraining ════════════ */
+group("training-pool pairing");
+{
+  await MB._resetForTests();
+  const id = await MB.pairForTraining(123, {
+    symbol: "BTCUSDT", tf: "1h",
+    orch: { signals: [{ signal: 0.5, confidence: 0.7 }] },
+    regime: { trend: "up" },
+  });
+  log("pairForTraining returns id",   typeof id === "string" && id.startsWith("mb-"));
+
+  const ready1 = await MB.readyCount();
+  log("readyCount=0 before label",     ready1 === 0);
+
+  const ok = await MB.labelForTraining(123, "up");
+  log("labelForTraining returns true",  ok === true);
+  const ready2 = await MB.readyCount();
+  log("readyCount=1 after label",       ready2 === 1);
+
+  // Re-labeling does nothing (pending already false)
+  const ok2 = await MB.labelForTraining(123, "down");
+  log("re-label returns false",          ok2 === false);
+
+  // Unknown id → false
+  const okMiss = await MB.labelForTraining(999, "up");
+  log("unknown id → false",              okMiss === false);
+}
+
+/* ════════════ decide · model fallback ════════════ */
+group("decide · with no model → orch fallback");
+{
+  await MB._resetForTests();
+  const r = await MB.decide([0,0,0], {
+    orchFallback: { rawScore: 0.4, probability: 0.7, direction: "long" }
+  });
+  log("used === 'orch-fallback'",      r.used === "orch-fallback");
+  log("direction passed through",      r.direction === "long");
+  log("rawScore passed through",       close(r.rawScore, 0.4));
+
+  // No orch → direction=neutral, used="none"
+  const empty = await MB.decide([0,0,0]);
+  log("no orch + no model → neutral",  empty.direction === "neutral" && empty.used === "none");
+
+  // Empty input → falls back too
+  const noInput = await MB.decide([], { orchFallback: { rawScore: 0.5, direction: "long" } });
+  log("empty input → fallback",         noInput.used === "none");
+}
+
+/* ════════════ maybeTrain · synthetic linearly-separable data ════════════ */
+group("maybeTrain · trains and persists");
+{
+  await MB._resetForTests();
+  // Build 250 samples where input[0] strongly predicts the label
+  const D = 80;   // matches aggregate vector size
+  for (let i = 0; i < 250; i++) {
+    const base = i % 2 === 0 ? 0.8 : -0.8;   // alternating sign
+    const ctx = {
+      symbol: "X", tf: "1h",
+      orch: { signals: [{ signal: base + (Math.random()-0.5)*0.1, confidence: 0.8 }] },
+    };
+    await MB.pairForTraining(i, ctx);
+    await MB.labelForTraining(i, base > 0 ? "up" : "down");
+  }
+  log("ready rows = 250",  (await MB.readyCount()) === 250);
+
+  // Below default threshold (200)? Not — 250 ≥ 200 so should train without force.
+  const r = await MB.maybeTrain({});
+  log("trained === true",         r.trained === true);
+  log("rows recorded",             r.rows === 250);
+  log("accuracy is finite + > 0",  Number.isFinite(r.accuracy) && r.accuracy > 0);
+  log("version is unique",          typeof r.version === "string" && r.version.startsWith("mb-"));
+
+  // Status reflects the new model
+  const st = await MB.status();
+  log("status.hasModel === true",    st.hasModel === true);
+  log("status.accuracy persisted",   Number.isFinite(st.accuracy));
+  log("status.version persisted",    st.version === r.version);
+  log("status.ready unchanged",      st.ready === 250);
+
+  // After training, decide() should return used=meta-nn
+  const dec = await MB.decide(MB.aggregate({ orch: { signals: [{ signal: 0.8, confidence: 0.8 }] } }));
+  log("decide used === 'meta-nn'",    dec.used === "meta-nn");
+  log("decide returns finite rawScore", Number.isFinite(dec.rawScore));
+}
+
+/* ════════════ insufficient rows → no train ════════════ */
+group("maybeTrain · insufficient rows");
+{
+  await MB._resetForTests();
+  for (let i = 0; i < 5; i++) {
+    await MB.pairForTraining(i, { orch: { signals: [{ signal: 0.5, confidence: 0.5 }] } });
+    await MB.labelForTraining(i, "up");
+  }
+  const r = await MB.maybeTrain({});
+  log("trained === false (5 rows < 200 threshold)", r.trained === false);
+  log("returns row count",                            r.rows === 5);
+
+  // Force === true should attempt training even with few rows
+  const rF = await MB.maybeTrain({ force: true });
+  log("force-train succeeds",                          rF.trained === true);
+}
+
+/* ════════════ Summary ════════════ */
+out.innerHTML += `\n<div class="summary ${p===n?'pass':'fail'}">Ran ${n} tests — ${p} passed, ${n-p} failed.</div>`;
+document.title = `MNP m-learn-4 ${p}/${n}`;
+</script>
+</body>
+</html>

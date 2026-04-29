@@ -13,7 +13,7 @@
  */
 
 export const DB_NAME    = "mnp";
-export const DB_VERSION = 7;
+export const DB_VERSION = 8;
 
 export const STORES = {
   // Time-series (OHLCV)
@@ -149,6 +149,20 @@ export const STORES = {
     ],
   },
 
+  // M-LEARN-4 (DB v8): meta-brain training pool — paired (input, label)
+  // rows for the meta-NN.  Keyed by string id so the verdict-side
+  // labeler can look up by `mb-${predictionId}`.
+  metaBrainPool: {
+    keyPath: "id",
+    autoIncrement: false,
+    indexes: [
+      { name: "by_predictionId", keyPath: "predictionId" },
+      { name: "by_pending",      keyPath: "pending" },
+      { name: "by_t",            keyPath: "t" },
+      { name: "by_symbol_tf",    keyPath: ["symbol", "tf"] },
+    ],
+  },
+
   // M-LEARN-2 (DB v7): anti-pattern clusters — feature-space regions
   // where the model has reliably been wrong.  Consumed by the
   // meta-veto layer (M-LEARN-3) on every prediction.
@@ -262,6 +276,18 @@ export const MIGRATIONS = {
     if (db.objectStoreNames.contains("antiPatterns")) return;
     const def = STORES.antiPatterns;
     const store = db.createObjectStore("antiPatterns", {
+      keyPath: def.keyPath,
+      autoIncrement: def.autoIncrement || false,
+    });
+    (def.indexes || []).forEach(({ name: iname, keyPath, unique = false, multiEntry = false }) => {
+      store.createIndex(iname, keyPath, { unique, multiEntry });
+    });
+  },
+  // M-LEARN-4: added `metaBrainPool` store.
+  8: (db /*: IDBDatabase */) => {
+    if (db.objectStoreNames.contains("metaBrainPool")) return;
+    const def = STORES.metaBrainPool;
+    const store = db.createObjectStore("metaBrainPool", {
       keyPath: def.keyPath,
       autoIncrement: def.autoIncrement || false,
     });

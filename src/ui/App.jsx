@@ -388,33 +388,76 @@ function derivePatternBias(ta) {
   return Math.max(-1, Math.min(1, v));
 }
 
-function useGhostCandles(ta, orch, candles, { nBars = 25, alpha = 0.1, symbol, tf, patternBias = 0 } = {}) {
+function useGhostCandles(ta, orch, candles, { nBars = 25, alpha = 0.1, symbol, tf, patternBias = 0,
+                                                regime, wyckoff, macro, deriv, stability, adaptive } = {}) {
   const [conformal, setConformal] = useState(null);
+
+  // M-LEARN-4 — Meta-Brain decision.  When a trained meta-NN exists in
+  // IDB this OVERRIDES the orchestrator's direction/probability before
+  // the rest of the pipeline.  Without a model this is a passthrough
+  // (used: "orch-fallback") so the app still works on cold install.
+  const [brainDecision, setBrainDecision] = useState(null);
+  const [brainOrch,     setBrainOrch]     = useState(orch);
+  useEffect(() => {
+    let cancelled = false;
+    const MB = window.__MNP__?.MetaBrain;
+    if (!MB?.decide || !MB?.aggregate || !orch) { setBrainOrch(orch); setBrainDecision(null); return; }
+    (async () => {
+      try {
+        const ctx = { symbol, tf, t: Date.now(), orch, ta, ghost: null,
+                       regime: regime || ta?.regime, wyckoff: wyckoff || ta?.wyckoff,
+                       macro, deriv, stability, adaptive };
+        const input = MB.aggregate(ctx);
+        const decision = await MB.decide(input, { orchFallback: orch });
+        if (cancelled) return;
+        setBrainDecision(decision);
+        if (decision.used === "meta-nn") {
+          // Meta-NN wins — override orch's signal/prob/direction so
+          // every downstream consumer (veto, predictGhostCandles)
+          // sees the brain's call.
+          setBrainOrch({
+            ...orch,
+            rawScore:    decision.rawScore,
+            probability: decision.probability,
+            direction:   decision.direction,
+            confidence:  decision.confidence,
+            metaBrain:   { used: "meta-nn", version: decision.modelVersion },
+          });
+        } else {
+          setBrainOrch(orch);
+        }
+      } catch { setBrainOrch(orch); setBrainDecision(null); }
+    })();
+    return () => { cancelled = true; };
+  }, [orch?.rawScore, orch?.direction, ta?.close?.length, regime, wyckoff, macro, deriv, stability, adaptive]);
+
   // M-LEARN-3 — meta-veto: re-check the live feature vector against
   // the anti-pattern store on every bar.  When a match lands, this
   // returns an "adjusted" orch (signal softened or zeroed) which is
-  // what then feeds predictGhostCandles below.
-  const [vetoedOrch, setVetoedOrch] = useState(orch);
+  // what then feeds predictGhostCandles below.  Veto runs AFTER the
+  // meta-brain so the veto can still soften / block a meta-NN call.
+  const [vetoedOrch, setVetoedOrch] = useState(brainOrch);
   const [vetoInfo,   setVetoInfo]   = useState(null);
   useEffect(() => {
     let cancelled = false;
     const MV = window.__MNP__?.MetaVeto;
-    if (!MV?.applyVetoToOrch || !orch) { setVetoedOrch(orch); setVetoInfo(null); return; }
-    const fv = ta?.lastFeatureVec || orch?.featureVec || null;
-    if (!Array.isArray(fv) || fv.length === 0) { setVetoedOrch(orch); setVetoInfo(null); return; }
+    const baseOrch = brainOrch || orch;
+    if (!MV?.applyVetoToOrch || !baseOrch) { setVetoedOrch(baseOrch); setVetoInfo(null); return; }
+    const fv = ta?.lastFeatureVec || baseOrch?.featureVec || null;
+    if (!Array.isArray(fv) || fv.length === 0) { setVetoedOrch(baseOrch); setVetoInfo(null); return; }
     (async () => {
       try {
-        const verdict = await MV.applyVetoToOrch(orch, fv, { regime: ta?.regime?.label });
+        const verdict = await MV.applyVetoToOrch(baseOrch, fv, { regime: ta?.regime?.label });
         if (cancelled) return;
         setVetoInfo(verdict);
-        setVetoedOrch(verdict.vetoed ? MV.applyToOrch(orch, verdict) : orch);
+        setVetoedOrch(verdict.vetoed ? MV.applyToOrch(baseOrch, verdict) : baseOrch);
         if (verdict.vetoed) {
           try { window.__MNP__?.EventBus?.emit?.("meta:veto", verdict); } catch {}
         }
-      } catch { setVetoedOrch(orch); setVetoInfo(null); }
+      } catch { setVetoedOrch(baseOrch); setVetoInfo(null); }
     })();
     return () => { cancelled = true; };
-  }, [orch?.rawScore, orch?.direction, ta?.lastFeatureVec, ta?.regime?.label]);
+  }, [brainOrch?.rawScore, brainOrch?.direction, ta?.lastFeatureVec, ta?.regime?.label]);
 
   // Try to hydrate a previously-calibrated regressor from IDB (fire-and-forget).
   useEffect(() => {
@@ -447,7 +490,7 @@ function useGhostCandles(ta, orch, candles, { nBars = 25, alpha = 0.1, symbol, t
         candles,
         patternBias,
       });
-      // Surface the veto on the forecast so the UI can render a chip.
+      // Surface the veto + brain on the forecast so the UI can render chips.
       if (f && vetoInfo?.vetoed) {
         f.metaVeto = {
           kind:        vetoInfo.vetoed,
@@ -456,6 +499,9 @@ function useGhostCandles(ta, orch, candles, { nBars = 25, alpha = 0.1, symbol, t
           originalScore: vetoInfo.originalScore,
           originalProb:  vetoInfo.originalProb,
         };
+      }
+      if (f && brainDecision?.used === "meta-nn") {
+        f.metaBrain = { used: "meta-nn", version: brainDecision.modelVersion };
       }
       return f;
     } catch (err) {
@@ -1972,6 +2018,68 @@ function AdaptiveWeightsCard({ adaptive, tick, orch }) {
 /* ── M-LEARN-1 · MistakeLedgerCard ──
    Shows the running mistake count + last 5 wrong calls for the
    current (symbol, tf) so you can see the brain working. */
+/* ── M-LEARN-4 · BrainCard — meta-NN status + manual retrain ── */
+function BrainCard() {
+  const [st, setSt]   = useState(null);
+  const [tick, setTick] = useState(0);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    const off = window.__MNP__?.EventBus?.on?.("metabrain:trained", () => setTick((n) => n + 1));
+    return () => { try { off?.(); } catch {} };
+  }, []);
+  useEffect(() => {
+    let stopped = false;
+    const MB = window.__MNP__?.MetaBrain;
+    if (!MB?.status) return;
+    MB.status().then((s) => { if (!stopped) setSt(s); }).catch(() => {});
+    return () => { stopped = true; };
+  }, [tick]);
+  const onRetrain = async () => {
+    const MB = window.__MNP__?.MetaBrain;
+    if (!MB?.maybeTrain) return;
+    setBusy(true);
+    try { const r = await MB.maybeTrain({ force: true }); console.log("[brain] retrain", r); }
+    finally { setBusy(false); setTick((n) => n + 1); }
+  };
+  if (!st) return (
+    <div className="card"><h3>Meta-Brain <span className="badge">…</span></h3></div>
+  );
+  const tone = st.hasModel ? "bull" : "warn";
+  const acc = Number.isFinite(st.accuracy) ? `${(st.accuracy * 100).toFixed(0)}%` : "—";
+  return (
+    <div className="card">
+      <h3>
+        Meta-Brain
+        <span className={"badge " + tone}>{st.hasModel ? "ACTIVE" : "WARMUP"}</span>
+      </h3>
+      {st.hasModel ? (
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 6 }}>
+          <div className="dl-cell"><div className="k">Accuracy</div><div className="v" style={{ color: st.accuracy >= 0.55 ? "var(--bull)" : "var(--fg)" }}>{acc}</div></div>
+          <div className="dl-cell"><div className="k">Trained on</div><div className="v">{st.rowsTrained || 0} rows</div></div>
+          <div className="dl-cell"><div className="k">Version</div><div className="v" style={{ fontFamily: "var(--font-mono)", fontSize: 10 }}>{st.version || "—"}</div></div>
+          <div className="dl-cell"><div className="k">Trained</div><div className="v">{st.trainedAt ? timeAgo(st.trainedAt) : "—"}</div></div>
+        </div>
+      ) : (
+        <div style={{ color: "var(--fg-dim)", fontSize: 12 }}>
+          Need ≥200 labeled predictions to train.  Currently:
+        </div>
+      )}
+      <div style={{ display: "flex", gap: 6, alignItems: "center", marginTop: 8 }}>
+        <span style={{ fontSize: 11, color: "var(--fg-dim)" }}>Pool</span>
+        <span className="chip-toggle on" style={{ fontSize: 10, padding: "1px 6px" }}>{st.ready || 0} ready</span>
+        <span className="chip-toggle"     style={{ fontSize: 10, padding: "1px 6px" }}>{st.pending || 0} pending</span>
+        <button type="button"
+          className="chip-toggle"
+          style={{ fontSize: 10, padding: "2px 8px", marginLeft: "auto" }}
+          disabled={busy || (st.ready || 0) < 50}
+          onClick={onRetrain}>
+          {busy ? "training…" : "retrain now"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 /* ── M-LEARN-2/3 · AntiPatternCard ──
    Lists the active anti-patterns, sorted by miss-rate (worst first).
    Refreshes whenever `antipatterns:rebuilt` fires. */
@@ -3270,6 +3378,7 @@ function SignalSidebar({ orch, expected, ghost, ta, candles, regime, symbol, gho
       <AdaptiveWeightsCard adaptive={adaptive} tick={adaptiveTick} orch={orch} />
       <MistakeLedgerCard symbol={symbol} tf={tf} />
       <AntiPatternCard />
+      <BrainCard />
       <DLSupervisorCard orch={orch} expected={expected} ta={ta} />
       {symbol && <LongShortRatioCard symbol={symbol} />}
       {symbol && <HTFBiasGridCard symbol={symbol} />}
@@ -3405,6 +3514,15 @@ function GhostCandleCard({ ghost, ta, nBars, setNBars }) {
               (bias {fmtSigned(ghost.patternBias, 2)})
             </span>
           )}
+        </div>
+      )}
+      {ghost.metaBrain?.used === "meta-nn" && (
+        <div style={{ marginTop: 8, padding: 6, background: "rgba(38,166,154,.10)", border: "1px solid rgba(38,166,154,.35)", borderRadius: 4, fontSize: 11 }}>
+          🧠 <b style={{ color: "var(--bull)" }}>META-NN</b>
+          <span style={{ color: "var(--fg-dim)", marginLeft: 6, fontFamily: "var(--font-mono)", fontSize: 10 }}>
+            {ghost.metaBrain.version || "v?"}
+          </span>
+          <span style={{ color: "var(--fg-dim)", marginLeft: 6 }}>(orchestrator → input only)</span>
         </div>
       )}
       {ghost.metaVeto && (
@@ -4220,6 +4338,11 @@ function App() {
   const ghost = useGhostCandles(ta, orch, ghostAnchorCandles, {
     nBars: ghostNBars, alpha: 0.1, symbol, tf,
     patternBias: recentPatternBias,
+    regime:  ta?.regime,
+    wyckoff: ta?.wyckoff,
+    // stability + adaptive are computed AFTER this hook; the
+    // meta-brain aggregator tolerates undefined and will simply
+    // zero those dimensions on the input vector.
   });
   useGhostResolver(symbol, tf, feed.candles);
 
@@ -4261,7 +4384,23 @@ function App() {
       payload: { dir, prob: orch.probability, refPrice, rawScore: orch.rawScore, direction: orch.direction },
       regime:  ta.regime?.label || null,
       version: window.__MNP__?.version || "unknown",
-    }, { refCandle: lastBar }).catch(() => { /* swallow */ });
+    }, { refCandle: lastBar }).then((predId) => {
+      // M-LEARN-4 — pair predict-time aggregate vector with this prediction
+      const MB = window.__MNP__?.MetaBrain;
+      if (!MB?.pairForTraining || predId == null) return;
+      try {
+        MB.pairForTraining(predId, {
+          symbol, tf, t: lastBar.t,
+          orch, ta, ghost,
+          regime:  ta?.regime,
+          wyckoff: ta?.wyckoff,
+          macro:   null,
+          deriv:   null,
+          stability,
+          adaptive: adaptiveRef.current,
+        });
+      } catch { /* swallow */ }
+    }).catch(() => { /* swallow */ });
   }, [orch?.rawScore, orch?.direction, feed.candles?.length]);
 
   // Tick the monitor on every closed candle so it sweeps due predictions.
@@ -4304,6 +4443,22 @@ function App() {
     if (!A?.recordVerdict || !adaptiveRef.current) return;
     A.recordVerdict(adaptiveRef.current, orch, e?.verdict || {});
     setAdaptiveTick((n) => n + 1);
+  });
+
+  // M-LEARN-4 — label the paired training-pool row when a verdict lands.
+  // The label drives offline retraining; pairing was done at submit-time.
+  useBusEvent("validation:verdict", async (e) => {
+    const MB = window.__MNP__?.MetaBrain;
+    if (!MB?.labelForTraining) return;
+    const predId  = e?.prediction?.id;
+    const realDir = e?.verdict?.realizedDir
+                 || (e?.verdict?.hit === true && e?.prediction?.payload?.dir)
+                 || (e?.verdict?.hit === false && e?.prediction?.payload?.dir
+                     ? (e.prediction.payload.dir === "up" ? "down"
+                       : e.prediction.payload.dir === "down" ? "up" : "flat")
+                     : null);
+    if (predId == null || !realDir) return;
+    try { await MB.labelForTraining(predId, realDir); } catch { /* swallow */ }
   });
 
   // M-LEARN-1 — auto-record any miss into the Mistake Ledger with the

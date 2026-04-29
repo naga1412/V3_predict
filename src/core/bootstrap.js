@@ -99,6 +99,8 @@ import * as MistakeLedger from "../learn/mistakeLedger.js";
 // M-LEARN-2/3 — Anti-pattern discovery + meta-veto
 import * as AntiPatterns  from "../learn/antiPatterns.js";
 import * as MetaVeto      from "../learn/metaVeto.js";
+// M-LEARN-4 — Meta-Brain (decision layer)
+import * as MetaBrain     from "../learn/metaBrain.js";
 // Phase 10 — Auto-validation + drift monitor
 import * as PredictionStore from "../validation/predictionStore.js";
 import * as Validator from "../validation/validator.js";
@@ -208,13 +210,15 @@ export async function boot() {
     // M-LEARN-2/3
     AntiPatterns,
     MetaVeto,
+    // M-LEARN-4
+    MetaBrain,
     // Phase 10
     PredictionStore,
     Validator,
     Drift,
     ValidationMonitor,
     createDefaultMonitor,
-    version: "3.0.0-mlearn3",
+    version: "3.0.0-mlearn4",
   };
 
   // Degrade decisions ------------------------------------------------------
@@ -291,6 +295,35 @@ export async function boot() {
 
   log("bootstrap complete", sum);
   EventBus.emit("boot:complete", { caps, summary: sum });
+
+  // M-LEARN-4 — Auto-trainer for the Meta-Brain.  Kicks an offline
+  // training pass whenever ≥200 newly-labeled rows accumulate OR
+  // every 4 h, whichever comes first.  Uses Phase-8 MLP machinery on
+  // main thread (synchronous; ~80 KB params, ~30 epochs over 200-rows
+  // ≤ 200 ms on a modern laptop).  Worker move is M-LEARN-5.
+  let _lastTrainT = 0;
+  let _labelsSinceLastTrain = 0;
+  const _TRAIN_MIN_NEW  = 200;
+  const _TRAIN_MIN_INT  = 4 * 60 * 60_000;
+  const _runMetaTrain = async () => {
+    try {
+      const res = await MetaBrain.maybeTrain({});
+      if (res?.trained) {
+        _lastTrainT = Date.now();
+        _labelsSinceLastTrain = 0;
+        log("metaBrain trained", `rows=${res.rows} acc=${(res.accuracy*100).toFixed(1)}%  v=${res.version}`);
+      }
+    } catch (err) { log("metaBrain train failed", err?.message || err); }
+  };
+  EventBus.on("validation:verdict", () => {
+    _labelsSinceLastTrain++;
+    const elapsed = Date.now() - _lastTrainT;
+    if (_labelsSinceLastTrain >= _TRAIN_MIN_NEW || elapsed >= _TRAIN_MIN_INT) {
+      _runMetaTrain();
+    }
+  });
+  // Initial pass after 12s in case there are pre-existing labeled rows
+  setTimeout(() => _runMetaTrain(), 12_000);
 
   // M-LEARN-2 — Schedule anti-pattern discovery whenever the ledger
   // grows past a threshold OR an hour has passed since the last run.
