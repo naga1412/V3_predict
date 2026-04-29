@@ -105,6 +105,8 @@ import * as MetaBrain     from "../learn/metaBrain.js";
 import * as ChampionChallenger from "../learn/championChallenger.js";
 // M-SCAN — multi-symbol background scanner
 import * as Scan          from "../scan/scanManager.js";
+// M7 — Walk-forward backtest harness
+import * as Backtest      from "../backtest/backtestEngine.js";
 // Phase 10 — Auto-validation + drift monitor
 import * as PredictionStore from "../validation/predictionStore.js";
 import * as Validator from "../validation/validator.js";
@@ -220,13 +222,15 @@ export async function boot() {
     ChampionChallenger,
     // M-SCAN
     Scan,
+    // M7 — backtest
+    Backtest,
     // Phase 10
     PredictionStore,
     Validator,
     Drift,
     ValidationMonitor,
     createDefaultMonitor,
-    version: "3.0.0-mlearn5",
+    version: "3.0.0-m7",
   };
 
   // Degrade decisions ------------------------------------------------------

@@ -8,7 +8,7 @@
  * Scenarios covered: cold-load perf, offline shell (#39), SW update flow (#62)
  */
 
-const SW_VERSION = "mnp-v3-mlearn5-1";
+const SW_VERSION = "mnp-v3-m7-1";
 const SHELL_CACHE = `${SW_VERSION}-shell`;
 const CDN_CACHE   = `${SW_VERSION}-cdn`;
 
@@ -114,6 +114,8 @@ const SHELL = [
   "./src/learn/championChallenger.js",
   // m-scan — multi-symbol background scanner
   "./src/scan/scanManager.js",
+  // m7 — walk-forward backtest harness
+  "./src/backtest/backtestEngine.js",
   // phase 7 — 12 modules + orchestrator + calibration
   "./src/modules/baseModule.js",
   "./src/modules/trendFollow.js",

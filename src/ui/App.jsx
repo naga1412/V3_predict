@@ -943,6 +943,7 @@ function TopBar({ tab, setTab, symbol, setSymbol, tf, setTf, net, skew, status, 
       <nav className="tabnav" aria-label="primary">
         <button className={"tab-btn" + (tab === "chart" ? " active" : "")} onClick={() => setTab("chart")}>Chart</button>
         <button className={"tab-btn" + (tab === "scanner" ? " active" : "")} onClick={() => setTab("scanner")}>Scanner</button>
+        <button className={"tab-btn" + (tab === "backtest" ? " active" : "")} onClick={() => setTab("backtest")}>Backtest</button>
         <button className={"tab-btn" + (tab === "news" ? " active" : "")} onClick={() => setTab("news")}>News</button>
         <button className={"tab-btn" + (tab === "chat" ? " active" : "")} onClick={() => setTab("chat")}>AI Chat</button>
         <button className={"tab-btn" + (tab === "system" ? " active" : "")} onClick={() => setTab("system")}>
@@ -4146,6 +4147,166 @@ function ScannerPane({ tf, setSymbol, setTab }) {
 }
 
 /* ╔══════════════════════════════════════════════════════════════════╗
+   ║  M7 · Backtest tab                                               ║
+   ╚══════════════════════════════════════════════════════════════════╝ */
+
+function BacktestPane({ symbol: initialSym, tf: initialTf }) {
+  const [symbol, setSym]   = useState(initialSym || "BTCUSDT");
+  const [tf, setTf]        = useState(initialTf || "1h");
+  const [horizon, setHor]  = useState(5);
+  const [maxBars, setMax]  = useState(800);
+  const [useBrain, setUB]  = useState(true);
+  const [busy, setBusy]    = useState(false);
+  const [result, setRes]   = useState(null);
+  const [progress, setPr]  = useState({ done: 0, total: 0 });
+  const [err, setErr]      = useState(null);
+
+  useBusEvent("backtest:progress", (e) => setPr(e));
+
+  const run = useCallback(async () => {
+    const M = window.__MNP__;
+    if (!M?.Backtest?.runBacktest) { setErr("backtest engine not ready"); return; }
+    setBusy(true); setErr(null); setRes(null); setPr({ done: 0, total: 0 });
+    try {
+      const r = await M.Backtest.runBacktest({
+        symbol, tf, horizon, useMetaBrain: useBrain, maxBars, sample: 1,
+        onProgress: (p) => setPr(p),
+      });
+      setRes(r);
+    } catch (e) {
+      setErr(e?.message || String(e));
+    } finally { setBusy(false); }
+  }, [symbol, tf, horizon, useBrain, maxBars]);
+
+  const m = result?.metrics;
+  const pct = progress.total > 0 ? Math.round((progress.done / progress.total) * 100) : 0;
+  const byRegime = result && window.__MNP__?.Backtest?.metricsByRegime?.(result.trades);
+
+  return (
+    <section className="card" style={{ overflow: "auto", height: "100%" }}>
+      <h3>Backtest <span className="badge">{symbol} · {tf}</span></h3>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 8, marginBottom: 12 }}>
+        <label style={{ fontSize: 11, color: "var(--fg-dim)" }}>Symbol
+          <input className="input" value={symbol} onChange={(e) => setSym(e.target.value.toUpperCase())} disabled={busy} style={{ width: "100%" }} />
+        </label>
+        <label style={{ fontSize: 11, color: "var(--fg-dim)" }}>Timeframe
+          <select className="input" value={tf} onChange={(e) => setTf(e.target.value)} disabled={busy} style={{ width: "100%" }}>
+            {["1m","5m","15m","1h","4h","1d"].map((t) => <option key={t} value={t}>{t}</option>)}
+          </select>
+        </label>
+        <label style={{ fontSize: 11, color: "var(--fg-dim)" }}>Horizon (bars)
+          <input className="input" type="number" min={1} max={50} value={horizon} onChange={(e) => setHor(Math.max(1, Math.min(50, +e.target.value || 1)))} disabled={busy} style={{ width: "100%" }} />
+        </label>
+        <label style={{ fontSize: 11, color: "var(--fg-dim)" }}>Max bars
+          <input className="input" type="number" min={300} max={5000} value={maxBars} onChange={(e) => setMax(Math.max(300, +e.target.value || 800))} disabled={busy} style={{ width: "100%" }} />
+        </label>
+        <label style={{ fontSize: 11, color: "var(--fg-dim)", display: "flex", alignItems: "center", gap: 6, marginTop: 14 }}>
+          <input type="checkbox" checked={useBrain} onChange={(e) => setUB(e.target.checked)} disabled={busy} />
+          Use Meta-Brain
+        </label>
+      </div>
+
+      <div style={{ display: "flex", gap: 8, marginBottom: 12, alignItems: "center" }}>
+        <button className="btn-primary" onClick={run} disabled={busy} style={{ padding: "6px 16px" }}>
+          {busy ? `running ${pct}%…` : "Run Backtest"}
+        </button>
+        {err && <span style={{ color: "var(--bear)", fontSize: 12 }}>{err}</span>}
+        {result && <span style={{ fontSize: 11, color: "var(--fg-dim)" }}>finished in {result.params.ms}ms · {result.trades.length} trades</span>}
+      </div>
+
+      {busy && (
+        <div style={{ height: 4, background: "var(--bg)", borderRadius: 2, overflow: "hidden", marginBottom: 12 }}>
+          <div style={{ width: `${pct}%`, height: "100%", background: "var(--accent)", transition: "width .15s linear" }} />
+        </div>
+      )}
+
+      {m && (
+        <>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(110px, 1fr))", gap: 8, marginBottom: 14 }}>
+            <Stat label="Trades" value={m.n} />
+            <Stat label="Hit rate" value={fmtPct(m.hitRate)} tone={m.hitRate >= 0.55 ? "bull" : m.hitRate >= 0.5 ? "" : "bear"} />
+            <Stat label="Total return" value={fmtPct(m.totalReturn, 2)} tone={m.totalReturn > 0 ? "bull" : "bear"} />
+            <Stat label="Sharpe" value={m.sharpe.toFixed(2)} tone={m.sharpe > 1 ? "bull" : m.sharpe > 0 ? "" : "bear"} />
+            <Stat label="Sortino" value={m.sortino.toFixed(2)} tone={m.sortino > 1 ? "bull" : ""} />
+            <Stat label="Max DD" value={fmtPct(m.maxDrawdown)} tone="bear" />
+            <Stat label="Profit factor" value={m.profitFactor != null ? m.profitFactor.toFixed(2) : "∞"} tone={m.profitFactor > 1.5 ? "bull" : ""} />
+            <Stat label="Avg win" value={fmtPct(m.avgWin, 2)} tone="bull" />
+            <Stat label="Avg loss" value={fmtPct(m.avgLoss, 2)} tone="bear" />
+            <Stat label="Best" value={fmtPct(m.bestTrade, 2)} tone="bull" />
+            <Stat label="Worst" value={fmtPct(m.worstTrade, 2)} tone="bear" />
+          </div>
+
+          {byRegime && Object.keys(byRegime).length > 1 && (
+            <div style={{ marginBottom: 14 }}>
+              <h4 style={{ fontSize: 12, color: "var(--fg-dim)", textTransform: "uppercase", letterSpacing: 1 }}>By Regime</h4>
+              <table className="scan-table">
+                <thead>
+                  <tr><th>Regime</th><th>N</th><th>Hit</th><th>Sharpe</th><th>Total</th><th>MDD</th></tr>
+                </thead>
+                <tbody>
+                  {Object.entries(byRegime).map(([k, mm]) => (
+                    <tr key={k}>
+                      <td><b>{k}</b></td>
+                      <td>{mm.n}</td>
+                      <td className={mm.hitRate >= 0.55 ? "bull" : mm.hitRate >= 0.5 ? "" : "bear"}>{fmtPct(mm.hitRate)}</td>
+                      <td>{mm.sharpe.toFixed(2)}</td>
+                      <td className={mm.totalReturn > 0 ? "bull" : "bear"}>{fmtPct(mm.totalReturn, 2)}</td>
+                      <td>{fmtPct(mm.maxDrawdown)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          <h4 style={{ fontSize: 12, color: "var(--fg-dim)", textTransform: "uppercase", letterSpacing: 1 }}>Recent Trades (last 20)</h4>
+          <table className="scan-table">
+            <thead>
+              <tr><th>Time</th><th>Dir</th><th>Entry</th><th>Exit</th><th>Return</th><th>Cash</th><th>Brain</th><th>Regime</th></tr>
+            </thead>
+            <tbody>
+              {result.trades.slice(-20).reverse().map((t, i) => (
+                <tr key={i}>
+                  <td style={{ fontSize: 10, color: "var(--fg-dim)" }}>{new Date(t.t).toLocaleString()}</td>
+                  <td className={directionTone(t.direction)}>{t.direction.toUpperCase()}</td>
+                  <td>{fmt(t.entryPrice)}</td>
+                  <td>{fmt(t.exitPrice)}</td>
+                  <td className={t.pnl >= 0 ? "bull" : "bear"}>{fmtPct(t.pnl, 2)}</td>
+                  <td>{t.cash.toFixed(4)}</td>
+                  <td>{t.brain === "meta-nn" ? <span className="chip-toggle on" style={{ fontSize: 9, padding: "1px 5px" }}>NN</span> : <span style={{ color: "var(--fg-dim)", fontSize: 10 }}>orch</span>}</td>
+                  <td style={{ fontSize: 10, color: "var(--fg-dim)" }}>{t.regime || "—"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </>
+      )}
+
+      {!result && !busy && !err && (
+        <div style={{ color: "var(--fg-dim)", fontSize: 12, padding: 12 }}>
+          Walks bar-by-bar through your stored candle history, generating a prediction at each bar
+          and evaluating it `horizon` bars later. No look-ahead leak. Click <b>Run Backtest</b>.
+        </div>
+      )}
+
+      <div style={{ marginTop: 14, fontSize: 10, color: "var(--fg-dim)" }}>
+        Walks bar-by-bar from warmup=200; TA computed causally on prefix only · neutral signals skipped · positions sized 1 (compounding)
+      </div>
+    </section>
+  );
+}
+
+function Stat({ label, value, tone }) {
+  return (
+    <div className="dl-cell">
+      <div className="k">{label}</div>
+      <div className={"v " + (tone || "")}>{value}</div>
+    </div>
+  );
+}
+
+/* ╔══════════════════════════════════════════════════════════════════╗
    ║  AI Chat stub tab                                                ║
    ╚══════════════════════════════════════════════════════════════════╝ */
 
@@ -4744,6 +4905,11 @@ function App() {
         {tab === "scanner" && (
           <div style={{ gridColumn: "1 / -1", overflow: "auto" }}>
             <ScannerPane tf={tf} setSymbol={setSymbol} setTab={setTab} />
+          </div>
+        )}
+        {tab === "backtest" && (
+          <div style={{ gridColumn: "1 / -1", overflow: "auto" }}>
+            <BacktestPane symbol={symbol} tf={tf} />
           </div>
         )}
         {tab === "news" && (
