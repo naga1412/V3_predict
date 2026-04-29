@@ -226,10 +226,29 @@ function useCandleSeries(symbol, tf, limit = 500) {
     let cancelled = false;
     let fm = null;
     setCandles([]); setForming(null);
+    // Wait for window.__MNP__ to be wired by bootstrap.js.  Without this,
+    // when the App mounts before boot completes, the hook would bail
+    // silently and never retry (deps don't change), leaving the chart
+    // stuck on "loading history…" forever.
+    const waitForMNP = (timeoutMs = 10_000) => new Promise((resolve, reject) => {
+      const t0 = performance.now();
+      const tryNow = () => {
+        if (window.__MNP__?.getStored && window.__MNP__?.FeedManager) return resolve(window.__MNP__);
+        if (performance.now() - t0 > timeoutMs) return reject(new Error("MNP not ready"));
+        setTimeout(tryNow, 50);
+      };
+      // Also resolve on boot:complete bus event (faster than polling).
+      const off = window.__MNP__?.EventBus?.once?.("boot:complete", () => {
+        try { off?.(); } catch {}
+        if (window.__MNP__?.getStored) resolve(window.__MNP__);
+      });
+      tryNow();
+    });
     (async () => {
-      const mnp = window.__MNP__;
-      if (!mnp) return;
-      // 1. IDB history
+      let mnp;
+      try { mnp = await waitForMNP(); } catch (err) { console.warn("[ui] MNP not ready", err); return; }
+      if (cancelled) return;
+      // 1. IDB history (fast — paint chart immediately if any cached candles exist)
       try {
         const hist = await mnp.getStored({ symbol, tf, limit });
         if (!cancelled && Array.isArray(hist) && hist.length) {
@@ -246,6 +265,11 @@ function useCandleSeries(symbol, tf, limit = 500) {
         setExchange(snap.exchange);
         setRole(snap.role);
         if (snap.forming) setForming(snap.forming);
+        // After backfill, refresh candles from IDB once.
+        const hist2 = await mnp.getStored({ symbol, tf, limit });
+        if (!cancelled && Array.isArray(hist2) && hist2.length) {
+          setCandles(hist2.slice().sort((a, b) => a.t - b.t));
+        }
       } catch (err) { console.error("[ui] feed start failed", err); }
     })();
     return () => {
