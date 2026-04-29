@@ -230,7 +230,7 @@ export async function boot() {
     Drift,
     ValidationMonitor,
     createDefaultMonitor,
-    version: "3.0.0-m7",
+    version: "3.0.0",
   };
 
   // Degrade decisions ------------------------------------------------------

@@ -4595,6 +4595,51 @@ function SystemPane({ caps }) {
           {caps.quota.freePct != null && ` · ${(caps.quota.freePct * 100).toFixed(1)}% free`}
         </div>
       )}
+      <AboutCard />
+    </div>
+  );
+}
+
+/* M8 · About / Status — list every shipped milestone with current state */
+function AboutCard() {
+  const M = window.__MNP__;
+  const milestones = [
+    { id: "phase-1-9",   label: "Phase 1-9 · data layer + TA + ML core" },
+    { id: "phase-10",    label: "Phase 10 · auto-validation + drift monitor" },
+    { id: "phase-11",    label: "Phase 11 · ghost candles" },
+    { id: "m3.5",        label: "M3.5 · multi-asset universe (Binance + Yahoo + Stooq)" },
+    { id: "m4abc",       label: "M4a/b/c · news + Wyckoff + macro + derivs + intermarket" },
+    { id: "m5",          label: "M5 · stability + adaptive weights" },
+    { id: "m6",          label: "M6 · Ollama + Web-LLM + router" },
+    { id: "m-learn-1",   label: "M-LEARN-1 · mistake ledger" },
+    { id: "m-learn-23",  label: "M-LEARN-2/3 · anti-pattern + meta-veto" },
+    { id: "m-learn-4",   label: "M-LEARN-4 · Meta-Brain (decision layer)" },
+    { id: "m-learn-5",   label: "M-LEARN-5 · champion/challenger + drift rollback" },
+    { id: "m-scan",      label: "M-SCAN · multi-symbol background scanner" },
+    { id: "ghost2",      label: "Ghost 2.0 · colored step markers + Predicted arrow" },
+    { id: "m7",          label: "M7 · walk-forward backtest harness" },
+    { id: "m8",          label: "M8 · PWA + mobile + about (this card)" },
+  ];
+  return (
+    <div style={{ marginTop: 16, padding: 12, background: "var(--bg)", borderRadius: 6 }}>
+      <h4 style={{ fontSize: 12, color: "var(--fg-dim)", textTransform: "uppercase", letterSpacing: 1, margin: "0 0 8px 0" }}>
+        About · {M?.version || "—"}
+      </h4>
+      <div style={{ fontSize: 11, color: "var(--fg-dim)", marginBottom: 10, lineHeight: 1.5 }}>
+        Fully client-side · zero backend · zero telemetry · zero API keys · GitHub Pages hosted ·
+        IndexedDB persistence · ServiceWorker offline-shell.
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+        {milestones.map((m) => (
+          <div key={m.id} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11 }}>
+            <span style={{ color: "var(--bull)" }}>✓</span>
+            <span style={{ color: "var(--fg)" }}>{m.label}</span>
+          </div>
+        ))}
+      </div>
+      <div style={{ marginTop: 10, fontSize: 10, color: "var(--fg-dimmer)" }}>
+        Source · <a href="https://github.com/naga1412/V3_predict" target="_blank" rel="noopener noreferrer" style={{ color: "var(--accent)" }}>github.com/naga1412/V3_predict</a>
+      </div>
     </div>
   );
 }

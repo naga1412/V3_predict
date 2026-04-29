@@ -8,13 +8,14 @@
  * Scenarios covered: cold-load perf, offline shell (#39), SW update flow (#62)
  */
 
-const SW_VERSION = "mnp-v3-m7-1";
+const SW_VERSION = "mnp-v300";
 const SHELL_CACHE = `${SW_VERSION}-shell`;
 const CDN_CACHE   = `${SW_VERSION}-cdn`;
 
 const SHELL = [
   "./",
   "./index.html",
+  "./manifest.json",
   "./public/theme.css",
   // core
   "./src/core/bootstrap.js",

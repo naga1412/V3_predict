@@ -330,6 +330,39 @@ html, body {
   .sidebar { order: 2; }
 }
 
+/* M8 — Mobile responsive: tab nav scrolls, sidebar collapses to drawer
+   on phones, top bar wraps cleanly without overflowing. */
+@media (max-width: 768px) {
+  body { padding: 0; }
+  .topbar { flex-wrap: wrap; padding: 6px 8px; gap: 6px; }
+  .topbar > * { font-size: 12px; }
+  .tabnav { width: 100%; overflow-x: auto; flex-wrap: nowrap !important; -webkit-overflow-scrolling: touch; }
+  .tabnav::-webkit-scrollbar { display: none; }
+  .tab-btn { white-space: nowrap; padding: 6px 10px; font-size: 12px; }
+  .tf-group { flex-wrap: wrap; gap: 2px; }
+  .tf-btn { padding: 3px 6px; font-size: 11px; }
+  .workspace { padding: 6px; gap: 6px; grid-template-columns: 1fr; }
+  .sidebar { order: 2; max-height: 70vh; overflow-y: auto; }
+  .chart-card { grid-template-rows: auto 1fr auto; }
+  .chart-header { padding: 6px 8px; font-size: 11px; }
+  .chart-header .price { font-size: 18px !important; }
+  .scan-table { font-size: 11px; }
+  .scan-table th, .scan-table td { padding: 4px 6px; }
+  .card h3 { font-size: 13px; }
+  .dl-cell .v { font-size: 13px; }
+  /* hide non-essential overlays on tiny screens */
+  .indicators-bar { gap: 2px; padding: 4px 6px; overflow-x: auto; flex-wrap: nowrap !important; }
+  .indicator-chip { padding: 3px 6px; font-size: 10px; white-space: nowrap; }
+}
+
+@media (max-width: 480px) {
+  .splash-logo { font-size: 32px; }
+  .topbar .logo .product-name { font-size: 13px; }
+  .ohlc { display: none; }
+  .price { font-size: 16px !important; }
+  .delta { font-size: 11px; }
+}
+
 /* Chart pane */
 .chart-card {
   position: relative;

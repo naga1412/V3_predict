@@ -29,6 +29,11 @@
 ">
 
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%232962ff'/%3E%3Ctext x='8' y='11' font-size='10' font-weight='bold' text-anchor='middle' fill='white' font-family='Arial'%3EM%3C/text%3E%3C/svg%3E">
+<link rel="manifest" href="./manifest.json">
+<link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 192 192'%3E%3Crect width='192' height='192' fill='%232962ff' rx='28'/%3E%3Ctext x='96' y='125' font-size='112' font-weight='bold' text-anchor='middle' fill='white' font-family='Arial'%3EM%3C/text%3E%3C/svg%3E">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="MNP">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <link rel="preconnect" href="https://unpkg.com" />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 
@@ -66,7 +71,7 @@
 <!-- The ?v= query busts the browser's ES-module graph cache when we change  -->
 <!-- the data-layer surface exposed on window.__MNP__.                         -->
 <script type="module">
-  const V = "m7-1";
+  const V = "v300";
   // Pick the first non-data: URL as the resolution base.
   function findBase() {
     for (const u of [window.location?.href, document.baseURI, import.meta.url]) {
@@ -100,7 +105,7 @@
   if (location.protocol === "file:") {
     document.write('<script type="text/babel" data-type="module" data-presets="env,react" src="./src/ui/App.jsx"><\/script>');
   } else {
-    document.write('<script type="text/babel" data-type="module" data-presets="env,react" src="./src/ui/App.jsx?v=m7-1"><\/script>');
+    document.write('<script type="text/babel" data-type="module" data-presets="env,react" src="./src/ui/App.jsx?v=v300"><\/script>');
   }
 </script>
 
