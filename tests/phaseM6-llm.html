@@ -1,0 +1,176 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>MNP · M6 — Ollama LLM client</title>
+<style>
+  body { background:#131722; color:#d1d4dc; font:13px/1.5 monospace; padding:20px; }
+  .pass { color:#26a69a; } .fail { color:#ef5350; }
+  .group { margin-top: 12px; font-weight:bold; color:#2962ff; }
+  h1 { color:#fff; font-size:18px; }
+  #out { white-space: pre-wrap; }
+  .summary { margin-top: 16px; padding: 8px; border:1px solid #2a2e39; }
+</style>
+</head>
+<body>
+<h1>MNP — M6 · Ollama LLM</h1>
+<script>
+  if (location.protocol === "file:") { document.body.innerHTML = `<div style="color:#ef5350">Run on http://localhost</div>`; throw new Error("file://"); }
+</script>
+<div id="out">running…</div>
+
+<script type="module">
+const out = document.getElementById("out");
+window.addEventListener("error", (e) => { out.innerHTML += `<span class="fail">✗ ${e.message}</span>\n`; });
+const V = "m6-" + Date.now();
+const U = (p) => new URL(`${p}?v=${V}`, location.href).href;
+const Stream = await import(U("../src/llm/stream.js"));
+const Prompt = await import(U("../src/llm/prompt.js"));
+const Ollama = await import(U("../src/llm/ollama.js"));
+
+let n = 0, p = 0;
+const log = (s, ok, err) => { out.innerHTML += `<span class="${ok?'pass':'fail'}">${ok?'✓':'✗'} ${s}${err ? ' — ' + err : ''}</span>\n`; n++; if (ok) p++; };
+const group = (s) => { out.innerHTML += `\n<span class="group">[${s}]</span>\n`; };
+
+/* ════════════ Stream parsing ════════════ */
+group("parseChunk · NDJSON");
+{
+  const r1 = Stream.parseChunk('{"response":"Hi"}\n{"response":" there"}\n{"done":true}\n');
+  log("parses 3 events",            r1.events.length === 3);
+  log("event 1 has response 'Hi'",  r1.events[0].response === "Hi");
+  log("event 3 has done=true",      r1.events[2].done === true);
+  log("partial empty after full",   r1.partial === "");
+
+  // Partial line carried forward
+  const r2 = Stream.parseChunk('{"response":"foo"}\n{"resp');
+  log("emits 1 event",     r2.events.length === 1);
+  log("partial carries trailing", r2.partial === '{"resp');
+  const r3 = Stream.parseChunk('onse":"bar"}\n', r2.partial);
+  log("partial+next assembles into event", r3.events.length === 1 && r3.events[0].response === "bar");
+
+  // Malformed lines dropped
+  const bad = Stream.parseChunk('not-json\n{"response":"x"}\n');
+  log("malformed line skipped", bad.events.length === 1 && bad.events[0].response === "x");
+
+  // Empty / null inputs
+  log("empty string → no events", Stream.parseChunk("").events.length === 0);
+  log("null → no events",          Stream.parseChunk(null).events.length === 0);
+}
+
+group("tokenOf");
+{
+  log("/api/generate response → token", Stream.tokenOf({ response: "abc" }) === "abc");
+  log("/api/chat message.content → token",
+      Stream.tokenOf({ message: { content: "hello" } }) === "hello");
+  log("event without response → ''", Stream.tokenOf({ done: true }) === "");
+  log("null event → ''",              Stream.tokenOf(null) === "");
+}
+
+/* ════════════ Prompt builder ════════════ */
+group("buildContext");
+{
+  const ctx = {
+    symbol: "BTCUSDT", tf: "1h", lastPrice: 65432.10,
+    ta: { trend: "up", ema20: [65000], ema50: [64500], ema200: [60000], rsi14: [58], adx14: { adx: [28] }, atr14: [350] },
+    orch: { rawScore: 0.42, probability: 0.71, direction: "long", participating: 12, signals: [
+      { moduleId: "trend-follow", signal: 0.6, confidence: 0.8 },
+      { moduleId: "momentum",     signal: 0.4, confidence: 0.6 },
+    ]},
+    ghost: { bars: [{c:65500, lo:65200, hi:65800, width:600}], direction: 1, bias: 0.4, usedConformal: true },
+    regime: { label: "trend-up-strong", trend: "up", strength: "strong", volatility: "normal" },
+    wyckoff: { phase: "markup", bias: "bullish", bullPct: 65 },
+    macro: { label: "risk-on", score: 0.42 },
+    stability: { label: "stable", score: 0.78, biasSigma: 0.12, flipRate: 0.05 },
+    news: [
+      { title: "Bitcoin rallies", classification: { primary: "CRYPTO MKT", impact: 0.7 }, sentiment: { label: "bullish" } },
+    ],
+  };
+  const txt = Prompt.buildContext(ctx);
+  log("includes SYMBOL line",       /SYMBOL: BTCUSDT/.test(txt));
+  log("includes TA block",          /TA:[\s\S]*RSI14/.test(txt));
+  log("includes ORCH rawScore",     /rawScore=0\.42/.test(txt));
+  log("includes top4 modules",      /top4: trend-follow=0\.60/.test(txt));
+  log("includes GHOST line",        /GHOST:/.test(txt));
+  log("includes WYCKOFF",           /WYCKOFF: phase=markup/.test(txt));
+  log("includes MACRO",             /MACRO: risk-on/.test(txt));
+  log("includes STABILITY",         /STABILITY: stable/.test(txt));
+  log("includes NEWS section",      /NEWS \(recent/.test(txt));
+}
+
+group("buildContext · empty inputs");
+{
+  log("empty ctx → empty string or short",
+      typeof Prompt.buildContext({}) === "string");
+  // Empty ta is filtered out
+  const t = Prompt.buildContext({ ta: { empty: true } });
+  log("empty ta omitted", !/RSI14/.test(t));
+}
+
+group("buildPrompt");
+{
+  const r = Prompt.buildPrompt({
+    ctx: { symbol: "ETHUSDT" },
+    question: "What's the call?",
+  });
+  log("returns {system, prompt, context}",
+      typeof r.system === "string" && typeof r.prompt === "string" && typeof r.context === "string");
+  log("system mentions analyst",  /analyst/i.test(r.system));
+  log("prompt embeds question",    /What's the call/.test(r.prompt));
+  log("prompt has LIVE CONTEXT",   /=== LIVE CONTEXT ===/.test(r.prompt));
+}
+
+group("buildMessages");
+{
+  const r = Prompt.buildMessages({
+    ctx: { symbol: "BTCUSDT" },
+    question: "Why long?",
+    history: [
+      { role: "user",      content: "Earlier" },
+      { role: "assistant", content: "Earlier reply" },
+    ],
+  });
+  log("returns {system, messages[]}",
+      typeof r.system === "string" && Array.isArray(r.messages));
+  log("messages length === 3",   r.messages.length === 3);
+  log("last is user 'Why long?'",
+      r.messages[2].role === "user" && /Why long/.test(r.messages[2].content));
+  log("first preserves prior turn role", r.messages[0].role === "user");
+  // History capped at 6 turns
+  const long = Array.from({ length: 20 }, (_, i) => ({ role: "user", content: `q${i}` }));
+  const r2 = Prompt.buildMessages({ ctx: {}, question: "now", history: long });
+  log("history capped at 6 prior turns + 1 user = 7 messages", r2.messages.length === 7);
+}
+
+group("SYSTEM_PROMPT");
+{
+  log("exported and non-empty", typeof Prompt.SYSTEM_PROMPT === "string" && Prompt.SYSTEM_PROMPT.length > 50);
+}
+
+/* ════════════ Ollama client (offline guard) ════════════ */
+group("Ollama · offline guard");
+{
+  // ping returns boolean
+  const p1 = await Ollama.ping();
+  log("ping returns boolean", typeof p1 === "boolean");
+
+  // generate without model → null (with onError fired)
+  let errSeen = null;
+  const r1 = await Ollama.generate({ model: "", prompt: "x" }, { onError: (e) => { errSeen = e?.message; } });
+  log("generate without model → null", r1 === null);
+  log("onError fired with message",     typeof errSeen === "string");
+
+  // chat without messages → null
+  const r2 = await Ollama.chat({ model: "x", messages: [] }, {});
+  log("chat without messages → null",   r2 === null);
+
+  // listModels gracefully returns [] when daemon offline
+  const list = await Ollama.listModels();
+  log("listModels returns array (possibly empty)", Array.isArray(list));
+}
+
+/* ════════════ Summary ════════════ */
+out.innerHTML += `\n<div class="summary ${p===n?'pass':'fail'}">Ran ${n} tests — ${p} passed, ${n-p} failed.</div>`;
+document.title = `MNP m6 ${p}/${n}`;
+</script>
+</body>
+</html>

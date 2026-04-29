@@ -88,6 +88,10 @@ import * as Correlation    from "../intermarket/correlation.js";
 // M5 — Stability + adaptive weights
 import * as Stability from "../ml/stability.js";
 import * as Adaptive  from "../ml/adaptive.js";
+// M6 — Local LLM (Ollama)
+import * as Ollama  from "../llm/ollama.js";
+import * as LLMPrompt from "../llm/prompt.js";
+import * as LLMStream from "../llm/stream.js";
 // Phase 10 — Auto-validation + drift monitor
 import * as PredictionStore from "../validation/predictionStore.js";
 import * as Validator from "../validation/validator.js";
@@ -186,13 +190,17 @@ export async function boot() {
     // M5
     Stability,
     Adaptive,
+    // M6
+    Ollama,
+    LLMPrompt,
+    LLMStream,
     // Phase 10
     PredictionStore,
     Validator,
     Drift,
     ValidationMonitor,
     createDefaultMonitor,
-    version: "3.0.0-m5",
+    version: "3.0.0-m6",
   };
 
   // Degrade decisions ------------------------------------------------------

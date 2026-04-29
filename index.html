@@ -66,7 +66,7 @@
 <!-- The ?v= query busts the browser's ES-module graph cache when we change  -->
 <!-- the data-layer surface exposed on window.__MNP__.                         -->
 <script type="module">
-  const V = "m5-1";
+  const V = "m6-1";
   // Pick the first non-data: URL as the resolution base.
   function findBase() {
     for (const u of [window.location?.href, document.baseURI, import.meta.url]) {
@@ -100,7 +100,7 @@
   if (location.protocol === "file:") {
     document.write('<script type="text/babel" data-type="module" data-presets="env,react" src="./src/ui/App.jsx"><\/script>');
   } else {
-    document.write('<script type="text/babel" data-type="module" data-presets="env,react" src="./src/ui/App.jsx?v=m5-1"><\/script>');
+    document.write('<script type="text/babel" data-type="module" data-presets="env,react" src="./src/ui/App.jsx?v=m6-1"><\/script>');
   }
 </script>
 

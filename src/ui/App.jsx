@@ -3631,61 +3631,181 @@ function ScannerPane({ tf }) {
    ║  AI Chat stub tab                                                ║
    ╚══════════════════════════════════════════════════════════════════╝ */
 
-function AIChatPane({ orch, expected, ta, symbol, tf }) {
+/* ── M6 · AIChatPane — Ollama-streamed reasoning trace ──
+   Talks to a local Ollama daemon at http://localhost:11434.  When
+   unavailable (daemon down or HTTPS-blocked mixed-content) falls back
+   to the deterministic analyst from v3-pre-M6. */
+function AIChatPane({ orch, expected, ta, symbol, tf, ghost, regime, wyckoff, macro, deriv, stability, news }) {
   const [msgs, setMsgs] = useState([
-    { role: "ai", text: "Hi — I'm your trading analyst assistant. Ask me why the model is leaning long or short, and I'll explain based on the current ensemble + modules." },
+    { role: "ai", text: "Hi — I'm wired to your local Ollama daemon (model below). Ask anything. If Ollama isn't running, I fall back to a deterministic local analyst." },
   ]);
   const [input, setInput] = useState("");
+  const [models, setModels] = useState([]);
+  const [model, setModel]   = useState(localStorage.getItem("mnp.llm.model") || "");
+  const [llmReady, setLlmReady] = useState(false);
+  const [busy, setBusy]     = useState(false);
+  const abortRef = useRef(null);
 
-  const explain = useCallback(() => {
-    const lines = [];
-    if (!orch) return "The orchestration pipeline hasn't produced a signal yet — load more candles first.";
-    lines.push(`On ${symbol} · ${tf}, the ensemble is leaning **${orch.direction.toUpperCase()}** with bias ${fmt(orch.rawScore, 2)} and P(up) ${fmtPct(orch.probability)}.`);
-    if (expected) lines.push(`Expected move target: ${fmt(expected.point)} (direction ${expected.direction > 0 ? "up" : "down"}, band ±${fmt(expected.hi - expected.point)}).`);
-    if (orch.signals) {
-      const top = orch.signals
-        .slice()
-        .sort((a, b) => Math.abs(b.signal * b.confidence) - Math.abs(a.signal * a.confidence))
-        .slice(0, 3);
-      lines.push("Top drivers:");
-      for (const s of top) {
-        const meta = MODULE_META[s.id] || { label: s.id, emoji: "•" };
-        lines.push(`  ${meta.emoji} ${meta.label}: ${fmtSigned(s.signal, 2)} @ ${fmtPct(s.confidence)} conf`);
+  // Probe Ollama once on mount + every 30s.
+  useEffect(() => {
+    const O = window.__MNP__?.Ollama;
+    if (!O) return;
+    let stopped = false;
+    const probe = async () => {
+      const ok = await O.ping();
+      if (stopped) return;
+      setLlmReady(ok);
+      if (ok) {
+        const list = await O.listModels();
+        if (stopped) return;
+        setModels(list);
+        if (!model && list.length) {
+          // Prefer DeepSeek if installed
+          const ds = list.find((m) => /deepseek/i.test(m));
+          const pick = ds || list[0];
+          setModel(pick);
+          localStorage.setItem("mnp.llm.model", pick);
+        }
       }
-    }
-    return lines.join("\n");
-  }, [orch, expected, symbol, tf]);
+    };
+    probe();
+    const t = setInterval(probe, 30_000);
+    return () => { stopped = true; clearInterval(t); };
+  }, []);
 
-  const send = useCallback(() => {
-    if (!input.trim()) return;
+  const onModelChange = useCallback((m) => {
+    setModel(m);
+    try { localStorage.setItem("mnp.llm.model", m); } catch {}
+  }, []);
+
+  const buildCtx = useCallback(() => ({
+    symbol, tf,
+    lastPrice: ta?.close?.[ta.close.length - 1],
+    ta, orch, ghost,
+    regime: regime || ta?.regime,
+    wyckoff: wyckoff || ta?.wyckoff,
+    macro,
+    deriv,
+    stability,
+    news: Array.isArray(news) ? news.slice(0, 5) : null,
+  }), [symbol, tf, ta, orch, ghost, regime, wyckoff, macro, deriv, stability, news]);
+
+  // Deterministic fallback (used when Ollama is offline).
+  const deterministic = useCallback((user) => {
+    if (/why|explain|reason/i.test(user)) {
+      if (!orch) return "The orchestration pipeline hasn't produced a signal yet — load more candles first.";
+      const lines = [];
+      lines.push(`On ${symbol} · ${tf}, the ensemble is leaning ${orch.direction?.toUpperCase()} with bias ${fmt(orch.rawScore, 2)} and P(up) ${fmtPct(orch.probability)}.`);
+      if (expected) lines.push(`Expected move target: ${fmt(expected.point)} (band ±${fmt(expected.hi - expected.point)}).`);
+      if (orch.signals) {
+        const top = orch.signals.slice().sort((a, b) => Math.abs(b.signal * b.confidence) - Math.abs(a.signal * a.confidence)).slice(0, 3);
+        lines.push("Top drivers:");
+        for (const s of top) {
+          const meta = MODULE_META[s.id || s.moduleId] || { label: s.moduleId || s.id || "?", emoji: "•" };
+          lines.push(`  ${meta.emoji} ${meta.label}: ${fmtSigned(s.signal, 2)} @ ${fmtPct(s.confidence)} conf`);
+        }
+      }
+      return lines.join("\n");
+    }
+    if (/target|price|move/i.test(user)) return expected ? `Target ${fmt(expected.point)} (band ${fmt(expected.lo)}–${fmt(expected.hi)})` : "No target available yet.";
+    if (/risk|atr|volat/i.test(user)) return ta?.atr14?.length ? `ATR14: ${fmt(ta.atr14[ta.atr14.length - 1])}` : "ATR not available.";
+    return "Ollama isn't reachable — local analyst answers: why · target · risk.";
+  }, [orch, expected, symbol, tf, ta]);
+
+  const send = useCallback(async () => {
+    if (!input.trim() || busy) return;
     const user = input.trim();
     setInput("");
     setMsgs(m => [...m, { role: "you", text: user }]);
-    // Deterministic local analyst (real LLM hook lands in Phase 15 / DeepSeek)
-    const reply = /why|explain|reason/i.test(user) ? explain() :
-                  /target|price|move/i.test(user) ?
-                    (expected ? `Current target: ${fmt(expected.point)} (band ${fmt(expected.lo)} – ${fmt(expected.hi)})`
-                              : "No target available yet.") :
-                  /risk|atr|volat/i.test(user) ? (ta?.atr14?.length ? `ATR14: ${fmt(ta.atr14[ta.atr14.length - 1])}` : "ATR not available.") :
-                  "I'm a local analyst — I can answer about why, target/move, or risk/volatility. (Full LLM integration arrives in Phase 15 with DeepSeek-R1.)";
-    setTimeout(() => setMsgs(m => [...m, { role: "ai", text: reply }]), 120);
-  }, [input, explain, expected, ta]);
+
+    const O   = window.__MNP__?.Ollama;
+    const PB  = window.__MNP__?.LLMPrompt;
+    if (!llmReady || !O || !PB || !model) {
+      setMsgs(m => [...m, { role: "ai", text: deterministic(user) }]);
+      return;
+    }
+    setBusy(true);
+    const aiIdx = msgs.length + 1;   // index of the streaming AI bubble (after we push)
+    setMsgs(m => [...m, { role: "ai", text: "", streaming: true }]);
+    const ctl = new AbortController();
+    abortRef.current = ctl;
+    const ctx = buildCtx();
+    const { system, prompt } = PB.buildPrompt({ ctx, question: user });
+    let acc = "";
+    try {
+      await O.generate(
+        { model, prompt, system, signal: ctl.signal, options: { temperature: 0.4 } },
+        {
+          onToken: (tok) => {
+            acc += tok;
+            setMsgs((m) => {
+              const arr = m.slice();
+              const last = arr[arr.length - 1];
+              if (last && last.role === "ai" && last.streaming) arr[arr.length - 1] = { ...last, text: acc };
+              return arr;
+            });
+          },
+          onError: (err) => {
+            acc = `(LLM error: ${err?.message || err})\n\n` + deterministic(user);
+            setMsgs((m) => {
+              const arr = m.slice();
+              arr[arr.length - 1] = { role: "ai", text: acc, streaming: false };
+              return arr;
+            });
+          },
+        }
+      );
+    } catch { /* swallowed; onError handled it */ }
+    setMsgs((m) => {
+      const arr = m.slice();
+      const last = arr[arr.length - 1];
+      if (last && last.role === "ai" && last.streaming) arr[arr.length - 1] = { ...last, streaming: false };
+      return arr;
+    });
+    setBusy(false);
+    abortRef.current = null;
+  }, [input, busy, llmReady, model, msgs.length, buildCtx, deterministic]);
+
+  const stop = useCallback(() => {
+    if (abortRef.current) { try { abortRef.current.abort(); } catch {} abortRef.current = null; }
+  }, []);
 
   return (
     <div className="chat-shell" aria-label="ai-chat">
+      <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 10px", borderBottom: "1px solid var(--border)", fontSize: 11 }}>
+        <span style={{ color: "var(--fg-dim)" }}>Ollama</span>
+        <span className={"chip-toggle on " + (llmReady ? "bull" : "bear")} style={{ fontSize: 9, padding: "1px 6px" }}>
+          {llmReady ? "online" : "offline"}
+        </span>
+        {llmReady && models.length > 0 && (
+          <select
+            value={model}
+            onChange={(e) => onModelChange(e.target.value)}
+            style={{ fontSize: 11, padding: "2px 4px", background: "var(--bg)", color: "var(--fg)", border: "1px solid var(--border)", borderRadius: 3 }}>
+            {models.map((m) => <option key={m} value={m}>{m}</option>)}
+          </select>
+        )}
+        {!llmReady && (
+          <span style={{ color: "var(--fg-dim)" }}>(start with `ollama serve` then pull a model)</span>
+        )}
+        {busy && <button type="button" onClick={stop} className="chip-toggle" style={{ fontSize: 10, padding: "2px 6px", marginLeft: "auto" }}>stop</button>}
+      </div>
       <div className="chat-log">
         {msgs.map((m, i) => (
-          <div key={i} className={"chat-msg " + m.role} style={{ whiteSpace: "pre-wrap" }}>{m.text}</div>
+          <div key={i} className={"chat-msg " + m.role} style={{ whiteSpace: "pre-wrap" }}>
+            {m.text}{m.streaming ? <span style={{ color: "var(--fg-dim)" }}> ▌</span> : null}
+          </div>
         ))}
       </div>
       <div className="chat-input">
         <input
-          type="text" placeholder="Why is the model leaning this way?"
+          type="text" placeholder={llmReady ? `Ask ${model || "the LLM"}…` : "Why is the model leaning this way?"}
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && send()}
+          disabled={busy}
         />
-        <button className="btn-primary" onClick={send}>Send</button>
+        <button className="btn-primary" onClick={send} disabled={busy || !input.trim()}>{busy ? "…" : "Send"}</button>
       </div>
     </div>
   );
@@ -3942,7 +4062,7 @@ function App() {
         )}
         {tab === "chat" && (
           <>
-            <AIChatPane orch={orch} expected={expected} ta={ta} symbol={symbol} tf={tf} />
+            <AIChatPane orch={orch} expected={expected} ta={ta} symbol={symbol} tf={tf} ghost={ghost} stability={stability} />
             <SignalSidebar orch={orch} expected={expected} ghost={ghost} ta={ta} candles={feed.candles} regime={ta?.regime?.label} symbol={symbol} ghostNBars={ghostNBars} setGhostNBars={setGhostNBars} stability={stability} adaptive={adaptiveRef.current} adaptiveTick={adaptiveTick} />
           </>
         )}
