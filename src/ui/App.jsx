@@ -1259,6 +1259,43 @@ function VolumeProfileOverlay({ chartRef, seriesRef, dims }) {
    ║  Chart pane — lightweight-charts + overlay layer                 ║
    ╚══════════════════════════════════════════════════════════════════╝ */
 
+/* When candles haven't arrived after 8s the most likely cause is a
+   stale Service Worker shell.  Show a one-click cache-nuke escape so
+   users never get permanently stuck behind an old SW. */
+function ChartEmptyWithRescue() {
+  const [stuck, setStuck] = useState(false);
+  const [busy,  setBusy]  = useState(false);
+  useEffect(() => {
+    const id = setTimeout(() => setStuck(true), 8000);
+    return () => clearTimeout(id);
+  }, []);
+  const onReset = async () => {
+    setBusy(true);
+    try {
+      const regs = await navigator.serviceWorker?.getRegistrations?.() || [];
+      await Promise.all(regs.map(r => r.unregister()));
+      const ks = await caches.keys();
+      await Promise.all(ks.map(k => caches.delete(k)));
+    } catch {}
+    location.replace(location.pathname + "?fresh=" + Date.now());
+  };
+  return (
+    <div className="chart-empty" style={{ display: "flex", flexDirection: "column", gap: 8, alignItems: "center" }}>
+      <div>loading history…</div>
+      {stuck && (
+        <>
+          <div style={{ fontSize: 11, color: "var(--fg-dim)", maxWidth: 300, textAlign: "center" }}>
+            Stuck? Your browser may be serving a cached old version. Reset to force-fetch fresh.
+          </div>
+          <button type="button" className="chip-toggle on" disabled={busy} onClick={onReset} style={{ fontSize: 11, padding: "4px 10px" }}>
+            {busy ? "resetting…" : "Reset cache & reload"}
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
+
 function ChartPane({ symbol, tf, candles, forming, ta, indicators, structure, expected, subplots, ghost }) {
   const containerRef = useRef(null);
   const chartRef = useRef(null);
@@ -1655,7 +1692,7 @@ function ChartPane({ symbol, tf, candles, forming, ta, indicators, structure, ex
       </div>
       <div className="chart-canvas" ref={containerRef}>
         <div className="chart-watermark">{symbol} · {tf}</div>
-        {!candles?.length && <div className="chart-empty">loading history…</div>}
+        {!candles?.length && <ChartEmptyWithRescue />}
         {structure?.volProfile && (
           <VolumeProfileOverlay
             chartRef={chartRef}

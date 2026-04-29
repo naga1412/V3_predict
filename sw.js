@@ -8,7 +8,7 @@
  * Scenarios covered: cold-load perf, offline shell (#39), SW update flow (#62)
  */
 
-const SW_VERSION = "mnp-v3-mlearn4-4";
+const SW_VERSION = "mnp-v3-mlearn4-5";
 const SHELL_CACHE = `${SW_VERSION}-shell`;
 const CDN_CACHE   = `${SW_VERSION}-cdn`;
 
