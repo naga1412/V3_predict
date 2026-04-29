@@ -4415,7 +4415,7 @@ function AIChatPane({ orch, expected, ta, symbol, tf, ghost, regime, wyckoff, ma
     }
     if (/target|price|move/i.test(user)) return expected ? `Target ${fmt(expected.point)} (band ${fmt(expected.lo)}–${fmt(expected.hi)})` : "No target available yet.";
     if (/risk|atr|volat/i.test(user)) return ta?.atr14?.length ? `ATR14: ${fmt(ta.atr14[ta.atr14.length - 1])}` : "ATR not available.";
-    return "Ollama isn't reachable — local analyst answers: why · target · risk.";
+    return "No LLM tier reachable — local analyst answers: why · target · risk.";
   }, [orch, expected, symbol, tf, ta]);
 
   const send = useCallback(async () => {
