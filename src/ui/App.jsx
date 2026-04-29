@@ -4543,7 +4543,7 @@ function AIChatPane({ orch, expected, ta, symbol, tf, ghost, regime, wyckoff, ma
       </div>
       <div className="chat-input">
         <input
-          type="text" placeholder={llmReady ? `Ask ${model || "the LLM"}…` : "Why is the model leaning this way?"}
+          type="text" placeholder={tier && tier !== "fallback" ? `Ask ${model || "the LLM"}…` : "Why is the model leaning this way?"}
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && send()}
