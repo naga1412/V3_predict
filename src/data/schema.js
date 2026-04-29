@@ -13,7 +13,7 @@
  */
 
 export const DB_NAME    = "mnp";
-export const DB_VERSION = 6;
+export const DB_VERSION = 7;
 
 export const STORES = {
   // Time-series (OHLCV)
@@ -149,6 +149,20 @@ export const STORES = {
     ],
   },
 
+  // M-LEARN-2 (DB v7): anti-pattern clusters — feature-space regions
+  // where the model has reliably been wrong.  Consumed by the
+  // meta-veto layer (M-LEARN-3) on every prediction.
+  antiPatterns: {
+    keyPath: "id",
+    autoIncrement: true,
+    indexes: [
+      { name: "by_regime",    keyPath: "regime" },
+      { name: "by_hitRate",   keyPath: "hitRate" },
+      { name: "by_direction", keyPath: "direction" },
+      { name: "by_updatedAt", keyPath: "updatedAt" },
+    ],
+  },
+
   // M4a (DB v5): news headlines + sentiment + categorisation.  Row shape:
   //   { guid, source, sourceId, link, title, summary, pubDate, fetchedAt,
   //     sentiment: {compound,label,pos,neg},
@@ -236,6 +250,18 @@ export const MIGRATIONS = {
     if (db.objectStoreNames.contains("mistakes")) return;
     const def = STORES.mistakes;
     const store = db.createObjectStore("mistakes", {
+      keyPath: def.keyPath,
+      autoIncrement: def.autoIncrement || false,
+    });
+    (def.indexes || []).forEach(({ name: iname, keyPath, unique = false, multiEntry = false }) => {
+      store.createIndex(iname, keyPath, { unique, multiEntry });
+    });
+  },
+  // M-LEARN-2: added `antiPatterns` store.
+  7: (db /*: IDBDatabase */) => {
+    if (db.objectStoreNames.contains("antiPatterns")) return;
+    const def = STORES.antiPatterns;
+    const store = db.createObjectStore("antiPatterns", {
       keyPath: def.keyPath,
       autoIncrement: def.autoIncrement || false,
     });

@@ -96,6 +96,9 @@ import * as WebLLM    from "../llm/webllm.js";
 import * as LLMRouter from "../llm/llmRouter.js";
 // M-LEARN-1 — Mistake ledger (closed-loop self-correction)
 import * as MistakeLedger from "../learn/mistakeLedger.js";
+// M-LEARN-2/3 — Anti-pattern discovery + meta-veto
+import * as AntiPatterns  from "../learn/antiPatterns.js";
+import * as MetaVeto      from "../learn/metaVeto.js";
 // Phase 10 — Auto-validation + drift monitor
 import * as PredictionStore from "../validation/predictionStore.js";
 import * as Validator from "../validation/validator.js";
@@ -202,13 +205,16 @@ export async function boot() {
     LLMRouter,
     // M-LEARN-1
     MistakeLedger,
+    // M-LEARN-2/3
+    AntiPatterns,
+    MetaVeto,
     // Phase 10
     PredictionStore,
     Validator,
     Drift,
     ValidationMonitor,
     createDefaultMonitor,
-    version: "3.0.0-mlearn1",
+    version: "3.0.0-mlearn3",
   };
 
   // Degrade decisions ------------------------------------------------------
@@ -285,6 +291,34 @@ export async function boot() {
 
   log("bootstrap complete", sum);
   EventBus.emit("boot:complete", { caps, summary: sum });
+
+  // M-LEARN-2 — Schedule anti-pattern discovery whenever the ledger
+  // grows past a threshold OR an hour has passed since the last run.
+  // Runs on the main thread (the clustering is small-scale: ≤500
+  // mistakes × ≤37 dims).  TODO: move to a Web Worker once N grows.
+  let _lastDiscoveryT  = 0;
+  let _mistakesSinceLast = 0;
+  const _DISCOVERY_MIN_NEW = 25;          // at least 25 new mistakes
+  const _DISCOVERY_MIN_INT = 60 * 60_000; // or hourly
+  const _runDiscovery = async () => {
+    try {
+      const recent = await MistakeLedger.recent({ limit: 500 });
+      if (recent.length < AntiPatterns._internals.DEFAULTS.minSamples) return;
+      const res = await AntiPatterns.discoverAntiPatterns({ mistakes: recent });
+      _lastDiscoveryT = Date.now();
+      _mistakesSinceLast = 0;
+      try { EventBus.emit("antipatterns:rebuilt", res); } catch {}
+    } catch (err) { try { EventBus.emit("antipatterns:error", { error: err?.message || String(err) }); } catch {} }
+  };
+  EventBus.on("mistake:recorded", () => {
+    _mistakesSinceLast++;
+    const elapsed = Date.now() - _lastDiscoveryT;
+    if (_mistakesSinceLast >= _DISCOVERY_MIN_NEW || elapsed >= _DISCOVERY_MIN_INT) {
+      _runDiscovery();
+    }
+  });
+  // Initial pass on cold-load (in case there were existing mistakes from a prior session).
+  setTimeout(() => _runDiscovery(), 8_000);
 
   // M4a — Kick off the news manager.  Hydrates from IDB on first call,
   // schedules a fetch ~4 s after start (so it doesn't compete with the

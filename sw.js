@@ -8,7 +8,7 @@
  * Scenarios covered: cold-load perf, offline shell (#39), SW update flow (#62)
  */
 
-const SW_VERSION = "mnp-v3-mlearn1-1";
+const SW_VERSION = "mnp-v3-mlearn3-1";
 const SHELL_CACHE = `${SW_VERSION}-shell`;
 const CDN_CACHE   = `${SW_VERSION}-cdn`;
 
@@ -105,6 +105,9 @@ const SHELL = [
   "./src/llm/llmRouter.js",
   // m-learn-1 — mistake ledger (closed-loop self-correction)
   "./src/learn/mistakeLedger.js",
+  // m-learn-2/3 — anti-pattern discovery + meta-veto
+  "./src/learn/antiPatterns.js",
+  "./src/learn/metaVeto.js",
   // phase 7 — 12 modules + orchestrator + calibration
   "./src/modules/baseModule.js",
   "./src/modules/trendFollow.js",

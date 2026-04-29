@@ -1,0 +1,269 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate" />
+<title>MNP · M-LEARN-2/3 — Anti-patterns + Meta-Veto</title>
+<style>
+  body { background:#131722; color:#d1d4dc; font:13px/1.5 monospace; padding:20px; }
+  .pass { color:#26a69a; } .fail { color:#ef5350; }
+  .group { margin-top: 12px; font-weight:bold; color:#2962ff; }
+  h1 { color:#fff; font-size:18px; }
+  #out { white-space: pre-wrap; }
+  .summary { margin-top: 16px; padding: 8px; border:1px solid #2a2e39; }
+</style>
+</head>
+<body>
+<h1>MNP — M-LEARN-2/3 · Anti-patterns + Meta-Veto</h1>
+<script>
+  if (location.protocol === "file:") { document.body.innerHTML = `<div style="color:#ef5350">Run on http://localhost</div>`; throw new Error("file://"); }
+</script>
+<div id="out">running…</div>
+<script type="module">
+const out = document.getElementById("out");
+function showErr(prefix, info) {
+  const safe = (info?.message || info?.reason || JSON.stringify(info)) || "(empty)";
+  out.innerHTML += `<span class="fail">✗ ${prefix}: ${safe}</span>\n`;
+}
+window.addEventListener("error", (e) => showErr("error", { message: e.message, file: e.filename, line: e.lineno }));
+window.addEventListener("unhandledrejection", (e) => showErr("rejection", e.reason?.message || String(e.reason)));
+
+const V = "ml23-" + Date.now();
+const U = (p) => new URL(`${p}?v=${V}`, location.href).href;
+
+// Force-revalidate to ensure DB v7 schema is read
+for (const f of [
+  "../src/data/schema.js","../src/data/idb.js",
+  "../src/learn/mistakeLedger.js","../src/learn/antiPatterns.js","../src/learn/metaVeto.js",
+  "../src/core/bus.js","../src/core/resilience.js",
+]) try { await fetch(f, { cache: "reload" }); } catch {}
+
+// Hydrate IDB
+const IDB = await import(U("../src/data/idb.js"));
+await new Promise((res) => { const r = indexedDB.deleteDatabase("mnp_v3"); r.onsuccess = r.onerror = r.onblocked = () => res(); });
+await IDB.openDB();
+
+const AP = await import(U("../src/learn/antiPatterns.js"));
+const MV = await import(U("../src/learn/metaVeto.js"));
+const ML = await import(U("../src/learn/mistakeLedger.js"));
+
+let n = 0, p = 0;
+const log = (s, ok, err) => { out.innerHTML += `<span class="${ok?'pass':'fail'}">${ok?'✓':'✗'} ${s}${err ? ' — ' + err : ''}</span>\n`; n++; if (ok) p++; };
+const group = (s) => { out.innerHTML += `\n<span class="group">[${s}]</span>\n`; };
+const close = (a, b, eps=1e-6) => Math.abs(a - b) <= eps;
+
+/* ════════════ AntiPatterns · math helpers ════════════ */
+group("sqDist + mean + clusterRadius");
+{
+  log("identical → 0",        AP.sqDist([1,2,3],[1,2,3]) === 0);
+  log("orthogonal unit → 2",  close(AP.sqDist([1,0],[0,1]), 2));
+  log("non-array → Infinity", AP.sqDist(null, [1,2]) === Infinity);
+  log("ragged dims OK",        AP.sqDist([1,2],[1,2,3]) === 9);
+
+  const m = AP.mean([[1,2],[3,4],[5,6]]);
+  log("mean → [3,4]",         m[0] === 3 && m[1] === 4);
+  log("mean of empty → null", AP.mean([]) === null);
+
+  const r = AP.clusterRadius([[1,0],[2,0],[3,0]], [2,0], 1.0);
+  log("clusterRadius @ p=1.0 = max sqDist", r === 1);
+  log("empty input → 0", AP.clusterRadius([], [0,0]) === 0);
+}
+
+group("kmeans · convergence");
+{
+  // 3 distinct clusters
+  const vecs = [
+    [10,10],[10.5,10.5],[10,10.5],     // cluster A
+    [50,50],[51,51],[49,50],            // cluster B
+    [-30,-30],[-29,-31],[-30,-29],     // cluster C
+  ];
+  const r = AP.kmeans(vecs, 3, 30);
+  log("returns labels of length 9", r.labels.length === 9);
+  log("returns 3 centroids",         r.centroids.length === 3);
+  // Each cluster's 3 points must all share the same label
+  const same = (a, b, c) => r.labels[a] === r.labels[b] && r.labels[b] === r.labels[c];
+  log("cluster A grouped",  same(0,1,2));
+  log("cluster B grouped",  same(3,4,5));
+  log("cluster C grouped",  same(6,7,8));
+  // Different clusters get different labels
+  log("clusters separated", new Set([r.labels[0], r.labels[3], r.labels[6]]).size === 3);
+
+  // Edge: empty input
+  const e = AP.kmeans([], 3);
+  log("empty input → empty result", e.labels.length === 0 && e.centroids.length === 0);
+}
+
+/* ════════════ AntiPatterns · discoverAntiPatterns ════════════ */
+group("discoverAntiPatterns · end-to-end");
+{
+  await AP.clearAll();
+  // 30 mistakes, all clustered in feature region [10, 10] — should
+  // surface as ONE anti-pattern with hitRate=0 (no corrects passed)
+  const mistakes = [];
+  for (let i = 0; i < 30; i++) {
+    mistakes.push({
+      predictionId: i, symbol: "BTCUSDT", tf: "1h", t: i,
+      kind: "direction", errorType: "direction", errorMag: 1.0,
+      predicted: { direction: "long" },
+      realized: { direction: "short" },
+      context: {
+        regime: "trend-down-strong",
+        featureVec: [10 + Math.random() * 0.4, 10 + Math.random() * 0.4],
+      },
+      createdAt: Date.now(),
+    });
+  }
+  const res = await AP.discoverAntiPatterns({ mistakes, k: 3, minSamples: 10 });
+  log("discoverAntiPatterns returned",     !!res);
+  log("at least 1 anti-pattern persisted", res.added >= 1);
+
+  const list = await AP.listAntiPatterns();
+  log("listAntiPatterns non-empty",        list.length >= 1);
+  log("anti-pattern.regime captured",      list[0].regime === "trend-down-strong");
+  log("centroid is 2-dim",                 list[0].centroid.length === 2);
+  log("hitRate < threshold",               list[0].hitRate < 0.45);
+  log("direction === 'long' (dominant)",   list[0].direction === "long");
+  log("label includes hit %",              /miss \d+\/\d+ \(\d+%\)/.test(list[0].label));
+
+  // With "corrects" passed in, hitRate should rise
+  await AP.clearAll();
+  const corrects = [];
+  for (let i = 0; i < 60; i++) {
+    corrects.push({ context: { featureVec: [10 + Math.random() * 0.4, 10 + Math.random() * 0.4], regime: "trend-down-strong" } });
+  }
+  const res2 = await AP.discoverAntiPatterns({ mistakes, corrects, k: 3, minSamples: 10 });
+  // 30 misses + 60 corrects in same region = hitRate ~67%, ABOVE threshold → no antiPattern
+  log("high-hitRate cluster NOT flagged",  res2.added === 0);
+
+  // Below-threshold mistakes count → skipped
+  await AP.clearAll();
+  const small = mistakes.slice(0, 5);
+  const res3 = await AP.discoverAntiPatterns({ mistakes: small, minSamples: 20 });
+  log("insufficient mistakes → skipped",    res3.skipped != null);
+  log("nothing persisted",                   (await AP.count()) === 0);
+}
+
+group("nearestAntiPattern lookup");
+{
+  await AP.clearAll();
+  const mistakes = [];
+  for (let i = 0; i < 30; i++) {
+    mistakes.push({
+      predictionId: i, symbol: "X", tf: "1h", t: i,
+      kind: "direction", errorType: "direction", errorMag: 1.0,
+      predicted: { direction: "short" },
+      realized: { direction: "long" },
+      context: { regime: "A", featureVec: [5 + Math.random() * 0.2, 5 + Math.random() * 0.2] },
+      createdAt: Date.now(),
+    });
+  }
+  await AP.discoverAntiPatterns({ mistakes, k: 2, minSamples: 10 });
+  const ap = (await AP.listAntiPatterns())[0];
+
+  // Live vector AT the centroid is guaranteed inside the radius
+  const inside = await AP.nearestAntiPattern(ap.centroid);
+  log("nearestAntiPattern returns object", !!inside);
+  log("inRadius === true (centroid)",       inside?.inRadius === true);
+  log("distance is finite",                  Number.isFinite(inside?.distance));
+
+  // Live vector far away → outside
+  const far = await AP.nearestAntiPattern([100, 100]);
+  log("inRadius === false (far)",            far?.inRadius === false);
+
+  // No vector → null
+  log("empty vec → null",                    (await AP.nearestAntiPattern([])) === null);
+}
+
+/* ════════════ Meta-veto · pure decision logic ════════════ */
+group("MetaVeto.evaluate · decision table");
+{
+  const orch = { rawScore: 0.6, probability: 0.78, direction: "long" };
+
+  // No match → pass-through
+  const r1 = MV.evaluate(orch, null);
+  log("null match → vetoed=false",  r1.vetoed === false);
+  log("pass-through preserves score",close(r1.signal, 0.6));
+
+  // Match outside radius → pass-through
+  const r2 = MV.evaluate(orch, { antiPattern: { hitRate: 0.1 }, distance: 99, inRadius: false });
+  log("inRadius=false → pass-through", r2.vetoed === false);
+
+  // Match in radius with very poor hit rate (≤0.25) → full veto
+  const r3 = MV.evaluate(orch, { antiPattern: { hitRate: 0.20, label: "x" }, distance: 0.1, inRadius: true });
+  log("hitRate ≤ 0.25 → full veto",      r3.vetoed === "full");
+  log("full veto signal === 0",          r3.signal === 0);
+  log("full veto direction === neutral", r3.direction === "neutral");
+  log("full veto reason mentions label", /vetoed/i.test(r3.reason));
+
+  // Match in radius with mediocre hit rate (0.25..0.40) → soften
+  const r4 = MV.evaluate(orch, { antiPattern: { hitRate: 0.35, label: "soft" }, distance: 0.1, inRadius: true });
+  log("hitRate in (0.25,0.40] → softened", r4.vetoed === "softened");
+  log("softened signal scaled down",        Math.abs(r4.signal) < Math.abs(orch.rawScore));
+  log("softened confidence reduced",        r4.confidence < orch.probability);
+
+  // Match in radius with hit rate above threshold (0.45) → pass-through
+  const r5 = MV.evaluate(orch, { antiPattern: { hitRate: 0.50 }, distance: 0.1, inRadius: true });
+  log("hitRate > 0.45 → pass-through",    r5.vetoed === false);
+
+  // originalScore preserved
+  log("originalScore captured",            r3.originalScore === 0.6);
+}
+
+group("MetaVeto.applyToOrch");
+{
+  const orch = { rawScore: 0.6, probability: 0.78, direction: "long", signals: [{moduleId:"x"}], featureVec: [1,2,3] };
+  const v = MV.evaluate(orch, { antiPattern: { hitRate: 0.20, label: "x", id: 7 }, distance: 0.1, inRadius: true });
+  const adj = MV.applyToOrch(orch, v);
+  log("applyToOrch returns new object",   adj !== orch);
+  log("rawScore overridden",               adj.rawScore === v.signal);
+  log("direction overridden",              adj.direction === v.direction);
+  log("metaVeto block carried",            adj.metaVeto && adj.metaVeto.kind === "full");
+  log("antiPatternId carried",             adj.metaVeto.antiPatternId === 7);
+  log("preserves signals[]",               Array.isArray(adj.signals) && adj.signals.length === 1);
+  log("preserves featureVec",              Array.isArray(adj.featureVec));
+
+  // No-op when verdict.vetoed === false
+  const v2 = MV.evaluate(orch, null);
+  log("no veto → applyToOrch returns same orch", MV.applyToOrch(orch, v2) === orch);
+}
+
+group("MetaVeto.applyVetoToOrch · IDB end-to-end");
+{
+  // Seed an anti-pattern centred on [5,5]
+  await AP.clearAll();
+  const mistakes = [];
+  for (let i = 0; i < 30; i++) {
+    mistakes.push({
+      predictionId: i, symbol: "X", tf: "1h", t: i,
+      kind: "direction", errorType: "direction", errorMag: 1.0,
+      predicted: { direction: "long" },
+      realized: { direction: "short" },
+      context: { regime: "X", featureVec: [5 + Math.random() * 0.2, 5 + Math.random() * 0.2] },
+      createdAt: Date.now(),
+    });
+  }
+  await AP.discoverAntiPatterns({ mistakes, k: 2, minSamples: 10 });
+
+  const ap2 = (await AP.listAntiPatterns())[0];
+  const orch = { rawScore: 0.6, probability: 0.78, direction: "long" };
+  // Inside the cluster (use the centroid) → veto
+  const r = await MV.applyVetoToOrch(orch, ap2.centroid);
+  log("inside cluster → vetoed/softened",
+      r.vetoed === "full" || r.vetoed === "softened");
+  log("antiPattern carried",                !!r.antiPattern);
+
+  // Outside the cluster → no veto
+  const r2 = await MV.applyVetoToOrch(orch, [100, 100]);
+  log("outside cluster → pass-through",     r2.vetoed === false);
+
+  // Empty featureVec → pass-through
+  const r3 = await MV.applyVetoToOrch(orch, []);
+  log("empty featureVec → pass-through",    r3.vetoed === false);
+}
+
+/* ════════════ Summary ════════════ */
+out.innerHTML += `\n<div class="summary ${p===n?'pass':'fail'}">Ran ${n} tests — ${p} passed, ${n-p} failed.</div>`;
+document.title = `MNP m-learn-23 ${p}/${n}`;
+</script>
+</body>
+</html>

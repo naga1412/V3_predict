@@ -390,6 +390,31 @@ function derivePatternBias(ta) {
 
 function useGhostCandles(ta, orch, candles, { nBars = 25, alpha = 0.1, symbol, tf, patternBias = 0 } = {}) {
   const [conformal, setConformal] = useState(null);
+  // M-LEARN-3 — meta-veto: re-check the live feature vector against
+  // the anti-pattern store on every bar.  When a match lands, this
+  // returns an "adjusted" orch (signal softened or zeroed) which is
+  // what then feeds predictGhostCandles below.
+  const [vetoedOrch, setVetoedOrch] = useState(orch);
+  const [vetoInfo,   setVetoInfo]   = useState(null);
+  useEffect(() => {
+    let cancelled = false;
+    const MV = window.__MNP__?.MetaVeto;
+    if (!MV?.applyVetoToOrch || !orch) { setVetoedOrch(orch); setVetoInfo(null); return; }
+    const fv = ta?.lastFeatureVec || orch?.featureVec || null;
+    if (!Array.isArray(fv) || fv.length === 0) { setVetoedOrch(orch); setVetoInfo(null); return; }
+    (async () => {
+      try {
+        const verdict = await MV.applyVetoToOrch(orch, fv, { regime: ta?.regime?.label });
+        if (cancelled) return;
+        setVetoInfo(verdict);
+        setVetoedOrch(verdict.vetoed ? MV.applyToOrch(orch, verdict) : orch);
+        if (verdict.vetoed) {
+          try { window.__MNP__?.EventBus?.emit?.("meta:veto", verdict); } catch {}
+        }
+      } catch { setVetoedOrch(orch); setVetoInfo(null); }
+    })();
+    return () => { cancelled = true; };
+  }, [orch?.rawScore, orch?.direction, ta?.lastFeatureVec, ta?.regime?.label]);
 
   // Try to hydrate a previously-calibrated regressor from IDB (fire-and-forget).
   useEffect(() => {
@@ -414,19 +439,30 @@ function useGhostCandles(ta, orch, candles, { nBars = 25, alpha = 0.1, symbol, t
   const forecast = useMemo(() => {
     const gc = window.__MNP__?.GhostCandles;
     if (!gc?.predictGhostCandles) return null;
-    if (!ta || ta.empty || !orch) return null;
+    if (!ta || ta.empty || !vetoedOrch) return null;
     try {
-      return gc.predictGhostCandles(ta, orch, {
+      const f = gc.predictGhostCandles(ta, vetoedOrch, {
         nBars, alpha,
         conformal,
         candles,
         patternBias,
       });
+      // Surface the veto on the forecast so the UI can render a chip.
+      if (f && vetoInfo?.vetoed) {
+        f.metaVeto = {
+          kind:        vetoInfo.vetoed,
+          reason:      vetoInfo.reason,
+          antiPattern: vetoInfo.antiPattern,
+          originalScore: vetoInfo.originalScore,
+          originalProb:  vetoInfo.originalProb,
+        };
+      }
+      return f;
     } catch (err) {
       console.warn("[ui] ghost candles failed", err);
       return null;
     }
-  }, [ta, orch, conformal, candles, nBars, alpha, patternBias]);
+  }, [ta, vetoedOrch, conformal, candles, nBars, alpha, patternBias, vetoInfo]);
 
   // Side-effect: persist each forecast + emit on the bus.  Keyed on
   // anchorTime so a forecast is only stored once per bar-open (subsequent
@@ -1936,6 +1972,63 @@ function AdaptiveWeightsCard({ adaptive, tick, orch }) {
 /* ── M-LEARN-1 · MistakeLedgerCard ──
    Shows the running mistake count + last 5 wrong calls for the
    current (symbol, tf) so you can see the brain working. */
+/* ── M-LEARN-2/3 · AntiPatternCard ──
+   Lists the active anti-patterns, sorted by miss-rate (worst first).
+   Refreshes whenever `antipatterns:rebuilt` fires. */
+function AntiPatternCard() {
+  const [aps, setAps] = useState([]);
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    const off = window.__MNP__?.EventBus?.on?.("antipatterns:rebuilt", () => setTick((n) => n + 1));
+    return () => { try { off?.(); } catch {} };
+  }, []);
+  useEffect(() => {
+    let stopped = false;
+    const AP = window.__MNP__?.AntiPatterns;
+    if (!AP?.listAntiPatterns) return;
+    AP.listAntiPatterns({ limit: 8 }).then((rows) => { if (!stopped) setAps(rows || []); }).catch(() => {});
+    return () => { stopped = true; };
+  }, [tick]);
+  if (!aps.length) {
+    return (
+      <div className="card">
+        <h3>Anti-patterns <span className="badge">0</span></h3>
+        <div style={{ color: "var(--fg-dim)", fontSize: 12 }}>
+          No anti-patterns yet — needs ≥ 20 mistakes to discover clusters.
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div className="card">
+      <h3>Anti-patterns <span className="badge warn">{aps.length}</span></h3>
+      <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+        {aps.slice().sort((a, b) => (a.hitRate || 0) - (b.hitRate || 0)).map((ap) => {
+          const tone = ap.hitRate <= 0.25 ? "bear"
+                    : ap.hitRate <= 0.40 ? "warn"
+                    : "";
+          return (
+            <div key={ap.id} style={{ padding: "5px 6px", background: "var(--bg)", borderRadius: 3, fontSize: 11 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 6 }}>
+                <span className={"chip-toggle on " + tone} style={{ fontSize: 9, padding: "1px 5px" }}>
+                  {(ap.hitRate * 100 | 0)}% hit
+                </span>
+                <span style={{ color: "var(--fg-dim)", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {ap.label}
+                </span>
+                <span style={{ color: "var(--fg-dim)", fontFamily: "var(--font-mono)" }}>{ap.mistakeN}/{ap.sampleN}</span>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      <div style={{ fontSize: 10, color: "var(--fg-dim)", marginTop: 6 }}>
+        Auto-rebuilt every 25 mistakes / 1 hr · meta-veto blocks ghosts when current bar matches
+      </div>
+    </div>
+  );
+}
+
 function MistakeLedgerCard({ symbol, tf }) {
   const [sum, setSum] = useState(null);
   const [recent, setRecent] = useState([]);
@@ -3176,6 +3269,7 @@ function SignalSidebar({ orch, expected, ghost, ta, candles, regime, symbol, gho
       <StabilityCard stability={stability} />
       <AdaptiveWeightsCard adaptive={adaptive} tick={adaptiveTick} orch={orch} />
       <MistakeLedgerCard symbol={symbol} tf={tf} />
+      <AntiPatternCard />
       <DLSupervisorCard orch={orch} expected={expected} ta={ta} />
       {symbol && <LongShortRatioCard symbol={symbol} />}
       {symbol && <HTFBiasGridCard symbol={symbol} />}
@@ -3311,6 +3405,16 @@ function GhostCandleCard({ ghost, ta, nBars, setNBars }) {
               (bias {fmtSigned(ghost.patternBias, 2)})
             </span>
           )}
+        </div>
+      )}
+      {ghost.metaVeto && (
+        <div style={{ marginTop: 8, padding: 6, background: ghost.metaVeto.kind === "full" ? "rgba(239,83,80,.10)" : "rgba(255,176,32,.10)", border: "1px solid " + (ghost.metaVeto.kind === "full" ? "rgba(239,83,80,.35)" : "rgba(255,176,32,.35)"), borderRadius: 4, fontSize: 11 }}>
+          🚫 <b style={{ color: ghost.metaVeto.kind === "full" ? "var(--bear)" : "var(--warn)" }}>
+            {ghost.metaVeto.kind === "full" ? "VETOED" : "SOFTENED"}
+          </b>
+          <span style={{ color: "var(--fg-dim)", marginLeft: 6 }}>
+            by anti-pattern {ghost.metaVeto.antiPattern?.label ? `· ${ghost.metaVeto.antiPattern.label}` : ""}
+          </span>
         </div>
       )}
       {horizonPicker}
@@ -4118,6 +4222,57 @@ function App() {
     patternBias: recentPatternBias,
   });
   useGhostResolver(symbol, tf, feed.candles);
+
+  // ── M-LEARN plumbing · Submit a prediction once per closed bar so
+  // ValidationMonitor produces verdicts that feed AdaptiveWeights,
+  // MistakeLedger, and (next) anti-pattern discovery.  Without this
+  // wire the entire closed-loop chain receives nothing.
+  const monitorRef = useRef(null);
+  const lastSubmittedBarRef = useRef(0);
+  if (!monitorRef.current) {
+    const M = window.__MNP__;
+    if (M?.createDefaultMonitor && M?.EventBus && M?.getStored) {
+      try {
+        const candleLookup = async (sym, tff, t) => {
+          const rows = await M.getStored({ symbol: sym, tf: tff, fromT: t, toT: t, limit: 1 });
+          return rows && rows.length ? rows[0] : null;
+        };
+        monitorRef.current = M.createDefaultMonitor({ bus: M.EventBus, candleLookup });
+        monitorRef.current.start();
+      } catch (err) { console.warn("[ui] monitor init failed", err); }
+    }
+  }
+  useEffect(() => {
+    const mon = monitorRef.current;
+    if (!mon || !orch || !ta?.close?.length) return;
+    if (orch.direction === "neutral" || !Number.isFinite(orch.rawScore)) return;
+    const lastBar = feed.candles?.[feed.candles.length - 1];
+    if (!lastBar || lastBar.t === lastSubmittedBarRef.current) return;
+    lastSubmittedBarRef.current = lastBar.t;
+    const dir =
+      orch.direction === "long"  ? "up"   :
+      orch.direction === "short" ? "down" :
+      "flat";
+    const refPrice = ta.close[ta.close.length - 1];
+    mon.submit({
+      symbol, tf,
+      kind: "direction",
+      t: lastBar.t,
+      payload: { dir, prob: orch.probability, refPrice, rawScore: orch.rawScore, direction: orch.direction },
+      regime:  ta.regime?.label || null,
+      version: window.__MNP__?.version || "unknown",
+    }, { refCandle: lastBar }).catch(() => { /* swallow */ });
+  }, [orch?.rawScore, orch?.direction, feed.candles?.length]);
+
+  // Tick the monitor on every closed candle so it sweeps due predictions.
+  useEffect(() => {
+    const mon = monitorRef.current;
+    if (!mon) return;
+    const off = window.__MNP__?.EventBus?.on?.("candle:closed", () => {
+      mon.tick({ symbol, tf }).catch(() => {});
+    });
+    return () => { try { off?.(); } catch {} };
+  }, [symbol, tf]);
 
   // ── M5 · Stability history + adaptive weights
   // Append one snapshot per orchestration tick (capped at 200 bars).
